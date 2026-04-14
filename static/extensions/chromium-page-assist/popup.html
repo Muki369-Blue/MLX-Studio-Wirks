@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MLX Studio Page Assist</title>
+  <style>
+    body {
+      margin: 0;
+      width: 320px;
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    .wrap {
+      padding: 16px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 15px;
+    }
+    p {
+      margin: 0 0 12px;
+      color: #94a3b8;
+    }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: linear-gradient(135deg, #818cf8, #34d399);
+      color: #08111f;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: linear-gradient(135deg, #38bdf8, #22d3ee);
+    }
+    button.act {
+      background: linear-gradient(135deg, #f59e0b, #f97316);
+      color: #1f1300;
+    }
+    button:disabled {
+      opacity: 0.65;
+      cursor: default;
+    }
+    .field {
+      margin-top: 12px;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      margin-bottom: 6px;
+      color: #cbd5e1;
+    }
+    textarea {
+      width: 100%;
+      min-height: 74px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.55);
+      color: #e2e8f0;
+      padding: 9px 10px;
+      font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      resize: vertical;
+      box-sizing: border-box;
+    }
+    .toggle {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #cbd5e1;
+      font-size: 12px;
+    }
+    .action-row {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .action-row button {
+      width: 100%;
+    }
+    .answer {
+      margin-top: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.55);
+      color: #e2e8f0;
+      padding: 10px;
+      max-height: 420px;
+      overflow: auto;
+      white-space: pre-wrap;
+      display: none;
+    }
+    .status {
+      margin-top: 12px;
+      min-height: 20px;
+      color: #cbd5e1;
+    }
+    code {
+      color: #f8fafc;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>MLX Studio Page Assist</h1>
+    <p>Capture page context and chat about the current tab through your local MLX Studio app at <code>127.0.0.1:8899</code>.</p>
+    <button id="send">Send Current Page</button>
+    <div class="field">
+      <label for="question">Ask about this page</label>
+      <textarea id="question" placeholder="Summarize this page, find key claims, or ask for action items..."></textarea>
+    </div>
+    <div class="field">
+      <label for="system-prompt">System prompt (optional)</label>
+      <textarea id="system-prompt" placeholder="Optional behavior instructions for page answers (tone, format, depth)."></textarea>
+    </div>
+    <div class="toggle">
+      <input id="agent-mode" type="checkbox">
+      <label for="agent-mode">Agent mode: allow live webpage actions (navigate, click, type)</label>
+    </div>
+    <div class="action-row">
+      <button id="ask" class="secondary">Ask MLX</button>
+      <button id="act" class="act">Tell MLX Act</button>
+    </div>
+    <div class="status" id="status">Ready.</div>
+    <div class="answer" id="answer"></div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

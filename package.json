@@ -1,0 +1,15 @@
+{
+  "name": "mlx-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "browser:service": "node scripts/playwright_service.mjs",
+    "browser:install": "playwright install chromium",
+    "check:browser": "node --check scripts/playwright_service.mjs",
+    "check:frontend": "node --check static/app.js"
+  },
+  "dependencies": {
+    "playwright": "1.59.1"
+  }
+}

@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MLX Studio — Local LLM on Apple Silicon</title>
+    <meta name="description" content="Premium local LLM studio powered by MLX on Apple Silicon — fast, private, unlimited inference">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Ambient background -->
+    <div class="ambient-bg">
+        <div class="orb orb-1"></div>
+        <div class="orb orb-2"></div>
+        <div class="orb orb-3"></div>
+    </div>
+
+    <!-- Command Palette Overlay -->
+    <div class="command-palette-overlay" id="command-palette-overlay">
+        <div class="command-palette" id="command-palette">
+            <div class="cmd-search-wrap">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+                <input type="text" class="cmd-search" id="cmd-search" placeholder="Type a command…" autocomplete="off">
+            </div>
+            <div class="cmd-results" id="cmd-results"></div>
+            <div class="cmd-footer">
+                <span class="cmd-hint"><kbd>↑↓</kbd> navigate</span>
+                <span class="cmd-hint"><kbd>⏎</kbd> select</span>
+                <span class="cmd-hint"><kbd>esc</kbd> close</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="app-layout">
+        <!-- Session Sidebar -->
+        <aside class="session-sidebar" id="session-sidebar">
+            <div class="session-sidebar-header">
+                <h2 class="session-sidebar-title">Chat Sessions</h2>
+                <button class="btn-icon" id="btn-new-session" title="New session">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                </button>
+            </div>
+            <div class="project-toolbar">
+                <select class="project-select" id="project-select"></select>
+                <button class="btn-ghost btn-sm" id="btn-new-project" title="Create project">New Project</button>
+            </div>
+            <div class="session-list" id="session-list">
+                <!-- sessions injected by JS -->
+            </div>
+            <div class="session-sidebar-footer">
+                <button class="btn-ghost btn-sm" id="btn-export-json" title="Export as JSON">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+                    JSON
+                </button>
+                <button class="btn-ghost btn-sm" id="btn-export-md" title="Export as Markdown">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>
+                    MD
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                            <rect x="2" y="2" width="24" height="24" rx="6" stroke="url(#logo-grad)" stroke-width="2.5"/>
+                            <path d="M8 14L12 10L16 14L20 10" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <path d="M8 18L12 14L16 18L20 14" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
+                            <defs>
+                                <linearGradient id="logo-grad" x1="2" y1="2" x2="26" y2="26">
+                                    <stop stop-color="#818cf8"/>
+                                    <stop offset="1" stop-color="#c084fc"/>
+                                </linearGradient>
+                            </defs>
+                        </svg>
+                    </div>
+                    <div class="logo-text">
+                        <span class="logo-title">MLX Studio</span>
+                        <span class="logo-subtitle">Apple Silicon LLM</span>
+                    </div>
+                </div>
+                <button class="btn-icon" id="btn-toggle-sessions" title="Toggle sessions panel (⌘K)">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+                </button>
+            </div>
+
+            <!-- Model Status Bar (Upgrade #1) -->
+            <div class="model-status-bar" id="model-status-bar">
+                <div class="status-indicator" id="status-indicator">
+                    <div class="status-led off" id="status-led"></div>
+                    <div class="status-text">
+                        <span class="status-model-name" id="status-model-name">No model loaded</span>
+                        <span class="status-detail" id="status-detail">Select a model to begin</span>
+                    </div>
+                </div>
+                <button class="btn-status-action" id="btn-status-action">Load Model</button>
+            </div>
+
+            <!-- System Info Card -->
+            <div class="sidebar-section">
+                <div class="section-label">System</div>
+                <div class="system-card" id="system-card">
+                    <div class="system-row">
+                        <span class="system-icon">🔲</span>
+                        <span class="system-key">Chip</span>
+                        <span class="system-val" id="sys-chip">—</span>
+                    </div>
+                    <div class="system-row">
+                        <span class="system-icon">💾</span>
+                        <span class="system-key">Memory</span>
+                        <span class="system-val" id="sys-memory">—</span>
+                    </div>
+                    <div class="system-row">
+                        <span class="system-icon">⚡</span>
+                        <span class="system-key">GPU</span>
+                        <span class="system-val" id="sys-gpu">—</span>
+                    </div>
+                    <div class="system-row memory-bar-row">
+                        <span class="system-icon">📊</span>
+                        <span class="system-key">Usage</span>
+                        <div class="memory-bar-wrap">
+                            <div class="memory-bar" id="memory-bar"><div class="memory-bar-fill" id="memory-bar-fill"></div></div>
+                            <span class="memory-label" id="memory-label">—</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Selector (Upgrade #2) -->
+            <div class="sidebar-section">
+                <div class="section-label">
+                    Model
+                    <button class="btn-icon" id="btn-refresh-models" title="Refresh models">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+                    </button>
+                </div>
+                <div class="model-filters" id="model-filters">
+                    <button class="filter-chip active" data-filter="all">All</button>
+                    <button class="filter-chip" data-filter="text">💬 Text</button>
+                    <button class="filter-chip" data-filter="vision">👁️ Vision</button>
+                    <button class="filter-chip" data-filter="diffusion">🎨 Diffusion</button>
+                </div>
+                <div class="model-selector">
+                    <div class="model-current" id="model-current">
+                        <div class="model-status-dot" id="model-status-dot"></div>
+                        <span id="model-current-name">No model loaded</span>
+                        <svg class="chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                    </div>
+                    <div class="model-dropdown" id="model-dropdown">
+                        <div class="model-search-wrap">
+                            <input type="text" class="model-search" id="model-search" placeholder="Search models…">
+                        </div>
+                        <div class="model-list" id="model-list">
+                            <div class="model-list-empty">Scanning models…</div>
+                        </div>
+                        <!-- HuggingFace Model Pull (from AI-ArtWirks create_model_pull) -->
+                        <div class="model-pull-section">
+                            <div class="model-pull-header">📦 Pull from HuggingFace</div>
+                            <div class="model-pull-input-wrap">
+                                <input type="text" class="model-pull-input" id="model-pull-input" placeholder="mlx-community/Qwen2-0.5B-Instruct-4bit">
+                                <button class="btn-pull" id="btn-pull-model" title="Download model">Pull</button>
+                            </div>
+                            <div class="model-pull-status" id="model-pull-status"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Parameters (Upgrade #9 — Pro Mode Toggle) -->
+            <div class="sidebar-section">
+                <div class="section-label">
+                    Parameters
+                    <div class="pro-mode-toggle-wrap">
+                        <span class="pro-label" id="pro-label">Simple</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="pro-mode-toggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Preset Profiles (Upgrade #4) -->
+                <div class="preset-bar" id="preset-bar">
+                    <button class="preset-chip active" data-preset="balanced" title="General purpose — good for most tasks">⚖️ Balanced</button>
+                    <button class="preset-chip" data-preset="coding" title="Low temperature for precise code">🧠 Coding</button>
+                    <button class="preset-chip" data-preset="creative" title="Higher temperature for creative writing">✍️ Creative</button>
+                    <button class="preset-chip" data-preset="precise" title="Very low temperature for factual Q&A">🎯 Precise</button>
+                </div>
+
+                <div class="param-group">
+                    <label class="param-label">
+                        <span>Temperature <span class="param-tooltip" data-tip="Controls randomness. Lower = more focused and deterministic. Higher = more creative and diverse.">ℹ️</span></span>
+                        <span class="param-value" id="temp-val">0.70</span>
+                    </label>
+                    <input type="range" class="param-slider" id="temperature" min="0" max="2" step="0.05" value="0.7">
+                </div>
+                <div class="param-group advanced-param">
+                    <label class="param-label">
+                        <span>Top P <span class="param-tooltip" data-tip="Nucleus sampling threshold. Lower = fewer token choices. Higher = more variety.">ℹ️</span></span>
+                        <span class="param-value" id="topp-val">0.90</span>
+                    </label>
+                    <input type="range" class="param-slider" id="top-p" min="0" max="1" step="0.05" value="0.9">
+                </div>
+                <div class="param-group advanced-param">
+                    <label class="param-label">
+                        <span>Max Tokens <span class="param-tooltip" data-tip="Maximum number of tokens to generate in the response.">ℹ️</span></span>
+                        <span class="param-value" id="maxtok-val">512</span>
+                    </label>
+                    <input type="range" class="param-slider" id="max-tokens" min="64" max="4096" step="64" value="512">
+                </div>
+                <div class="param-group advanced-param">
+                    <label class="param-label">
+                        <span>Rep. Penalty <span class="param-tooltip" data-tip="Penalizes repeated tokens. Higher = less repetitive output.">ℹ️</span></span>
+                        <span class="param-value" id="rep-val">1.10</span>
+                    </label>
+                    <input type="range" class="param-slider" id="rep-penalty" min="1.0" max="2.0" step="0.05" value="1.1">
+                </div>
+            </div>
+
+            <!-- System Prompt (Upgrade #8) -->
+            <div class="sidebar-section">
+                <div class="section-label system-prompt-label">
+                    <span>System Prompt</span>
+                    <div class="system-prompt-controls">
+                        <button class="btn-icon btn-sm" id="btn-toggle-system-prompt" title="Toggle panel">
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="system-prompt-badge" id="system-prompt-badge">
+                    <span class="badge-dot"></span>
+                    <span id="active-prompt-name">Custom</span>
+                </div>
+                <div class="system-prompt-panel" id="system-prompt-panel">
+                    <div class="system-prompt-presets">
+                        <button class="sp-preset active" data-sp="assistant">🤖 Assistant</button>
+                        <button class="sp-preset" data-sp="coder">💻 Coder</button>
+                        <button class="sp-preset" data-sp="creative">🎭 Creative</button>
+                        <button class="sp-preset" data-sp="analyst">📊 Analyst</button>
+                    </div>
+                    <textarea class="system-prompt" id="system-prompt" rows="3" placeholder="You are a helpful assistant…">You are a helpful, intelligent assistant. Be concise and accurate.</textarea>
+                </div>
+            </div>
+
+            <div class="sidebar-footer">
+                <button class="btn-secondary" id="btn-clear-chat">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                    Clear Chat
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="main-content">
+            <!-- Top Bar (Upgrade #1 + #5) -->
+            <div class="topbar">
+                <button class="btn-icon sidebar-toggle" id="btn-sidebar-toggle">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+                </button>
+                <div class="topbar-model" id="topbar-model-badge">
+                    <span class="topbar-dot" id="topbar-dot"></span>
+                    <span id="topbar-model-name">No model loaded</span>
+                </div>
+                <div class="capability-strip" id="capability-strip"></div>
+                <!-- Web Search Bar -->
+                <div class="web-search-bar">
+                    <input type="text" id="web-search-input" placeholder="Web search…" />
+                    <button id="web-search-btn">🔍</button>
+                </div>
+                <div class="topbar-stats" id="topbar-stats">
+                    <div class="stat-group">
+                        <span class="stat-label">Speed</span>
+                        <span class="stat" id="stat-tps">—</span>
+                                <!-- Web Search Results -->
+                                <div class="web-search-results" id="web-search-results" style="display:none;"></div>
+                    </div>
+                    <div class="stat-group">
+                        <span class="stat-label">Tokens</span>
+                        <span class="stat" id="stat-tokens">—</span>
+                    </div>
+                    <div class="stat-group">
+                        <span class="stat-label">Latency</span>
+                        <span class="stat" id="stat-latency">—</span>
+                    </div>
+                    <div class="stat-group">
+                        <span class="stat-label">Memory</span>
+                        <span class="stat" id="stat-memory">—</span>
+                    </div>
+                </div>
+                <div class="topbar-actions">
+                    <div class="transport-chip" id="transport-chip">Transport · Auto</div>
+                    <button class="btn-icon" id="btn-retry-last" title="Retry last prompt">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 103.13-9.36L1 10"/></svg>
+                    </button>
+                    <button class="btn-icon" id="btn-continue-last" title="Continue last response">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    </button>
+                    <button class="btn-icon" id="btn-compare-last" title="Compare alternate answer">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 00-2 2v3"/><path d="M16 3h3a2 2 0 012 2v3"/><path d="M8 21H5a2 2 0 01-2-2v-3"/><path d="M16 21h3a2 2 0 002-2v-3"/><path d="M12 8v8"/><path d="M8 12h8"/></svg>
+                    </button>
+                    <button class="btn-icon" id="btn-keyboard-help" title="Keyboard shortcuts">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+                    </button>
+                </div>
+            </div>
+            <!-- Memory Guard Warning Banner -->
+            <div class="memory-guard-banner hidden" id="memory-guard-banner">
+                <span class="memory-guard-icon">⚠️</span>
+                <span class="memory-guard-text" id="memory-guard-text">Memory pressure high — generation may be blocked</span>
+                <button class="btn-icon btn-sm" id="btn-dismiss-memory-warn" title="Dismiss">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <!-- Performance Sparkline Panel (Upgrade #5) -->
+            <div class="perf-panel" id="perf-panel">
+                <canvas id="sparkline-canvas" width="200" height="32"></canvas>
+            </div>
+
+            <div class="workspace-panel">
+                <div class="workspace-card">
+                    <div class="workspace-card-header">
+                        <span>Workspace</span>
+                        <span class="workspace-card-subtle" id="active-project-name">Inbox</span>
+                    </div>
+                    <div class="workspace-grid">
+                        <div class="workspace-metric">
+                            <span class="workspace-metric-label">Preset</span>
+                            <strong class="workspace-metric-value" id="active-preset-name">Balanced</strong>
+                        </div>
+                        <div class="workspace-metric">
+                            <span class="workspace-metric-label">Context</span>
+                            <strong class="workspace-metric-value" id="context-usage">—</strong>
+                        </div>
+                        <div class="workspace-metric">
+                            <span class="workspace-metric-label">Grounding</span>
+                            <strong class="workspace-metric-value" id="grounding-count">0</strong>
+                        </div>
+                        <div class="workspace-metric">
+                            <span class="workspace-metric-label">Health</span>
+                            <strong class="workspace-metric-value" id="health-summary">Idle</strong>
+                        </div>
+                    </div>
+                    <div class="context-meter">
+                        <div class="context-meter-fill" id="context-meter-fill"></div>
+                    </div>
+                    <div class="workspace-caption" id="context-warning">Load a model and start typing to inspect context usage.</div>
+                </div>
+                <div class="workspace-card">
+                    <div class="workspace-card-header">
+                        <span>Workspace Mode</span>
+                        <span class="workspace-card-subtle" id="workspace-label">Not connected</span>
+                    </div>
+                    <div class="workspace-actions">
+                        <button class="btn-ghost btn-sm" id="btn-open-workspace">Open Workspace</button>
+                        <button class="btn-ghost btn-sm" id="btn-refresh-workspace">Refresh</button>
+                        <button class="btn-ghost btn-sm" id="btn-clear-workspace">Clear</button>
+                    </div>
+                    <div class="workspace-caption" id="workspace-root-path">No workspace selected. Choose a local folder to inspect, scaffold, and stage safe edits.</div>
+                    <div class="workspace-tree-list" id="workspace-tree-list">
+                        <div class="page-assist-empty">No workspace selected yet.</div>
+                    </div>
+                    <div class="workspace-pending">
+                        <div class="workspace-pending-summary" id="workspace-pending-summary">No pending workspace changes.</div>
+                        <button class="btn-ghost btn-sm" id="btn-review-workspace-batch">Review Pending</button>
+                    </div>
+                </div>
+                <div class="workspace-card">
+                    <div class="workspace-card-header">
+                        <span>Page Assist Inbox</span>
+                        <span class="workspace-card-subtle" id="page-assist-count">0 clips</span>
+                    </div>
+                    <div class="page-assist-list" id="page-assist-list">
+                        <div class="page-assist-empty">No captured pages yet. Install the <a href="/static/extensions/chromium-page-assist/install.html" target="_blank" rel="noreferrer">Chromium helper</a> to send selected page text into this inbox.</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Messages (Upgrade #6) -->
+            <div class="chat-container" id="chat-container">
+                <div class="chat-messages" id="chat-messages">
+                    <!-- Welcome screen -->
+                    <div class="welcome" id="welcome-screen">
+                        <div class="welcome-icon">
+                            <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+                                <rect x="4" y="4" width="56" height="56" rx="14" stroke="url(#w-grad)" stroke-width="3"/>
+                                <path d="M16 32L24 24L32 32L40 24L48 32" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                                <path d="M16 42L24 34L32 42L40 34L48 42" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"/>
+                                <defs>
+                                    <linearGradient id="w-grad" x1="4" y1="4" x2="60" y2="60">
+                                        <stop stop-color="#818cf8"/>
+                                        <stop offset="1" stop-color="#c084fc"/>
+                                    </linearGradient>
+                                </defs>
+                            </svg>
+                        </div>
+                        <h1 class="welcome-title">MLX Studio</h1>
+                        <p class="welcome-subtitle">Local LLM inference on Apple Silicon — fast, private, unlimited.</p>
+                        <div class="welcome-shortcuts">
+                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>K</kbd> Command palette</div>
+                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>⏎</kbd> Send message</div>
+                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>L</kbd> Load model</div>
+                        </div>
+                        <div class="welcome-hints">
+                            <button class="hint-chip" data-prompt="Explain quantum computing in simple terms">🔬 Quantum computing</button>
+                            <button class="hint-chip" data-prompt="Write a Python function to parse JSON with error handling">🐍 Python code</button>
+                            <button class="hint-chip" data-prompt="What are the best practices for Apple Metal GPU programming?">⚡ Metal GPU tips</button>
+                            <button class="hint-chip" data-prompt="Create a short sci-fi story about AI consciousness">📖 Creative writing</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input Area (Upgrade #7) -->
+            <div class="input-area">
+                <div class="input-wrapper" id="input-wrapper">
+                    <div class="input-attachments" id="input-attachments"></div>
+                    <div class="input-row">
+                        <button class="btn-icon btn-attach" id="btn-attach" title="Attach files">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+                        </button>
+                        <button class="btn-icon btn-attach" id="btn-attach-folder" title="Attach folder">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h5l2 2h11v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z"/></svg>
+                        </button>
+                        <button class="btn-icon btn-attach" id="btn-add-source" title="Add external source">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 000-6l-1.5-.4a6.97 6.97 0 00-1-1.7l.8-1.4a1.65 1.65 0 00-2.3-2.3l-1.4.8a6.97 6.97 0 00-1.7-1L12 1.6a1.65 1.65 0 00-6 0l-.4 1.5a6.97 6.97 0 00-1.7 1l-1.4-.8a1.65 1.65 0 00-2.3 2.3l.8 1.4a6.97 6.97 0 00-1 1.7L1.6 9a1.65 1.65 0 000 6l1.5.4a6.97 6.97 0 001 1.7l-.8 1.4a1.65 1.65 0 002.3 2.3l1.4-.8a6.97 6.97 0 001.7 1L9 22.4a1.65 1.65 0 006 0l.4-1.5a6.97 6.97 0 001.7-1l1.4.8a1.65 1.65 0 002.3-2.3l-.8-1.4a6.97 6.97 0 001-1.7z"/></svg>
+                        </button>
+                        <textarea class="chat-input" id="chat-input" rows="1" placeholder="Send a message… (/ for commands)"></textarea>
+                        <button class="btn-send" id="btn-send">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+                        </button>
+                        <button class="btn-stop hidden" id="btn-stop">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                        </button>
+                    </div>
+                    <!-- Slash command dropdown -->
+                    <div class="slash-menu" id="slash-menu">
+                        <div class="slash-item" data-cmd="/system"><span class="slash-cmd">/system</span><span class="slash-desc">Set system prompt</span></div>
+                        <div class="slash-item" data-cmd="/clear"><span class="slash-cmd">/clear</span><span class="slash-desc">Clear chat history</span></div>
+                        <div class="slash-item" data-cmd="/load"><span class="slash-cmd">/load</span><span class="slash-desc">Load a model</span></div>
+                        <div class="slash-item" data-cmd="/unload"><span class="slash-cmd">/unload</span><span class="slash-desc">Unload current model</span></div>
+                        <div class="slash-item" data-cmd="/pull"><span class="slash-cmd">/pull</span><span class="slash-desc">Pull model from HuggingFace</span></div>
+                        <div class="slash-item" data-cmd="/web"><span class="slash-cmd">/web</span><span class="slash-desc">Search the web and add source context</span></div>
+                        <div class="slash-item" data-cmd="/github"><span class="slash-cmd">/github</span><span class="slash-desc">Search GitHub and add source context</span></div>
+                        <div class="slash-item" data-cmd="/agent"><span class="slash-cmd">/agent</span><span class="slash-desc">Toggle agent tools for web and browser access</span></div>
+                        <div class="slash-item" data-cmd="/mode"><span class="slash-cmd">/mode</span><span class="slash-desc">Set workflow mode: chat, plan, or build</span></div>
+                        <div class="slash-item" data-cmd="/approve"><span class="slash-cmd">/approve</span><span class="slash-desc">Set change policy: manual or auto</span></div>
+                        <div class="slash-item" data-cmd="/research"><span class="slash-cmd">/research</span><span class="slash-desc">Toggle extended research</span></div>
+                        <div class="slash-item" data-cmd="/workspace"><span class="slash-cmd">/workspace</span><span class="slash-desc">Open workspace mode for local repo files</span></div>
+                        <div class="slash-item" data-cmd="/export"><span class="slash-cmd">/export</span><span class="slash-desc">Export chat as JSON</span></div>
+                        <div class="slash-item" data-cmd="/preset"><span class="slash-cmd">/preset</span><span class="slash-desc">Switch generation preset</span></div>
+                        <div class="slash-item" data-cmd="/memory"><span class="slash-cmd">/memory</span><span class="slash-desc">Show memory status</span></div>
+                    </div>
+                </div>
+                <div class="input-footer">
+                    <span class="input-hint">Enter to send · Shift+Enter for new line · / for commands · ⌘K command palette</span>
+                    <div class="input-action-row">
+                        <div class="quick-settings">
+                            <button class="btn-ghost btn-sm" id="btn-quick-settings">Chat · Approve / Deny</button>
+                            <div class="quick-settings-menu" id="quick-settings-menu">
+                                <div class="quick-settings-section">
+                                    <label class="quick-settings-label" for="workflow-mode-select">Mode</label>
+                                    <select class="quick-settings-select" id="workflow-mode-select">
+                                        <option value="chat">Chat</option>
+                                        <option value="plan">Plan</option>
+                                        <option value="build">Build</option>
+                                    </select>
+                                </div>
+                                <div class="quick-settings-section">
+                                    <label class="quick-settings-label" for="approval-mode-select">Changes</label>
+                                    <select class="quick-settings-select" id="approval-mode-select">
+                                        <option value="manual">Approve / Deny</option>
+                                        <option value="auto">Auto-approve in Build</option>
+                                    </select>
+                                </div>
+                                <label class="quick-settings-check" for="workflow-deep-research">
+                                    <input type="checkbox" id="workflow-deep-research">
+                                    <span>Extended research</span>
+                                </label>
+                                <div class="quick-settings-note" id="workflow-context-note">Replay and output length will adapt to the selected mode.</div>
+                                <div class="quick-settings-note" id="workflow-agent-note">Planning, building, and extended research automatically enable agent tools.</div>
+                                <div class="workflow-model-recommendations" id="workflow-model-recommendations"></div>
+                            </div>
+                        </div>
+                        <button class="btn-ghost btn-sm" id="btn-open-workspace-footer">Open Workspace</button>
+                        <button class="btn-ghost btn-sm" id="btn-agent-mode">Agent Tools Off</button>
+                        <button class="btn-ghost btn-sm" id="btn-clear-grounding">Clear Context</button>
+                        <button class="btn-ghost btn-sm" id="btn-export-last-md">Export MD</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Hidden file inputs for grounding -->
+    <input type="file" id="file-input" style="display:none" multiple>
+    <input type="file" id="folder-input" style="display:none" multiple webkitdirectory directory>
+
+    <!-- Keyboard shortcuts help modal -->
+    <div class="modal-overlay" id="keyboard-modal">
+        <div class="modal-card">
+            <div class="modal-header">
+                <h3>Keyboard Shortcuts</h3>
+                <button class="btn-icon" id="btn-close-keyboard-modal">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <div class="shortcut-row"><kbd>⌘</kbd> + <kbd>K</kbd><span>Command palette</span></div>
+                <div class="shortcut-row"><kbd>⌘</kbd> + <kbd>Enter</kbd><span>Send message</span></div>
+                <div class="shortcut-row"><kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>L</kbd><span>Load model picker</span></div>
+                <div class="shortcut-row"><kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>N</kbd><span>New session</span></div>
+                <div class="shortcut-row"><kbd>⌘</kbd> + <kbd>⇧</kbd> + <kbd>⌫</kbd><span>Clear chat</span></div>
+                <div class="shortcut-row"><kbd>↑</kbd><span>Previous prompt (when input empty)</span></div>
+                <div class="shortcut-row"><kbd>Esc</kbd><span>Close panels / stop generation</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="connector-modal">
+        <div class="modal-card connector-modal-card">
+            <div class="modal-header">
+                <h3>Add External Source</h3>
+                <button class="btn-icon" id="btn-close-connector-modal" title="Close sources">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div class="modal-body connector-modal-body">
+                <div class="connector-provider-list" id="connector-provider-list"></div>
+                <div class="connector-search-row">
+                    <input type="text" class="connector-search-input" id="connector-search-input" placeholder="Search GitHub repos, issues, PRs, or paste a GitHub URL">
+                    <button class="btn-status-action connector-search-btn" id="btn-connector-search">Search</button>
+                </div>
+                <div class="connector-status" id="connector-status">Search a repository, issue, pull request, or paste a GitHub URL.</div>
+                <div class="connector-results" id="connector-results"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="workspace-approval-modal">
+        <div class="modal-card connector-modal-card">
+            <div class="modal-header">
+                <h3>Review Pending Workspace Changes</h3>
+                <button class="btn-icon" id="btn-close-workspace-approval-modal" title="Close workspace review">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+            <div class="modal-body connector-modal-body">
+                <div class="workspace-batch-meta" id="workspace-batch-meta">No pending workspace batch.</div>
+                <div class="workspace-batch-list" id="workspace-batch-list"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn-ghost btn-sm" id="btn-discard-workspace-batch">Deny</button>
+                <button class="btn-status-action" id="btn-approve-workspace-batch">Approve & Apply</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

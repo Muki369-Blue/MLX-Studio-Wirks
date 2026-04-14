@@ -2585,6 +2585,114 @@ body {
     align-items: center;
 }
 
+.quick-settings {
+    position: relative;
+    flex: 1 1 220px;
+    min-width: 220px;
+}
+
+.quick-settings > .btn-ghost {
+    width: 100%;
+    justify-content: space-between;
+    flex: 1 1 auto;
+}
+
+.quick-settings-menu {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 10px);
+    width: min(340px, calc(100vw - 48px));
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border-default);
+    background: rgba(22, 22, 32, 0.96);
+    box-shadow: var(--shadow-lg);
+    display: grid;
+    gap: 10px;
+    opacity: 0;
+    transform: translateY(8px);
+    pointer-events: none;
+    transition: all var(--transition-normal);
+    z-index: 80;
+}
+
+.quick-settings-menu.open {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+.quick-settings-section {
+    display: grid;
+    gap: 4px;
+}
+
+.quick-settings-label {
+    font-size: 11px;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.quick-settings-select {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    font-family: var(--font-sans);
+    outline: none;
+}
+
+.quick-settings-select:focus {
+    border-color: var(--border-focus);
+}
+
+.quick-settings-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+}
+
+.quick-settings-check input {
+    accent-color: var(--accent-start);
+}
+
+.quick-settings-note {
+    font-size: 0.72rem;
+    color: var(--text-tertiary);
+    line-height: 1.4;
+}
+
+.workflow-model-recommendations {
+    display: grid;
+    gap: 6px;
+}
+
+.workflow-model-card {
+    display: grid;
+    gap: 3px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(129, 140, 248, 0.14);
+    background: rgba(129, 140, 248, 0.08);
+}
+
+.workflow-model-card strong {
+    font-size: 0.72rem;
+    color: var(--text-accent);
+}
+
+.workflow-model-card span {
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    line-height: 1.35;
+}
+
 .attachment-preview {
     display: flex;
     align-items: center;
@@ -2639,6 +2747,14 @@ body {
 
     .input-action-row {
         flex-wrap: wrap;
+    }
+
+    .quick-settings {
+        flex-basis: 100%;
+    }
+
+    .quick-settings-menu {
+        width: 100%;
     }
 
     .connector-search-row {

@@ -84,6 +84,19 @@ const PRESETS = {
     review: { temperature: 0.18, top_p: 0.82, max_tokens: 1792, repetition_penalty: 1.05 },
 };
 
+const WORKFLOW_DEFAULTS = {
+    workflow_mode: 'chat',
+    approval_mode: 'manual',
+    deep_research: false,
+};
+
+const WORKFLOW_MIN_OUTPUT_TOKENS = {
+    chat: 512,
+    plan: 2560,
+    build: 3072,
+    deep_research: 3584,
+};
+
 // System Prompt Presets
 const SP_PRESETS = {
     assistant: 'You are a helpful, intelligent assistant. Be concise and accurate.',
@@ -217,6 +230,14 @@ const dom = {
     workspacePendingSummary: $('#workspace-pending-summary'),
     contextMeterFill: $('#context-meter-fill'),
     contextWarning: $('#context-warning'),
+    btnQuickSettings: $('#btn-quick-settings'),
+    quickSettingsMenu: $('#quick-settings-menu'),
+    workflowModeSelect: $('#workflow-mode-select'),
+    approvalModeSelect: $('#approval-mode-select'),
+    workflowDeepResearch: $('#workflow-deep-research'),
+    workflowContextNote: $('#workflow-context-note'),
+    workflowAgentNote: $('#workflow-agent-note'),
+    workflowModelRecommendations: $('#workflow-model-recommendations'),
     btnOpenWorkspace: $('#btn-open-workspace'),
     btnOpenWorkspaceFooter: $('#btn-open-workspace-footer'),
     btnRefreshWorkspace: $('#btn-refresh-workspace'),
@@ -334,7 +355,7 @@ async function fetchAppState() {
         const data = await res.json();
         state.projects = Array.isArray(data.projects) && data.projects.length
             ? data.projects
-            : [{ id: 'default', name: 'Inbox', color: '#818cf8' }];
+            : [{ id: 'default', name: 'Inbox', color: '#818cf8', ...WORKFLOW_DEFAULTS }];
         state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
         state.activeSessionId = data.active_session_id || null;
         state.activeProjectId = data.active_project_id || state.projects[0]?.id || 'default';
@@ -348,6 +369,7 @@ async function fetchAppState() {
         }
         renderProjects();
         applyPreset(state.selectedPreset);
+        renderWorkflowControls();
         renderPageAssistList();
         renderConnectorProviders();
         renderAgentModeButton();
@@ -359,8 +381,9 @@ async function fetchAppState() {
             renderWorkspacePanel();
         }
     } catch (e) {
-        state.projects = [{ id: 'default', name: 'Inbox', color: '#818cf8' }];
+        state.projects = [{ id: 'default', name: 'Inbox', color: '#818cf8', ...WORKFLOW_DEFAULTS }];
         renderProjects();
+        renderWorkflowControls();
         renderWorkspacePanel();
     }
 }
@@ -377,13 +400,159 @@ async function fetchConnectors() {
     renderConnectorProviders();
 }
 
+function getProjectWorkflowSettings(project = getActiveProject()) {
+    return {
+        workflow_mode: project?.workflow_mode || WORKFLOW_DEFAULTS.workflow_mode,
+        approval_mode: project?.approval_mode || WORKFLOW_DEFAULTS.approval_mode,
+        deep_research: Boolean(project?.deep_research),
+    };
+}
+
+function getWorkflowMinOutputTokens(settings = getProjectWorkflowSettings()) {
+    if (settings.deep_research) {
+        return WORKFLOW_MIN_OUTPUT_TOKENS.deep_research;
+    }
+    return WORKFLOW_MIN_OUTPUT_TOKENS[settings.workflow_mode] || WORKFLOW_MIN_OUTPUT_TOKENS.chat;
+}
+
+function isWorkflowAgentForced(settings = getProjectWorkflowSettings()) {
+    return settings.workflow_mode !== 'chat' || settings.deep_research;
+}
+
+function getEffectiveAgentMode() {
+    return Boolean(state.agentMode || isWorkflowAgentForced());
+}
+
+function getGenerationParams() {
+    const workflow = getProjectWorkflowSettings();
+    return {
+        temperature: parseFloat(dom.sliderTemp.value),
+        top_p: parseFloat(dom.sliderTopP.value),
+        max_tokens: Math.max(parseInt(dom.sliderMaxTok.value), getWorkflowMinOutputTokens(workflow)),
+        repetition_penalty: parseFloat(dom.sliderRep.value),
+        workflow_mode: workflow.workflow_mode,
+        approval_mode: workflow.approval_mode,
+        deep_research: workflow.deep_research,
+        agent_mode: getEffectiveAgentMode(),
+    };
+}
+
+function getRecommendedWorkflowModel() {
+    const preferred = state.models.find(model => (
+        model.name === 'Qwen--Qwen2-VL-2B-Instruct'
+        && isModelChatCapable(model)
+        && (model.context_length || 0) >= 8192
+    ));
+    if (preferred) return preferred;
+
+    const longContext = state.models
+        .filter(model => isModelChatCapable(model) && (model.context_length || 0) >= 8192)
+        .sort((a, b) => (b.context_length || 0) - (a.context_length || 0));
+    if (longContext.length) return longContext[0];
+
+    return state.models.find(model => isModelChatCapable(model)) || null;
+}
+
+function renderWorkflowRecommendations() {
+    if (!dom.workflowModelRecommendations) return;
+    const model = getRecommendedWorkflowModel();
+    if (!model) {
+        dom.workflowModelRecommendations.innerHTML = '<div class="workflow-model-card"><strong>Recommended model</strong><span>No chat-capable model detected yet.</span></div>';
+        return;
+    }
+    const suffix = state.loadedModelPath === model.path ? ' · loaded' : '';
+    const contextLabel = model.context_length ? `${Math.round(model.context_length / 1000)}k ctx` : 'context unknown';
+    dom.workflowModelRecommendations.innerHTML = `
+        <div class="workflow-model-card">
+            <strong>Chat</strong>
+            <span>${escapeHtml(model.name)} · ${contextLabel}${suffix}</span>
+        </div>
+        <div class="workflow-model-card">
+            <strong>Plan</strong>
+            <span>${escapeHtml(model.name)} · best current long-context fit</span>
+        </div>
+        <div class="workflow-model-card">
+            <strong>Build</strong>
+            <span>${escapeHtml(model.name)} · use with workspace mode</span>
+        </div>
+        <div class="workflow-model-card">
+            <strong>Research</strong>
+            <span>${escapeHtml(model.name)} · preferred for extended research</span>
+        </div>
+    `;
+}
+
+function renderWorkflowControls() {
+    const settings = getProjectWorkflowSettings();
+    const modeLabel = settings.workflow_mode.charAt(0).toUpperCase() + settings.workflow_mode.slice(1);
+    const approvalLabel = settings.approval_mode === 'auto' ? 'Auto in Build' : 'Approve / Deny';
+    if (dom.btnQuickSettings) {
+        dom.btnQuickSettings.textContent = settings.deep_research
+            ? `${modeLabel} · ${approvalLabel} · Research`
+            : `${modeLabel} · ${approvalLabel}`;
+        dom.btnQuickSettings.classList.toggle('active', settings.workflow_mode !== 'chat' || settings.approval_mode !== 'manual' || settings.deep_research);
+    }
+    if (dom.workflowModeSelect) {
+        dom.workflowModeSelect.value = settings.workflow_mode;
+    }
+    if (dom.approvalModeSelect) {
+        dom.approvalModeSelect.value = settings.approval_mode;
+    }
+    if (dom.workflowDeepResearch) {
+        dom.workflowDeepResearch.checked = settings.deep_research;
+    }
+    if (dom.workflowContextNote) {
+        const minTokens = getWorkflowMinOutputTokens(settings);
+        dom.workflowContextNote.textContent = settings.deep_research
+            ? `Extended research increases tool passes and requests at least ${minTokens} output tokens.`
+            : settings.workflow_mode === 'plan'
+                ? `Plan mode prepends planning guidance and requests at least ${minTokens} output tokens.`
+                : settings.workflow_mode === 'build'
+                    ? `Build mode expands reply length and requests at least ${minTokens} output tokens.`
+                    : 'Replay and output length will adapt automatically when you switch into plan, build, or extended research.';
+    }
+    if (dom.workflowAgentNote) {
+        dom.workflowAgentNote.textContent = isWorkflowAgentForced(settings)
+            ? 'Agent tools are currently forced on by this workflow mode. Model recommendations remain advisory only.'
+            : 'Planning, building, and extended research automatically enable agent tools. Model recommendations remain advisory only.';
+    }
+    renderWorkflowRecommendations();
+}
+
+function setActiveProjectWorkflowSettings(patch) {
+    const project = getActiveProject();
+    if (!project?.id) return;
+    updateProjectState({ ...project, ...patch });
+    renderProjects();
+    renderAgentModeButton();
+    requestTokenInspection();
+    scheduleAppStateSave();
+}
+
+function toggleQuickSettingsMenu(forceOpen = null) {
+    if (!dom.quickSettingsMenu || !dom.btnQuickSettings) return;
+    const nextState = forceOpen == null
+        ? !dom.quickSettingsMenu.classList.contains('open')
+        : Boolean(forceOpen);
+    dom.quickSettingsMenu.classList.toggle('open', nextState);
+    dom.btnQuickSettings.classList.toggle('open', nextState);
+}
+
 function renderAgentModeButton() {
     if (!dom.btnAgentMode) return;
-    dom.btnAgentMode.textContent = state.agentMode ? 'Agent Tools On' : 'Agent Tools Off';
-    dom.btnAgentMode.classList.toggle('active', state.agentMode);
-    dom.btnAgentMode.title = state.agentMode
-        ? 'Agent mode can use connectors, workspace tools, and the local browser tool before answering'
-        : 'Enable connectors, workspace tools, and the local browser tool before answering';
+    const forced = isWorkflowAgentForced();
+    const effective = getEffectiveAgentMode();
+    dom.btnAgentMode.textContent = forced && !state.agentMode
+        ? 'Agent Tools Auto'
+        : effective
+            ? 'Agent Tools On'
+            : 'Agent Tools Off';
+    dom.btnAgentMode.classList.toggle('active', effective);
+    dom.btnAgentMode.title = forced
+        ? 'Agent tools are enabled automatically by the current workflow mode or research setting'
+        : effective
+            ? 'Agent mode can use connectors, workspace tools, and the local browser tool before answering'
+            : 'Enable connectors, workspace tools, and the local browser tool before answering';
 }
 
 function updateProjectState(nextProject) {
@@ -630,9 +799,9 @@ async function discardWorkspaceBatch() {
         }
         closeWorkspaceApprovalModal();
         renderWorkspacePanel();
-        showToast('Pending workspace batch discarded', 'info');
+        showToast('Pending workspace batch denied', 'info');
     } catch (e) {
-        showToast(`Discard failed: ${e.message}`, 'error');
+        showToast(`Deny failed: ${e.message}`, 'error');
     }
 }
 
@@ -640,6 +809,10 @@ function toggleAgentMode() {
     state.agentMode = !state.agentMode;
     renderAgentModeButton();
     scheduleAppStateSave();
+    if (!state.agentMode && isWorkflowAgentForced()) {
+        showToast('Agent tools remain on automatically in this workflow mode', 'info');
+        return;
+    }
     showToast(`Agent tools ${state.agentMode ? 'enabled' : 'disabled'}`, 'info');
 }
 
@@ -686,10 +859,12 @@ async function fetchModels() {
         state.loadedModelMeta = getLoadedModelMeta();
         renderModelList(state.models);
         updateModelStatus();
+        renderWorkflowControls();
         updateCapabilityRouting();
         syncComposerState();
     } catch (e) {
         dom.modelList.innerHTML = '<div class="model-list-empty">Failed to load models</div>';
+        renderWorkflowControls();
         syncComposerState();
         console.error('Failed to fetch models:', e);
     }
@@ -1260,16 +1435,20 @@ async function sendMessage(customText = null, options = {}) {
     state.currentStreamText = '';
 
     // Send via WebSocket
+    const generation = getGenerationParams();
     const params = {
         messages: messages,
         prompt: groundedPrompt,
-        temperature: parseFloat(dom.sliderTemp.value),
-        top_p: parseFloat(dom.sliderTopP.value),
-        max_tokens: parseInt(dom.sliderMaxTok.value),
-        repetition_penalty: parseFloat(dom.sliderRep.value),
+        temperature: generation.temperature,
+        top_p: generation.top_p,
+        max_tokens: generation.max_tokens,
+        repetition_penalty: generation.repetition_penalty,
         attachments,
         page_clips: pageClips,
-        agent_mode: state.agentMode,
+        agent_mode: generation.agent_mode,
+        workflow_mode: generation.workflow_mode,
+        approval_mode: generation.approval_mode,
+        deep_research: generation.deep_research,
         project_id: state.activeProjectId,
         generation_id: generationId,
     };
@@ -1335,16 +1514,20 @@ async function compareLastResponse() {
             pageClips: lastUser.page_clips_payload || [],
         },
     });
+    const generation = getGenerationParams();
     const params = {
         messages,
         prompt: groundedPrompt,
-        temperature: Math.min(parseFloat(dom.sliderTemp.value) + 0.15, 1.6),
-        top_p: Math.min(parseFloat(dom.sliderTopP.value) + 0.05, 1.0),
-        max_tokens: parseInt(dom.sliderMaxTok.value),
-        repetition_penalty: parseFloat(dom.sliderRep.value),
+        temperature: Math.min(generation.temperature + 0.15, 1.6),
+        top_p: Math.min(generation.top_p + 0.05, 1.0),
+        max_tokens: generation.max_tokens,
+        repetition_penalty: generation.repetition_penalty,
         attachments,
         page_clips: pageClips,
-        agent_mode: state.agentMode,
+        agent_mode: generation.agent_mode,
+        workflow_mode: generation.workflow_mode,
+        approval_mode: generation.approval_mode,
+        deep_research: generation.deep_research,
         project_id: state.activeProjectId,
     };
 
@@ -1485,7 +1668,42 @@ function handleSlashCommand(text) {
             }
             renderAgentModeButton();
             scheduleAppStateSave();
-            showToast(`Agent tools ${state.agentMode ? 'enabled' : 'disabled'}`, 'info');
+            if (!state.agentMode && isWorkflowAgentForced()) {
+                showToast('Agent tools remain on automatically in this workflow mode', 'info');
+            } else {
+                showToast(`Agent tools ${getEffectiveAgentMode() ? 'enabled' : 'disabled'}`, 'info');
+            }
+            break;
+        case '/mode':
+            if (['chat', 'plan', 'build'].includes(arg.toLowerCase())) {
+                setActiveProjectWorkflowSettings({ workflow_mode: arg.toLowerCase() });
+                showToast(`Workflow mode set to ${arg.toLowerCase()}`, 'success');
+            } else {
+                showToast('Usage: /mode [chat|plan|build]', 'info');
+            }
+            break;
+        case '/approve':
+            if (['manual', 'auto'].includes(arg.toLowerCase())) {
+                setActiveProjectWorkflowSettings({ approval_mode: arg.toLowerCase() });
+                showToast(arg.toLowerCase() === 'auto' ? 'Auto-approve enabled for build mode' : 'Manual approval restored', 'success');
+            } else {
+                showToast('Usage: /approve [manual|auto]', 'info');
+            }
+            break;
+        case '/research':
+            if (!arg || ['toggle'].includes(arg.toLowerCase())) {
+                const current = getProjectWorkflowSettings();
+                setActiveProjectWorkflowSettings({ deep_research: !current.deep_research });
+                showToast(`Extended research ${!current.deep_research ? 'enabled' : 'disabled'}`, 'success');
+            } else if (['on', 'true', 'enable', 'enabled'].includes(arg.toLowerCase())) {
+                setActiveProjectWorkflowSettings({ deep_research: true });
+                showToast('Extended research enabled', 'success');
+            } else if (['off', 'false', 'disable', 'disabled'].includes(arg.toLowerCase())) {
+                setActiveProjectWorkflowSettings({ deep_research: false });
+                showToast('Extended research disabled', 'success');
+            } else {
+                showToast('Usage: /research [on|off|toggle]', 'info');
+            }
             break;
         case '/workspace':
             if (!arg || arg === 'open') {
@@ -2119,7 +2337,8 @@ function loadSession(id) {
     state.activeSessionId = id;
     state.activeProjectId = session.projectId || state.activeProjectId || 'default';
     state.messages = [...session.messages];
-    dom.activeProjectName.textContent = getActiveProject()?.name || 'Inbox';
+    renderProjects();
+    renderAgentModeButton();
 
     // Re-render messages
     dom.chatMessages.innerHTML = '';
@@ -2212,7 +2431,7 @@ function getActiveProject() {
 function renderProjects() {
     if (!dom.projectSelect) return;
     if (!state.projects.length) {
-        state.projects = [{ id: 'default', name: 'Inbox', color: '#818cf8' }];
+        state.projects = [{ id: 'default', name: 'Inbox', color: '#818cf8', ...WORKFLOW_DEFAULTS }];
     }
     if (!state.projects.some(project => project.id === state.activeProjectId)) {
         state.activeProjectId = state.projects[0].id;
@@ -2226,11 +2445,13 @@ function renderProjects() {
     });
     dom.projectSelect.value = state.activeProjectId || state.projects[0].id;
     dom.activeProjectName.textContent = getActiveProject()?.name || 'Inbox';
+    renderWorkflowControls();
 }
 
 function setActiveProject(projectId) {
     state.activeProjectId = projectId;
     renderProjects();
+    renderAgentModeButton();
     const nextSession = state.sessions.find(s => (s.projectId || 'default') === projectId);
     if (nextSession) {
         loadSession(nextSession.id);
@@ -2242,6 +2463,7 @@ function setActiveProject(projectId) {
     state.workspaceTree = [];
     renderWorkspacePanel();
     fetchWorkspaceTree({ silent: true }).catch(() => null);
+    requestTokenInspection();
     scheduleAppStateSave();
 }
 
@@ -2259,6 +2481,9 @@ function createProject() {
         workspace_label: null,
         workspace_enabled: false,
         workspace_pending_batch: null,
+        workflow_mode: WORKFLOW_DEFAULTS.workflow_mode,
+        approval_mode: WORKFLOW_DEFAULTS.approval_mode,
+        deep_research: WORKFLOW_DEFAULTS.deep_research,
     };
     state.projects.push(project);
     setActiveProject(project.id);
@@ -2864,6 +3089,7 @@ async function requestTokenInspection() {
     clearTimeout(state.inspectorTimer);
     state.inspectorTimer = setTimeout(async () => {
         try {
+            const workflow = getProjectWorkflowSettings();
             const res = await fetch('/api/tokens/inspect', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2877,6 +3103,9 @@ async function requestTokenInspection() {
                     attachments: state.draftAttachments,
                     page_clips: state.pageClips.filter(clip => state.selectedPageClipIds.includes(clip.id)),
                     context_length: state.loadedModelMeta?.context_length || 0,
+                    workflow_mode: workflow.workflow_mode,
+                    approval_mode: workflow.approval_mode,
+                    deep_research: workflow.deep_research,
                 }),
             });
             const data = await res.json();
@@ -2937,6 +3166,7 @@ function setupEventListeners() {
             hideSlashMenu();
             closeConnectorModal();
             closeWorkspaceApprovalModal();
+            toggleQuickSettingsMenu(false);
         }
     });
     dom.chatInput.addEventListener('input', () => {
@@ -2970,6 +3200,9 @@ function setupEventListeners() {
     document.addEventListener('click', (e) => {
         if (!e.target.closest('.model-selector')) {
             closeModelDropdown();
+        }
+        if (!e.target.closest('.quick-settings')) {
+            toggleQuickSettingsMenu(false);
         }
     });
 
@@ -3049,6 +3282,22 @@ function setupEventListeners() {
     dom.btnAddSource?.addEventListener('click', () => openConnectorModal());
     dom.btnOpenWorkspace?.addEventListener('click', () => openWorkspaceSelection());
     dom.btnOpenWorkspaceFooter?.addEventListener('click', () => openWorkspaceSelection());
+    dom.btnQuickSettings?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleQuickSettingsMenu();
+    });
+    dom.quickSettingsMenu?.addEventListener('click', (e) => {
+        e.stopPropagation();
+    });
+    dom.workflowModeSelect?.addEventListener('change', (e) => {
+        setActiveProjectWorkflowSettings({ workflow_mode: e.target.value });
+    });
+    dom.approvalModeSelect?.addEventListener('change', (e) => {
+        setActiveProjectWorkflowSettings({ approval_mode: e.target.value });
+    });
+    dom.workflowDeepResearch?.addEventListener('change', (e) => {
+        setActiveProjectWorkflowSettings({ deep_research: Boolean(e.target.checked) });
+    });
     dom.btnRefreshWorkspace?.addEventListener('click', () => fetchWorkspaceTree());
     dom.btnClearWorkspace?.addEventListener('click', () => clearWorkspaceSelection());
     dom.btnReviewWorkspaceBatch?.addEventListener('click', () => openWorkspaceApprovalModal());
@@ -3156,6 +3405,8 @@ function setupEventListeners() {
                 closeCommandPalette();
             } else if (dom.keyboardModal.classList.contains('visible')) {
                 hideKeyboardModal();
+            } else if (dom.quickSettingsMenu?.classList.contains('open')) {
+                toggleQuickSettingsMenu(false);
             } else if (dom.workspaceApprovalModal?.classList.contains('visible')) {
                 closeWorkspaceApprovalModal();
             } else if (state.isGenerating) {

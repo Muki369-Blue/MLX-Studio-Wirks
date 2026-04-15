@@ -29,8 +29,12 @@ def _next_run(cron_expr: str, base: datetime | None = None) -> datetime:
 
 def _scheduler_loop():
     """Main scheduler loop — runs in background thread."""
-    from database import SessionLocal, Schedule, Persona, Content
-    import comfy_api
+    try:
+        from .database import SessionLocal, Schedule, Persona, Content
+        from . import comfy_api
+    except ImportError:
+        from database import SessionLocal, Schedule, Persona, Content
+        import comfy_api
 
     logger.info("Scheduler started")
 

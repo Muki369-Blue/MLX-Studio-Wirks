@@ -20,6 +20,7 @@ import socket
 import subprocess
 import atexit
 import time
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -62,21 +63,27 @@ def ensure_comfyui() -> bool:
         return _wait_for_comfyui(timeout=30)
 
     comfy_data = Path.home() / "Documents" / "ComfyUI"
-    comfy_venv_python = comfy_data / ".venv" / "bin" / "python"
-    comfy_app_main = Path("/Applications/ComfyUI.app/Contents/Resources/ComfyUI/main.py")
-    extra_config = Path.home() / "Library" / "Application Support" / "ComfyUI" / "extra_models_config.yaml"
 
-    # Strategy 1: Use Desktop app's code with local venv + data dir
-    if comfy_venv_python.exists() and comfy_app_main.exists():
+    # Strategy 1: Try local ComfyUI checkout in ~/Documents/ComfyUI
+    main_candidates = [
+        comfy_data / "main.py",
+        comfy_data / "ComfyUI" / "main.py",
+    ]
+    py_candidates = [
+        comfy_data / ".venv" / "bin" / "python",
+        comfy_data / ".venv" / "Scripts" / "python.exe",
+        Path(os.environ.get("PYTHON", "")) if os.environ.get("PYTHON") else None,
+    ]
+    comfy_main = next((p for p in main_candidates if p.exists()), None)
+    comfy_python = next((p for p in py_candidates if p and p.exists()), None)
+
+    if comfy_main and comfy_python:
         cmd = [
-            str(comfy_venv_python),
-            str(comfy_app_main),
+            str(comfy_python),
+            str(comfy_main),
             "--port", str(COMFY_PORT),
             "--base-directory", str(comfy_data),
         ]
-        if extra_config.exists():
-            cmd += ["--extra-model-paths-config", str(extra_config)]
-
         logger.info("Starting ComfyUI: %s", " ".join(cmd))
         try:
             _comfyui_process = subprocess.Popen(
@@ -88,8 +95,34 @@ def ensure_comfyui() -> bool:
             atexit.register(_shutdown_comfyui)
             return _wait_for_comfyui(timeout=60)
         except Exception as exc:
-            logger.error("Failed to start ComfyUI: %s", exc)
-            return False
+            logger.error("Failed to start ComfyUI from local checkout: %s", exc)
+
+    # Strategy 1b (macOS): Use Desktop app bundle with local venv + data dir
+    comfy_venv_python = comfy_data / ".venv" / "bin" / "python"
+    comfy_app_main = Path("/Applications/ComfyUI.app/Contents/Resources/ComfyUI/main.py")
+    extra_config = Path.home() / "Library" / "Application Support" / "ComfyUI" / "extra_models_config.yaml"
+    if comfy_venv_python.exists() and comfy_app_main.exists():
+        cmd = [
+            str(comfy_venv_python),
+            str(comfy_app_main),
+            "--port", str(COMFY_PORT),
+            "--base-directory", str(comfy_data),
+        ]
+        if extra_config.exists():
+            cmd += ["--extra-model-paths-config", str(extra_config)]
+
+        logger.info("Starting ComfyUI Desktop bundle: %s", " ".join(cmd))
+        try:
+            _comfyui_process = subprocess.Popen(
+                cmd,
+                cwd=str(comfy_data),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            atexit.register(_shutdown_comfyui)
+            return _wait_for_comfyui(timeout=60)
+        except Exception as exc:
+            logger.error("Failed to start ComfyUI Desktop bundle: %s", exc)
 
     # Strategy 2: Try `open -a ComfyUI` (Desktop app)
     app_path = Path("/Applications/ComfyUI.app")
@@ -400,12 +433,18 @@ def _flux_redux_workflow(
     return workflow
 
 
-def queue_prompt(positive_prompt: str, lora_name: Optional[str] = None, reference_image: Optional[str] = None, negative_prompt: Optional[str] = None) -> dict:
+def queue_prompt(
+    positive_prompt: str,
+    lora_name: Optional[str] = None,
+    reference_image: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    seed: Optional[int] = None,
+) -> dict:
     """Queue a generation job on ComfyUI. Uses Redux workflow if reference_image is provided."""
     if reference_image:
-        workflow = _flux_redux_workflow(positive_prompt, reference_image, lora_name, negative_prompt)
+        workflow = _flux_redux_workflow(positive_prompt, reference_image, lora_name, negative_prompt, seed=seed)
     else:
-        workflow = _flux_workflow(positive_prompt, lora_name, negative_prompt)
+        workflow = _flux_workflow(positive_prompt, lora_name, negative_prompt, seed=seed)
     payload = {
         "prompt": workflow,
         "client_id": CLIENT_ID,

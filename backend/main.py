@@ -16,26 +16,48 @@ from sqlalchemy import func
 
 import requests
 
-from database import (
-    get_db, init_db,
-    Persona, Content, ContentSet, Link,
-    Schedule, PostQueue, ChatMessage, Analytics,
-)
-from schemas import (
-    PersonaCreate, PersonaOut,
-    GenerationRequest, GenerationOut,
-    LinkCreate, LinkOut,
-    ContentSetCreate, ContentSetOut,
-    ScheduleCreate, ScheduleOut,
-    PostQueueCreate, PostQueueOut,
-    ChatMessageIn, ChatMessageOut,
-    AnalyticsEntry, AnalyticsOut, AnalyticsSummary,
-    CaptionRequest, CaptionOut,
-    LoraTrainingRequest,
-)
-import comfy_api
-from scheduler import start_scheduler, stop_scheduler
-from postprocess import process_completed_image, check_upscale_status
+try:
+    from .database import (
+        get_db, init_db, SessionLocal,
+        Persona, Content, ContentSet, Link,
+        Schedule, PostQueue, ChatMessage, Analytics,
+    )
+    from .schemas import (
+        PersonaCreate, PersonaOut,
+        GenerationRequest, GenerationOut,
+        LinkCreate, LinkOut,
+        ContentSetCreate, ContentSetOut,
+        ScheduleCreate, ScheduleOut,
+        PostQueueCreate, PostQueueOut,
+        ChatMessageIn, ChatMessageOut,
+        AnalyticsEntry, AnalyticsOut, AnalyticsSummary,
+        CaptionRequest, CaptionOut,
+        LoraTrainingRequest,
+    )
+    from . import comfy_api
+    from .scheduler import start_scheduler, stop_scheduler
+    from .postprocess import process_completed_image, check_upscale_status
+except ImportError:
+    from database import (
+        get_db, init_db, SessionLocal,
+        Persona, Content, ContentSet, Link,
+        Schedule, PostQueue, ChatMessage, Analytics,
+    )
+    from schemas import (
+        PersonaCreate, PersonaOut,
+        GenerationRequest, GenerationOut,
+        LinkCreate, LinkOut,
+        ContentSetCreate, ContentSetOut,
+        ScheduleCreate, ScheduleOut,
+        PostQueueCreate, PostQueueOut,
+        ChatMessageIn, ChatMessageOut,
+        AnalyticsEntry, AnalyticsOut, AnalyticsSummary,
+        CaptionRequest, CaptionOut,
+        LoraTrainingRequest,
+    )
+    import comfy_api
+    from scheduler import start_scheduler, stop_scheduler
+    from postprocess import process_completed_image, check_upscale_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -176,7 +198,13 @@ def get_reference_image(persona_id: int, db: Session = Depends(get_db)):
     ref_path = Path(persona.reference_image)
     if not ref_path.exists():
         raise HTTPException(status_code=404, detail="Reference image file missing")
-    media_type = "image/png" if ref_path.suffix == ".png" else "image/jpeg"
+    suffix = ref_path.suffix.lower()
+    if suffix == ".png":
+        media_type = "image/png"
+    elif suffix == ".webp":
+        media_type = "image/webp"
+    else:
+        media_type = "image/jpeg"
     return FileResponse(ref_path, media_type=media_type)
 
 
@@ -320,7 +348,7 @@ def list_generations(db: Session = Depends(get_db)):
 
     # Auto-unload models when no more jobs are generating
     if any_just_completed:
-        still_generating = any(c.status == "generating" for c in gens)
+        still_generating = db.query(Content).filter(Content.status == "generating").count() > 0
         if not still_generating:
             threading.Thread(target=_deferred_memory_cleanup, daemon=True).start()
 
@@ -1406,7 +1434,8 @@ async def upload_training_images(
 
     saved = []
     for f in files:
-        safe_name = f"{persona_id}_{len(saved):03d}_{f.filename}"
+        original = Path(f.filename or "upload.png").name
+        safe_name = f"{persona_id}_{len(saved):03d}_{original}"
         dest = persona_dir / safe_name
         content = await f.read()
         dest.write_bytes(content)
@@ -1430,7 +1459,6 @@ def start_lora_training(persona_id: int, body: LoraTrainingRequest, db: Session 
     db.commit()
 
     def _train():
-        from .database import SessionLocal
         tdb = SessionLocal()
         try:
             # Build kohya-style training command
@@ -1497,7 +1525,10 @@ def create_schedule(body: ScheduleCreate, db: Session = Depends(get_db)):
     if not persona:
         raise HTTPException(status_code=404, detail="Persona not found")
 
-    from .scheduler import _next_run
+    try:
+        from .scheduler import _next_run
+    except ImportError:
+        from scheduler import _next_run
     sched = Schedule(
         persona_id=body.persona_id,
         prompt_template=body.prompt_template,
@@ -1705,7 +1736,13 @@ def create_content_set(body: ContentSetCreate, db: Session = Depends(get_db)):
 
     for i in range(body.set_size):
         seed = base_seed + i * 42  # Walk seeds for variation
-        comfy_resp = comfy_api.queue_prompt(full_prompt, lora, reference_image=ref_comfy_name, negative_prompt=body.negative_prompt)
+        comfy_resp = comfy_api.queue_prompt(
+            full_prompt,
+            lora,
+            reference_image=ref_comfy_name,
+            negative_prompt=body.negative_prompt,
+            seed=seed,
+        )
 
         content = Content(
             persona_id=persona.id,

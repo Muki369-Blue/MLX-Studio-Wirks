@@ -1,12 +1,15 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import {
   fetchVideoPresets,
   generateVideo,
-  refinePrompt,
+  refineVideoPrompt,
+  uploadVideoStartImage,
+  checkVideoStatus,
   type Persona,
   type VideoPreset,
+  API,
 } from "../lib/api";
 
 export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
@@ -18,9 +21,50 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
   const [refiningVideo, setRefiningVideo] = useState(false);
   const [videoIntensity, setVideoIntensity] = useState<"light" | "medium" | "heavy">("medium");
 
+  // I2V state
+  const [mode, setMode] = useState<"t2v" | "i2v">("t2v");
+  const [startImageFile, setStartImageFile] = useState<File | null>(null);
+  const [startImagePreview, setStartImagePreview] = useState<string | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [comfyImageName, setComfyImageName] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Video settings
+  const [width, setWidth] = useState(832);
+  const [height, setHeight] = useState(480);
+  const [length, setLength] = useState(81);
+  const [steps, setSteps] = useState(20);
+  const [cfg, setCfg] = useState(6.0);
+  const [showSettings, setShowSettings] = useState(false);
+
+  // Status polling
+  const [contentId, setContentId] = useState<number | null>(null);
+  const [videoStatus, setVideoStatus] = useState<string | null>(null);
+  const [videoOutputs, setVideoOutputs] = useState<any[]>([]);
+
   useEffect(() => {
     fetchVideoPresets().then(setVideoPresets);
   }, []);
+
+  // Poll for video completion
+  useEffect(() => {
+    if (!contentId || videoStatus === "completed" || videoStatus === "error") return;
+    const interval = setInterval(async () => {
+      try {
+        const result = await checkVideoStatus(contentId);
+        setVideoStatus(result.status);
+        if (result.status === "completed" && result.outputs?.length) {
+          setVideoOutputs(result.outputs);
+          setGeneratingVideo(false);
+          setVideoResult("Video generation complete!");
+          clearInterval(interval);
+        }
+      } catch {
+        // keep polling
+      }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [contentId, videoStatus]);
 
   const handleSelectVideoPreset = (presetId: string) => {
     const preset = videoPresets.find((item) => item.id === presetId);
@@ -30,40 +74,157 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
   const handleRefineVideo = async () => {
     if (!videoPrompt.trim()) return;
     setRefiningVideo(true);
+    setVideoResult(null);
     try {
-      const data = await refinePrompt(videoPrompt, videoIntensity);
+      const data = await refineVideoPrompt(videoPrompt, videoIntensity);
       setVideoPrompt(data.refined);
-      setVideoResult("✨ Motion prompt refined by Celeste");
-    } catch {
-      setVideoResult("Refine failed — is Ollama running?");
+      setVideoResult("✨ Motion prompt refined");
+    } catch (error) {
+      setVideoResult(error instanceof Error ? error.message : "Refine failed.");
     }
     setRefiningVideo(false);
   };
 
+  const handleImageSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setStartImageFile(file);
+    setStartImagePreview(URL.createObjectURL(file));
+    setComfyImageName(null);
+
+    // Upload to ComfyUI immediately
+    setUploadingImage(true);
+    try {
+      const result = await uploadVideoStartImage(file);
+      setComfyImageName(result.comfy_image_name);
+    } catch (error) {
+      setVideoResult(error instanceof Error ? error.message : "Failed to upload image");
+    }
+    setUploadingImage(false);
+  };
+
+  const clearStartImage = () => {
+    setStartImageFile(null);
+    setStartImagePreview(null);
+    setComfyImageName(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
   const handleGenerateVideo = async () => {
     if (!videoPersona || !videoPrompt.trim()) return;
+    if (mode === "i2v" && !comfyImageName) {
+      setVideoResult("Upload a start image first for Image-to-Video mode.");
+      return;
+    }
     setGeneratingVideo(true);
     setVideoResult(null);
+    setVideoOutputs([]);
+    setVideoStatus(null);
+    setContentId(null);
     try {
-      const res = await generateVideo(videoPersona, videoPrompt);
-      setVideoResult(res.message || "Video generation queued!");
-    } catch {
-      setVideoResult("Failed to generate video.");
+      const res = await generateVideo(videoPersona, videoPrompt, {
+        width,
+        height,
+        length,
+        steps,
+        cfg,
+        start_image: mode === "i2v" ? comfyImageName ?? undefined : undefined,
+      });
+      setContentId(res.id);
+      setVideoStatus("processing");
+      setVideoResult(`Video queued (${res.mode === "i2v" ? "Image→Video" : "Text→Video"}) — polling...`);
+    } catch (error) {
+      setVideoResult(error instanceof Error ? error.message : "Failed to generate video.");
+      setGeneratingVideo(false);
     }
-    setGeneratingVideo(false);
   };
+
+  const frameCount = Math.floor((length - 1) / 4) + 1;
+  const durationSecs = (length / 16).toFixed(1);
 
   return (
     <div className="space-y-6">
       <div className="bg-zinc-900 p-6 rounded-xl border border-zinc-800">
         <h2 className="text-xl font-semibold mb-4 flex items-center gap-2">
           <span>🎥</span> ShadowVid
+          <span className="text-xs bg-violet-600/20 text-violet-300 px-2 py-0.5 rounded-full ml-auto">
+            Wan 2.1
+          </span>
         </h2>
         <p className="text-xs text-zinc-500 mb-3">
-          Dedicated video workspace for motion prompts and animated WEBP generation.
+          Video generation powered by Wan 2.1 via local ComfyUI.
         </p>
 
         <div className="space-y-3">
+          {/* Mode selector */}
+          <div className="flex gap-2">
+            <button
+              onClick={() => setMode("t2v")}
+              className={`flex-1 text-xs px-3 py-2 rounded-lg border transition-colors ${
+                mode === "t2v"
+                  ? "bg-indigo-600/20 text-indigo-300 border-indigo-500"
+                  : "bg-zinc-800 text-zinc-500 border-zinc-700 hover:border-zinc-600"
+              }`}
+            >
+              📝 Text → Video
+            </button>
+            <button
+              onClick={() => setMode("i2v")}
+              className={`flex-1 text-xs px-3 py-2 rounded-lg border transition-colors ${
+                mode === "i2v"
+                  ? "bg-violet-600/20 text-violet-300 border-violet-500"
+                  : "bg-zinc-800 text-zinc-500 border-zinc-700 hover:border-zinc-600"
+              }`}
+            >
+              🖼️ Image → Video
+            </button>
+          </div>
+
+          {/* I2V: Start image upload */}
+          {mode === "i2v" && (
+            <div className="border border-dashed border-zinc-700 rounded-lg p-3">
+              <label className="text-xs text-zinc-500 mb-2 block">Start Image</label>
+              {startImagePreview ? (
+                <div className="relative">
+                  <img
+                    src={startImagePreview}
+                    alt="Start"
+                    className="max-h-32 rounded-lg object-cover mx-auto"
+                  />
+                  <button
+                    onClick={clearStartImage}
+                    className="absolute top-1 right-1 bg-zinc-900/80 text-zinc-400 hover:text-white rounded-full w-5 h-5 flex items-center justify-center text-xs"
+                  >
+                    ×
+                  </button>
+                  {uploadingImage && (
+                    <div className="absolute inset-0 bg-black/50 flex items-center justify-center rounded-lg">
+                      <span className="text-xs text-violet-300">Uploading...</span>
+                    </div>
+                  )}
+                  {comfyImageName && (
+                    <p className="text-xs text-emerald-400 mt-1 text-center">✓ Ready</p>
+                  )}
+                </div>
+              ) : (
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="w-full py-4 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+                >
+                  Click to upload a start image
+                </button>
+              )}
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleImageSelect}
+                className="hidden"
+              />
+            </div>
+          )}
+
+          {/* Persona selector */}
           <select
             className="w-full p-2.5 bg-zinc-800 border border-zinc-700 rounded-lg text-sm focus:border-violet-500 focus:outline-none"
             value={videoPersona ?? ""}
@@ -75,6 +236,7 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
             ))}
           </select>
 
+          {/* Motion presets */}
           <div>
             <label className="text-xs text-zinc-500 mb-1 block">Motion Preset</label>
             <select
@@ -89,6 +251,7 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
             </select>
           </div>
 
+          {/* Prompt textarea */}
           <textarea
             className="w-full p-2.5 bg-zinc-800 border border-zinc-700 rounded-lg text-sm placeholder-zinc-500 focus:border-violet-500 focus:outline-none min-h-[72px]"
             placeholder="Motion prompt (e.g. 'hair blowing in wind, gentle smile, looking at camera')"
@@ -96,6 +259,7 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
             onChange={(e) => setVideoPrompt(e.target.value)}
           />
 
+          {/* Refine controls */}
           <div className="flex items-center gap-2">
             <div className="flex gap-1">
               {(["light", "medium", "heavy"] as const).map((level) => (
@@ -122,20 +286,97 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
             </button>
           </div>
 
+          {/* Video settings toggle */}
           <button
-            onClick={handleGenerateVideo}
-            disabled={generatingVideo || !videoPersona || !videoPrompt.trim()}
-            className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
+            onClick={() => setShowSettings(!showSettings)}
+            className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
           >
-            {generatingVideo ? "Generating..." : "Generate Video/GIF"}
+            ⚙️ {showSettings ? "Hide" : "Show"} video settings
           </button>
 
+          {showSettings && (
+            <div className="grid grid-cols-2 gap-2 bg-zinc-800/50 p-3 rounded-lg border border-zinc-700">
+              <div>
+                <label className="text-xs text-zinc-500 block mb-1">Width</label>
+                <input type="number" step={16} min={256} max={1280} value={width}
+                  onChange={e => setWidth(Number(e.target.value))}
+                  className="w-full p-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs" />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-500 block mb-1">Height</label>
+                <input type="number" step={16} min={256} max={1280} value={height}
+                  onChange={e => setHeight(Number(e.target.value))}
+                  className="w-full p-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs" />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-500 block mb-1">Frames ({durationSecs}s @ 16fps)</label>
+                <input type="number" step={4} min={17} max={201} value={length}
+                  onChange={e => setLength(Number(e.target.value))}
+                  className="w-full p-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs" />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-500 block mb-1">Steps</label>
+                <input type="number" min={4} max={50} value={steps}
+                  onChange={e => setSteps(Number(e.target.value))}
+                  className="w-full p-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs" />
+              </div>
+              <div>
+                <label className="text-xs text-zinc-500 block mb-1">CFG</label>
+                <input type="number" step={0.5} min={1} max={15} value={cfg}
+                  onChange={e => setCfg(Number(e.target.value))}
+                  className="w-full p-1.5 bg-zinc-800 border border-zinc-700 rounded text-xs" />
+              </div>
+              <div className="flex items-end">
+                <span className="text-xs text-zinc-600">{frameCount} latent frames</span>
+              </div>
+            </div>
+          )}
+
+          {/* Generate button */}
+          <button
+            onClick={handleGenerateVideo}
+            disabled={generatingVideo || !videoPersona || !videoPrompt.trim() || (mode === "i2v" && !comfyImageName)}
+            className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
+          >
+            {generatingVideo
+              ? `Generating ${mode === "i2v" ? "I2V" : "T2V"}...`
+              : `Generate ${mode === "i2v" ? "Image→Video" : "Text→Video"}`}
+          </button>
+
+          {/* Status / result */}
           {videoResult && (
             <p className={`text-xs p-2 rounded-lg ${
-              videoResult.includes("Failed") ? "bg-red-900/30 text-red-300" : "bg-emerald-900/30 text-emerald-300"
+              videoResult.includes("Failed") || videoResult.includes("error")
+                ? "bg-red-900/30 text-red-300"
+                : videoResult.includes("complete")
+                  ? "bg-emerald-900/30 text-emerald-300"
+                  : "bg-blue-900/30 text-blue-300"
             }`}>
               {videoResult}
             </p>
+          )}
+
+          {/* Video output display */}
+          {videoOutputs.length > 0 && (
+            <div className="border border-zinc-700 rounded-lg p-3">
+              <label className="text-xs text-zinc-500 block mb-2">Output</label>
+              {videoOutputs.map((out, i) => (
+                <div key={i} className="text-center">
+                  <img
+                    src={`${API}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`}
+                    alt="Generated video"
+                    className="max-w-full rounded-lg mx-auto"
+                  />
+                  <a
+                    href={`${API}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`}
+                    download={out.filename}
+                    className="inline-block mt-2 text-xs text-violet-400 hover:text-violet-300"
+                  >
+                    ⬇ Download {out.filename}
+                  </a>
+                </div>
+              ))}
+            </div>
           )}
         </div>
       </div>

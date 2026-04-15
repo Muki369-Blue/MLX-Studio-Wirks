@@ -230,3 +230,16 @@ class CaptionOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ─── Video Generation ────────────────────────────────────────────────
+
+class VideoGenerationRequest(BaseModel):
+    prompt_extra: str
+    negative_prompt: Optional[str] = None
+    width: int = 832
+    height: int = 480
+    length: int = 81
+    steps: int = 20
+    cfg: float = 6.0
+    start_image: Optional[str] = None  # ComfyUI image name for I2V

@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:local": "node scripts/run-mode.js local",
+    "dev:split": "node scripts/run-mode.js split",
     "build": "next build",
     "start": "next start",
     "lint": "next lint"

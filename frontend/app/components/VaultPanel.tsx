@@ -57,7 +57,7 @@ export default function VaultPanel({ personas }: { personas: Persona[] }) {
   };
 
   // Group items by persona
-  const personaIds = [...new Set(items.map((i) => i.persona_id))];
+  const personaIds = Array.from(new Set(items.map((i) => i.persona_id)));
 
   // Items for the currently open folder
   const folderItems = openFolder !== null ? items.filter((i) => i.persona_id === openFolder) : [];

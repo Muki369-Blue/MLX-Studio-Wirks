@@ -363,7 +363,7 @@ export default function Dashboard() {
             {openFolder === null ? (
               /* ── Folder grid: one card per persona with generations ── */
               (() => {
-                const personaIds = [...new Set(generations.map((g) => g.persona_id))];
+                const personaIds = Array.from(new Set(generations.map((g) => g.persona_id)));
                 return personaIds.length === 0 ? (
                   <p className="text-zinc-500 text-sm">No generations yet.</p>
                 ) : (
@@ -445,7 +445,7 @@ export default function Dashboard() {
                               alt={g.prompt_used ?? "Generated image"}
                               filePath={g.file_path}
                               className="w-full h-full object-cover cursor-pointer"
-                              onClick={() => setLightbox({ src: imageUrl(g.file_path), prompt: g.prompt_used ?? "" })}
+                              onClick={() => setLightbox({ src: imageUrl(g.file_path ?? ""), prompt: g.prompt_used ?? "" })}
                             />
                           ) : g.status === "generating" ? (
                             <div className="w-full h-full flex items-center justify-center">

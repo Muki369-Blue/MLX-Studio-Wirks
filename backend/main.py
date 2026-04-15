@@ -34,6 +34,7 @@ try:
         AnalyticsEntry, AnalyticsOut, AnalyticsSummary,
         CaptionRequest, CaptionOut,
         LoraTrainingRequest,
+        VideoGenerationRequest,
     )
     from . import comfy_api
     from .scheduler import start_scheduler, stop_scheduler
@@ -55,6 +56,7 @@ except ImportError:
         AnalyticsEntry, AnalyticsOut, AnalyticsSummary,
         CaptionRequest, CaptionOut,
         LoraTrainingRequest,
+        VideoGenerationRequest,
     )
     import comfy_api
     from scheduler import start_scheduler, stop_scheduler
@@ -1199,6 +1201,48 @@ def refine_prompt(body: RefineRequest):
     return {"original": body.prompt, "refined": refined, "model": OLLAMA_MODEL}
 
 
+@app.post("/refine-video-prompt")
+def refine_video_prompt(body: RefineRequest):
+    """Enhance a video motion prompt using Celeste via Ollama — same as refine_prompt but video-tuned."""
+    prompt = body.prompt.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    intensity_note = _INTENSITY_INSTRUCTIONS.get(body.intensity, _INTENSITY_INSTRUCTIONS["medium"])
+
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/chat",
+            json={
+                "model": OLLAMA_MODEL,
+                "stream": False,
+                "options": {"temperature": 0.8, "num_predict": 300},
+                "messages": [
+                    {"role": "system", "content": (
+                        "You are a video motion prompt expert. Rewrite motion prompts to be more detailed and cinematic "
+                        "for AI video generation. Focus on describing motion, camera movement, lighting changes, and temporal flow. "
+                        "Return ONLY the rewritten prompt, no explanations."
+                    )},
+                    {"role": "user", "content": f"{intensity_note}\n\nRewrite this video prompt:\n{prompt}"},
+                ],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        refined = data.get("message", {}).get("content", "").strip()
+        if not refined:
+            raise ValueError("Empty response from model")
+    except Exception as e:
+        logger.error("Ollama video refine error: %s", e)
+        raise HTTPException(status_code=502, detail=f"Ollama error: {str(e)}")
+
+    if refined.startswith('"') and refined.endswith('"'):
+        refined = refined[1:-1]
+
+    return {"original": body.prompt, "refined": refined, "model": OLLAMA_MODEL}
+
+
 # ─── Voice / TTS (Edge-TTS) ─────────────────────────────────────────
 
 VOICE_PRESETS = [
@@ -1998,123 +2042,100 @@ def list_conversations(persona_id: int, db: Session = Depends(get_db)):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# FEATURE 9: Video / GIF Generation (AnimateDiff)
+# FEATURE 9: Video / GIF Generation (Wan 2.1)
 # ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/upload-video-start-image")
+def upload_video_start_image(file: UploadFile = File(...)):
+    """Upload an image to ComfyUI's input directory for Image-to-Video generation."""
+    if not comfy_api.is_comfy_running():
+        raise HTTPException(status_code=503, detail="ComfyUI is not running")
+
+    import tempfile
+    suffix = Path(file.filename or "image.png").suffix or ".png"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file.file.read())
+        tmp_path = tmp.name
+
+    comfy_name = comfy_api.upload_image_to_comfyui(tmp_path)
+    os.unlink(tmp_path)
+
+    if not comfy_name:
+        raise HTTPException(status_code=500, detail="Failed to upload image to ComfyUI")
+
+    return {"comfy_image_name": comfy_name}
+
 
 @app.post("/generate-video/{persona_id}")
 def generate_video(
     persona_id: int,
-    body: GenerationRequest,
+    body: VideoGenerationRequest,
     db: Session = Depends(get_db),
 ):
-    """Generate a short video/GIF using AnimateDiff via ComfyUI."""
+    """Generate video via local ComfyUI Wan 2.1 (T2V or I2V)."""
+    if not comfy_api.is_comfy_running():
+        raise HTTPException(status_code=503, detail="ComfyUI is not running. Start it first.")
+
     persona = db.query(Persona).filter(Persona.id == persona_id).first()
     if not persona:
         raise HTTPException(status_code=404, detail="Persona not found")
 
     full_prompt = f"{persona.prompt_base}, {body.prompt_extra}"
 
-    # AnimateDiff workflow for ComfyUI
-    seed = random.randint(0, 2**53)
-    workflow = {
-        "11": {
-            "class_type": "DualCLIPLoader",
-            "inputs": {
-                "clip_name1": "t5xxl_fp16.safetensors",
-                "clip_name2": "clip_l.safetensors",
-                "type": "flux",
-            },
-        },
-        "12": {
-            "class_type": "UNETLoader",
-            "inputs": {
-                "unet_name": "flux1-schnell.safetensors",
-                "weight_dtype": "default",
-            },
-        },
-        "10": {
-            "class_type": "VAELoader",
-            "inputs": {"vae_name": "ae.safetensors"},
-        },
-        "6": {
-            "class_type": "CLIPTextEncode",
-            "inputs": {"text": full_prompt, "clip": ["11", 0]},
-        },
-        "26": {
-            "class_type": "FluxGuidance",
-            "inputs": {"guidance": 3.5, "conditioning": ["6", 0]},
-        },
-        "25": {
-            "class_type": "RandomNoise",
-            "inputs": {"noise_seed": seed},
-        },
-        "16": {
-            "class_type": "KSamplerSelect",
-            "inputs": {"sampler_name": "euler"},
-        },
-        "17": {
-            "class_type": "BasicScheduler",
-            "inputs": {"scheduler": "simple", "steps": 4, "denoise": 1, "model": ["12", 0]},
-        },
-        "22": {
-            "class_type": "BasicGuider",
-            "inputs": {"model": ["12", 0], "conditioning": ["26", 0]},
-        },
-        "27": {
-            "class_type": "EmptySD3LatentImage",
-            "inputs": {"width": 512, "height": 512, "batch_size": 16},  # 16 frames
-        },
-        "13": {
-            "class_type": "SamplerCustomAdvanced",
-            "inputs": {
-                "noise": ["25", 0],
-                "guider": ["22", 0],
-                "sampler": ["16", 0],
-                "sigmas": ["17", 0],
-                "latent_image": ["27", 0],
-            },
-        },
-        "8": {
-            "class_type": "VAEDecode",
-            "inputs": {"samples": ["13", 0], "vae": ["10", 0]},
-        },
-        "9": {
-            "class_type": "SaveAnimatedWEBP",
-            "inputs": {
-                "filename_prefix": "Empire/video",
-                "fps": 8,
-                "lossless": False,
-                "quality": 85,
-                "method": "default",
-                "images": ["8", 0],
-            },
-        },
-    }
+    result = comfy_api.queue_video(
+        positive_prompt=full_prompt,
+        start_image=body.start_image,
+        negative_prompt=body.negative_prompt,
+        width=body.width,
+        height=body.height,
+        length=body.length,
+        steps=body.steps,
+        cfg=body.cfg,
+    )
 
-    try:
-        resp = requests.post(
-            f"{comfy_api.COMFY_BASE}/prompt",
-            json={"prompt": workflow, "client_id": comfy_api.CLIENT_ID},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        comfy_resp = resp.json()
-    except Exception as e:
-        comfy_resp = {"error": str(e)}
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=result["error"])
+
+    prompt_id = result.get("prompt_id")
 
     content = Content(
-        persona_id=persona.id,
+        persona_id=persona_id,
         prompt_used=full_prompt,
-        comfy_job_id=comfy_resp.get("prompt_id"),
-        status="failed" if "error" in comfy_resp else "generating",
-        seed=seed,
-        width=512,
-        height=512,
+        comfy_job_id=prompt_id,
+        status="processing",
+        tags="video",
     )
     db.add(content)
     db.commit()
     db.refresh(content)
-    return {"id": content.id, "status": content.status, "comfy_job_id": content.comfy_job_id}
+
+    return {
+        "id": content.id,
+        "prompt_id": prompt_id,
+        "status": "processing",
+        "mode": "i2v" if body.start_image else "t2v",
+    }
+
+
+@app.get("/video-status/{content_id}")
+def get_video_status(content_id: int, db: Session = Depends(get_db)):
+    """Check video generation status and return output files."""
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="Content not found")
+
+    if not content.comfy_job_id:
+        return {"status": content.status, "outputs": []}
+
+    result = comfy_api.get_video_job_status(content.comfy_job_id)
+
+    if result["status"] == "completed" and result.get("outputs"):
+        first_output = result["outputs"][0]
+        content.file_path = first_output["filename"]
+        content.status = "completed"
+        db.commit()
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════

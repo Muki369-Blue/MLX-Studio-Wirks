@@ -28,7 +28,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-COMFY_PORT = 8188
+COMFY_PORT = int(os.environ.get("COMFY_PORT", "8000"))
 COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
 CLIENT_ID = str(uuid.uuid4())
 
@@ -431,6 +431,326 @@ def _flux_redux_workflow(
     workflow["22"]["inputs"]["conditioning"] = ["41", 0]
 
     return workflow
+
+
+# ─── Wan 2.1 Video Workflows ─────────────────────────────────────────
+
+
+def _wan_t2v_workflow(
+    positive_prompt: str,
+    negative_prompt: Optional[str] = None,
+    width: int = 832,
+    height: int = 480,
+    length: int = 81,
+    steps: int = 20,
+    cfg: float = 6.0,
+    seed: Optional[int] = None,
+) -> dict:
+    """
+    Wan 2.1 Text-to-Video workflow (1.3B).
+
+    Pipeline:
+      Node 1  — UNETLoader   (wan2.1_t2v_1.3B_bf16)
+      Node 2  — CLIPLoader   (umt5_xxl_fp8_e4m3fn_scaled, type=wan)
+      Node 3  — VAELoader    (wan_2.1_vae)
+      Node 4  — CLIPTextEncode (positive prompt)
+      Node 5  — CLIPTextEncode (negative prompt)
+      Node 6  — WanImageToVideo (creates empty video latent)
+      Node 7  — KSampler
+      Node 8  — VAEDecode
+      Node 9  — SaveAnimatedWEBP
+    """
+    if seed is None:
+        seed = random.randint(0, 2**53)
+
+    workflow = {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+                "unet_name": "wan2.1_t2v_1.3B_bf16.safetensors",
+                "weight_dtype": "default",
+            },
+        },
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+                "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                "type": "wan",
+            },
+        },
+        "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+                "vae_name": "wan_2.1_vae.safetensors",
+            },
+        },
+        "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": positive_prompt,
+                "clip": ["2", 0],
+            },
+        },
+        "5": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": negative_prompt or "",
+                "clip": ["2", 0],
+            },
+        },
+        "6": {
+            "class_type": "WanImageToVideo",
+            "inputs": {
+                "positive": ["4", 0],
+                "negative": ["5", 0],
+                "vae": ["3", 0],
+                "width": width,
+                "height": height,
+                "length": length,
+                "batch_size": 1,
+            },
+        },
+        "7": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["6", 0],
+                "negative": ["6", 1],
+                "latent_image": ["6", 2],
+                "seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+            },
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["7", 0],
+                "vae": ["3", 0],
+            },
+        },
+        "9": {
+            "class_type": "SaveAnimatedWEBP",
+            "inputs": {
+                "filename_prefix": "Empire/video",
+                "fps": 16.0,
+                "lossless": False,
+                "quality": 85,
+                "method": "default",
+                "images": ["8", 0],
+            },
+        },
+    }
+    return workflow
+
+
+def _wan_i2v_workflow(
+    positive_prompt: str,
+    start_image_name: str,
+    negative_prompt: Optional[str] = None,
+    width: int = 832,
+    height: int = 480,
+    length: int = 81,
+    steps: int = 20,
+    cfg: float = 6.0,
+    seed: Optional[int] = None,
+) -> dict:
+    """
+    Wan 2.1 Image-to-Video workflow (14B fp8).
+
+    Same pipeline as T2V but uses the I2V model, adds CLIPVisionLoader +
+    CLIPVisionEncode + LoadImage, and feeds start_image + clip_vision_output
+    into WanImageToVideo.
+
+    Extra nodes vs T2V:
+      Node 10 — CLIPVisionLoader (clip_vision_h)
+      Node 11 — LoadImage        (the start image)
+      Node 12 — CLIPVisionEncode (encodes start image for conditioning)
+    """
+    if seed is None:
+        seed = random.randint(0, 2**53)
+
+    workflow = {
+        "1": {
+            "class_type": "UNETLoader",
+            "inputs": {
+                "unet_name": "wan2.1_i2v_480p_14B_fp8_scaled.safetensors",
+                "weight_dtype": "fp8_e4m3fn",
+            },
+        },
+        "2": {
+            "class_type": "CLIPLoader",
+            "inputs": {
+                "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                "type": "wan",
+            },
+        },
+        "3": {
+            "class_type": "VAELoader",
+            "inputs": {
+                "vae_name": "wan_2.1_vae.safetensors",
+            },
+        },
+        "4": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": positive_prompt,
+                "clip": ["2", 0],
+            },
+        },
+        "5": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": negative_prompt or "",
+                "clip": ["2", 0],
+            },
+        },
+        "10": {
+            "class_type": "CLIPVisionLoader",
+            "inputs": {
+                "clip_name": "clip_vision_h.safetensors",
+            },
+        },
+        "11": {
+            "class_type": "LoadImage",
+            "inputs": {
+                "image": start_image_name,
+                "upload": "image",
+            },
+        },
+        "12": {
+            "class_type": "CLIPVisionEncode",
+            "inputs": {
+                "crop": "center",
+                "clip_vision": ["10", 0],
+                "image": ["11", 0],
+            },
+        },
+        "6": {
+            "class_type": "WanImageToVideo",
+            "inputs": {
+                "positive": ["4", 0],
+                "negative": ["5", 0],
+                "vae": ["3", 0],
+                "width": width,
+                "height": height,
+                "length": length,
+                "batch_size": 1,
+                "clip_vision_output": ["12", 0],
+                "start_image": ["11", 0],
+            },
+        },
+        "7": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["1", 0],
+                "positive": ["6", 0],
+                "negative": ["6", 1],
+                "latent_image": ["6", 2],
+                "seed": seed,
+                "steps": steps,
+                "cfg": cfg,
+                "sampler_name": "euler",
+                "scheduler": "normal",
+                "denoise": 1.0,
+            },
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["7", 0],
+                "vae": ["3", 0],
+            },
+        },
+        "9": {
+            "class_type": "SaveAnimatedWEBP",
+            "inputs": {
+                "filename_prefix": "Empire/video",
+                "fps": 16.0,
+                "lossless": False,
+                "quality": 85,
+                "method": "default",
+                "images": ["8", 0],
+            },
+        },
+    }
+    return workflow
+
+
+def queue_video(
+    positive_prompt: str,
+    start_image: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    width: int = 832,
+    height: int = 480,
+    length: int = 81,
+    steps: int = 20,
+    cfg: float = 6.0,
+    seed: Optional[int] = None,
+) -> dict:
+    """Queue a Wan 2.1 video generation job. Uses I2V workflow if start_image is provided."""
+    if start_image:
+        workflow = _wan_i2v_workflow(
+            positive_prompt, start_image, negative_prompt,
+            width, height, length, steps, cfg, seed,
+        )
+    else:
+        workflow = _wan_t2v_workflow(
+            positive_prompt, negative_prompt,
+            width, height, length, steps, cfg, seed,
+        )
+    payload = {
+        "prompt": workflow,
+        "client_id": CLIENT_ID,
+    }
+    try:
+        resp = requests.post(f"{COMFY_BASE}/prompt", json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info("Queued video (i2v=%s): %s", bool(start_image), data.get("prompt_id"))
+        return data
+    except requests.ConnectionError:
+        logger.error("Cannot reach ComfyUI at %s", COMFY_BASE)
+        return {"error": "ComfyUI is not running. Start it first."}
+    except Exception as exc:
+        logger.error("ComfyUI error: %s", exc)
+        return {"error": str(exc)}
+
+
+def get_video_job_status(prompt_id: str) -> dict:
+    """Check video job status — looks for animated images (webp/gif) in outputs."""
+    try:
+        resp = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=10)
+        resp.raise_for_status()
+        history = resp.json()
+
+        if prompt_id not in history:
+            return {"status": "pending", "outputs": []}
+
+        job = history[prompt_id]
+        outputs = []
+        for node_id, node_out in job.get("outputs", {}).items():
+            for img in node_out.get("images", []):
+                outputs.append({
+                    "filename": img["filename"],
+                    "subfolder": img.get("subfolder", ""),
+                    "type": img.get("type", "output"),
+                })
+            for vid in node_out.get("gifs", []):
+                outputs.append({
+                    "filename": vid["filename"],
+                    "subfolder": vid.get("subfolder", ""),
+                    "type": vid.get("type", "output"),
+                })
+
+        return {"status": "completed" if outputs else "processing", "outputs": outputs}
+    except requests.ConnectionError:
+        return {"status": "error", "detail": "ComfyUI unreachable"}
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
 
 
 def queue_prompt(

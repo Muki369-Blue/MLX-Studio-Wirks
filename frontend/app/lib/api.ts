@@ -1,4 +1,5 @@
-export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
+export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+export const VIDEO_API = process.env.NEXT_PUBLIC_VIDEO_API_URL ?? API;
 
 export function imageUrl(filename: string, subfolder: string = "Empire"): string {
   return `${API}/images/${encodeURIComponent(filename)}?subfolder=${encodeURIComponent(subfolder)}`;
@@ -344,13 +345,70 @@ export async function fetchConversations(personaId: number): Promise<{ conversat
 
 // ─── Video ────────────────────────
 
-export async function generateVideo(personaId: number, promptExtra: string): Promise<any> {
-  const res = await fetch(`${API}/generate-video/${personaId}`, {
+export async function uploadVideoStartImage(file: File): Promise<{ comfy_image_name: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${VIDEO_API}/upload-video-start-image`, { method: "POST", body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Failed to upload start image" }));
+    throw new Error(err.detail || "Failed to upload start image");
+  }
+  return res.json();
+}
+
+export async function generateVideo(
+  personaId: number,
+  promptExtra: string,
+  opts?: {
+    negative_prompt?: string;
+    width?: number;
+    height?: number;
+    length?: number;
+    steps?: number;
+    cfg?: number;
+    start_image?: string;
+  }
+): Promise<any> {
+  const res = await fetch(`${VIDEO_API}/generate-video/${personaId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt_extra: promptExtra }),
+    body: JSON.stringify({
+      prompt_extra: promptExtra,
+      negative_prompt: opts?.negative_prompt || null,
+      width: opts?.width ?? 832,
+      height: opts?.height ?? 480,
+      length: opts?.length ?? 81,
+      steps: opts?.steps ?? 20,
+      cfg: opts?.cfg ?? 6.0,
+      start_image: opts?.start_image || null,
+    }),
   });
-  if (!res.ok) throw new Error("Failed to generate video");
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Failed to generate video" }));
+    throw new Error(err.detail || "Failed to generate video");
+  }
+  return res.json();
+}
+
+export async function checkVideoStatus(contentId: number): Promise<{ status: string; outputs: any[] }> {
+  const res = await fetch(`${VIDEO_API}/video-status/${contentId}`);
+  if (!res.ok) throw new Error("Failed to check video status");
+  return res.json();
+}
+
+export async function refineVideoPrompt(
+  prompt: string,
+  intensity: "light" | "medium" | "heavy" = "medium"
+): Promise<{ original?: string; refined: string; model?: string }> {
+  const res = await fetch(`${VIDEO_API}/refine-video-prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, intensity }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Video refine failed" }));
+    throw new Error(err.detail || `Video refine failed (${res.status})`);
+  }
   return res.json();
 }
 
@@ -468,7 +526,7 @@ export async function fetchContentSetPresets(): Promise<ContentSetPreset[]> {
 }
 
 export async function fetchVideoPresets(): Promise<VideoPreset[]> {
-  const res = await fetch(`${API}/presets/videos`);
+  const res = await fetch(`${VIDEO_API}/presets/videos`);
   if (!res.ok) return [];
   return res.json();
 }

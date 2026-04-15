@@ -1,4 +1,4 @@
-export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8001";
 
 export function imageUrl(filename: string, subfolder: string = "Empire"): string {
   return `${API}/images/${encodeURIComponent(filename)}?subfolder=${encodeURIComponent(subfolder)}`;

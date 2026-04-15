@@ -1,0 +1,488 @@
+"""
+ComfyUI API wrapper.
+
+ComfyUI exposes:
+  POST http://127.0.0.1:8188/prompt          — queue a workflow
+  GET  http://127.0.0.1:8188/history/{id}     — check job status
+  GET  http://127.0.0.1:8188/view?filename=x  — download output image
+
+This module wraps those endpoints so the rest of the backend
+never talks to ComfyUI directly.
+
+It can also auto-start ComfyUI using the Desktop app's bundled code
+with the local data directory at ~/Documents/ComfyUI.
+"""
+
+import uuid
+import random
+import logging
+import socket
+import subprocess
+import atexit
+import time
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+COMFY_PORT = 8188
+COMFY_BASE = f"http://127.0.0.1:{COMFY_PORT}"
+CLIENT_ID = str(uuid.uuid4())
+
+# Managed ComfyUI subprocess (if we started it)
+_comfyui_process: Optional[subprocess.Popen] = None
+
+
+# ─── ComfyUI Launcher ────────────────────────────────────────────────
+
+
+def _detect_comfyui_listener(port: int = COMFY_PORT, timeout: float = 0.2) -> bool:
+    """Check if something is listening on the given port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
+def ensure_comfyui() -> bool:
+    """Start ComfyUI if it's not already running. Returns True if healthy."""
+    global _comfyui_process
+
+    # Already running?
+    if _detect_comfyui_listener():
+        logger.info("ComfyUI already listening on port %d", COMFY_PORT)
+        return True
+
+    # Already started by us but not responding?
+    if _comfyui_process is not None and _comfyui_process.poll() is None:
+        logger.info("ComfyUI process exists but not responding yet, waiting...")
+        return _wait_for_comfyui(timeout=30)
+
+    comfy_data = Path.home() / "Documents" / "ComfyUI"
+    comfy_venv_python = comfy_data / ".venv" / "bin" / "python"
+    comfy_app_main = Path("/Applications/ComfyUI.app/Contents/Resources/ComfyUI/main.py")
+    extra_config = Path.home() / "Library" / "Application Support" / "ComfyUI" / "extra_models_config.yaml"
+
+    # Strategy 1: Use Desktop app's code with local venv + data dir
+    if comfy_venv_python.exists() and comfy_app_main.exists():
+        cmd = [
+            str(comfy_venv_python),
+            str(comfy_app_main),
+            "--port", str(COMFY_PORT),
+            "--base-directory", str(comfy_data),
+        ]
+        if extra_config.exists():
+            cmd += ["--extra-model-paths-config", str(extra_config)]
+
+        logger.info("Starting ComfyUI: %s", " ".join(cmd))
+        try:
+            _comfyui_process = subprocess.Popen(
+                cmd,
+                cwd=str(comfy_data),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            atexit.register(_shutdown_comfyui)
+            return _wait_for_comfyui(timeout=60)
+        except Exception as exc:
+            logger.error("Failed to start ComfyUI: %s", exc)
+            return False
+
+    # Strategy 2: Try `open -a ComfyUI` (Desktop app)
+    app_path = Path("/Applications/ComfyUI.app")
+    if app_path.exists():
+        try:
+            subprocess.Popen(
+                ["open", "-a", "ComfyUI"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Launched ComfyUI Desktop app, waiting for server...")
+            return _wait_for_comfyui(timeout=60)
+        except Exception as exc:
+            logger.error("Failed to launch ComfyUI Desktop: %s", exc)
+            return False
+
+    logger.warning("No ComfyUI installation found (checked ~/Documents/ComfyUI and /Applications/ComfyUI.app)")
+    return False
+
+
+def _wait_for_comfyui(timeout: int = 60) -> bool:
+    """Poll until ComfyUI responds on the expected port."""
+    for i in range(timeout):
+        time.sleep(1)
+        if _detect_comfyui_listener():
+            # Verify /system_stats actually responds (not just TCP)
+            try:
+                resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=2)
+                if resp.status_code == 200:
+                    logger.info("ComfyUI ready on port %d (waited %ds)", COMFY_PORT, i + 1)
+                    return True
+            except Exception:
+                pass
+    logger.warning("ComfyUI did not become ready within %ds", timeout)
+    return False
+
+
+def _shutdown_comfyui() -> None:
+    """Terminate managed ComfyUI process on exit."""
+    global _comfyui_process
+    if _comfyui_process is not None and _comfyui_process.poll() is None:
+        try:
+            _comfyui_process.terminate()
+            _comfyui_process.wait(timeout=10)
+            logger.info("Stopped managed ComfyUI process")
+        except Exception:
+            try:
+                _comfyui_process.kill()
+            except Exception:
+                pass
+    _comfyui_process = None
+
+
+def _flux_workflow(
+    positive_prompt: str,
+    lora_name: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    width: int = 1024,
+    height: int = 1024,
+    batch_size: int = 1,
+    steps: int = 4,
+    guidance: float = 3.5,
+    seed: Optional[int] = None,
+) -> dict:
+    """
+    Flux Schnell text-to-image workflow from AI-ArtWirks.
+
+    Pipeline:
+      Node 11 — DualCLIPLoader (t5xxl + clip_l for Flux)
+      Node 12 — UNETLoader   (flux1-schnell)
+      Node 10 — VAELoader    (ae.safetensors)
+      Node 6  — CLIPTextEncode (positive prompt)  ← injected
+      Node 26 — FluxGuidance
+      Node 25 — RandomNoise   ← seed injected
+      Node 16 — KSamplerSelect (euler)
+      Node 17 — BasicScheduler
+      Node 22 — BasicGuider
+      Node 27 — EmptySD3LatentImage ← width/height/batch injected
+      Node 13 — SamplerCustomAdvanced
+      Node 8  — VAEDecode
+      Node 9  — SaveImage
+    """
+    if seed is None:
+        seed = random.randint(0, 2**53)
+
+    # Flux doesn't support a separate negative conditioning node.
+    # Append negative terms as "Avoid:" suffix — established Flux community pattern.
+    final_prompt = positive_prompt
+    if negative_prompt:
+        final_prompt = f"{positive_prompt}\n\nAvoid: {negative_prompt}"
+
+    workflow = {
+        "11": {
+            "class_type": "DualCLIPLoader",
+            "inputs": {
+                "clip_name1": "t5xxl_fp16.safetensors",
+                "clip_name2": "clip_l.safetensors",
+                "type": "flux",
+            },
+        },
+        "12": {
+            "class_type": "UNETLoader",
+            "inputs": {
+                "unet_name": "flux1-schnell.safetensors",
+                "weight_dtype": "default",
+            },
+        },
+        "10": {
+            "class_type": "VAELoader",
+            "inputs": {
+                "vae_name": "ae.safetensors",
+            },
+        },
+        "6": {
+            "class_type": "CLIPTextEncode",
+            "inputs": {
+                "text": final_prompt,
+                "clip": ["11", 0],
+            },
+        },
+        "26": {
+            "class_type": "FluxGuidance",
+            "inputs": {
+                "guidance": guidance,
+                "conditioning": ["6", 0],
+            },
+        },
+        "25": {
+            "class_type": "RandomNoise",
+            "inputs": {
+                "noise_seed": seed,
+            },
+        },
+        "16": {
+            "class_type": "KSamplerSelect",
+            "inputs": {
+                "sampler_name": "euler",
+            },
+        },
+        "17": {
+            "class_type": "BasicScheduler",
+            "inputs": {
+                "scheduler": "simple",
+                "steps": steps,
+                "denoise": 1,
+                "model": ["12", 0],
+            },
+        },
+        "22": {
+            "class_type": "BasicGuider",
+            "inputs": {
+                "model": ["12", 0],
+                "conditioning": ["26", 0],
+            },
+        },
+        "27": {
+            "class_type": "EmptySD3LatentImage",
+            "inputs": {
+                "width": width,
+                "height": height,
+                "batch_size": batch_size,
+            },
+        },
+        "13": {
+            "class_type": "SamplerCustomAdvanced",
+            "inputs": {
+                "noise": ["25", 0],
+                "guider": ["22", 0],
+                "sampler": ["16", 0],
+                "sigmas": ["17", 0],
+                "latent_image": ["27", 0],
+            },
+        },
+        "8": {
+            "class_type": "VAEDecode",
+            "inputs": {
+                "samples": ["13", 0],
+                "vae": ["10", 0],
+            },
+        },
+        "9": {
+            "class_type": "SaveImage",
+            "inputs": {
+                "filename_prefix": "Empire/gen",
+                "images": ["8", 0],
+            },
+        },
+    }
+
+    # Inject LoRA if the persona has one — wire between UNET and the guider/scheduler
+    if lora_name:
+        workflow["30"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "lora_name": lora_name,
+                "strength_model": 0.85,
+                "strength_clip": 0.85,
+                "model": ["12", 0],
+                "clip": ["11", 0],
+            },
+        }
+        # Re-wire downstream nodes to use LoRA outputs
+        workflow["17"]["inputs"]["model"] = ["30", 0]
+        workflow["22"]["inputs"]["model"] = ["30", 0]
+        workflow["6"]["inputs"]["clip"] = ["30", 1]
+
+    return workflow
+
+
+def upload_image_to_comfyui(image_path: str) -> Optional[str]:
+    """Upload a local image to ComfyUI's input directory. Returns the filename ComfyUI uses."""
+    path = Path(image_path)
+    if not path.exists():
+        logger.error("Reference image not found: %s", image_path)
+        return None
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                f"{COMFY_BASE}/upload/image",
+                files={"image": (path.name, f, "image/png")},
+                data={"overwrite": "true"},
+                timeout=30,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        name = data.get("name", path.name)
+        logger.info("Uploaded reference image to ComfyUI: %s", name)
+        return name
+    except Exception as exc:
+        logger.error("Failed to upload image to ComfyUI: %s", exc)
+        return None
+
+
+def _flux_redux_workflow(
+    positive_prompt: str,
+    reference_image_name: str,
+    lora_name: Optional[str] = None,
+    negative_prompt: Optional[str] = None,
+    width: int = 1024,
+    height: int = 1024,
+    batch_size: int = 1,
+    steps: int = 4,
+    guidance: float = 3.5,
+    redux_strength: float = 0.85,
+    seed: Optional[int] = None,
+) -> dict:
+    """
+    Flux Schnell + Redux face/style consistency workflow.
+
+    Proven from Ai-ArtWirks flux_redux_identity_v1.json.
+    Adds SigCLIP vision encoding + StyleModelApply (Redux) to the base Flux pipeline.
+
+    Extra nodes vs base workflow:
+      Node 38 — CLIPVisionLoader (sigclip_vision_patch14_384)
+      Node 39 — CLIPVisionEncode (encodes reference image)
+      Node 40 — LoadImage        (the reference face image)
+      Node 41 — StyleModelApply  (applies Redux conditioning)
+      Node 42 — StyleModelLoader (flux1-redux-dev)
+    """
+    if seed is None:
+        seed = random.randint(0, 2**53)
+
+    # Start with the base Flux workflow
+    workflow = _flux_workflow(positive_prompt, lora_name, negative_prompt, width, height, batch_size, steps, guidance, seed)
+
+    # Add Redux nodes
+    workflow["38"] = {
+        "class_type": "CLIPVisionLoader",
+        "inputs": {
+            "clip_name": "sigclip_vision_patch14_384.safetensors",
+        },
+    }
+    workflow["40"] = {
+        "class_type": "LoadImage",
+        "inputs": {
+            "image": reference_image_name,
+            "upload": "image",
+        },
+    }
+    workflow["39"] = {
+        "class_type": "CLIPVisionEncode",
+        "inputs": {
+            "crop": "center",
+            "clip_vision": ["38", 0],
+            "image": ["40", 0],
+        },
+    }
+    workflow["42"] = {
+        "class_type": "StyleModelLoader",
+        "inputs": {
+            "style_model_name": "flux1-redux-dev.safetensors",
+        },
+    }
+    workflow["41"] = {
+        "class_type": "StyleModelApply",
+        "inputs": {
+            "strength": redux_strength,
+            "strength_type": "multiply",
+            "conditioning": ["26", 0],
+            "style_model": ["42", 0],
+            "clip_vision_output": ["39", 0],
+        },
+    }
+
+    # Re-wire: the guider now uses Redux-conditioned output instead of raw FluxGuidance
+    workflow["22"]["inputs"]["conditioning"] = ["41", 0]
+
+    return workflow
+
+
+def queue_prompt(positive_prompt: str, lora_name: Optional[str] = None, reference_image: Optional[str] = None, negative_prompt: Optional[str] = None) -> dict:
+    """Queue a generation job on ComfyUI. Uses Redux workflow if reference_image is provided."""
+    if reference_image:
+        workflow = _flux_redux_workflow(positive_prompt, reference_image, lora_name, negative_prompt)
+    else:
+        workflow = _flux_workflow(positive_prompt, lora_name, negative_prompt)
+    payload = {
+        "prompt": workflow,
+        "client_id": CLIENT_ID,
+    }
+    try:
+        resp = requests.post(f"{COMFY_BASE}/prompt", json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info("Queued prompt (redux=%s): %s", bool(reference_image), data.get("prompt_id"))
+        return data
+    except requests.ConnectionError:
+        logger.error("Cannot reach ComfyUI at %s", COMFY_BASE)
+        return {"error": "ComfyUI is not running. Start it first."}
+    except Exception as exc:
+        logger.error("ComfyUI error: %s", exc)
+        return {"error": str(exc)}
+
+
+def get_job_status(prompt_id: str) -> dict:
+    """Check the status / outputs of a queued job."""
+    try:
+        resp = requests.get(f"{COMFY_BASE}/history/{prompt_id}", timeout=10)
+        resp.raise_for_status()
+        history = resp.json()
+
+        if prompt_id not in history:
+            return {"status": "pending", "outputs": []}
+
+        job = history[prompt_id]
+        outputs = []
+        for node_id, node_out in job.get("outputs", {}).items():
+            for img in node_out.get("images", []):
+                outputs.append({
+                    "filename": img["filename"],
+                    "subfolder": img.get("subfolder", ""),
+                    "type": img.get("type", "output"),
+                })
+
+        return {"status": "completed" if outputs else "processing", "outputs": outputs}
+    except requests.ConnectionError:
+        return {"status": "error", "detail": "ComfyUI unreachable"}
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
+
+
+def is_comfy_running() -> bool:
+    """Quick health-check."""
+    try:
+        resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=3)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def free_memory(unload_models: bool = True) -> bool:
+    """Unload models and free VRAM/RAM via ComfyUI's /free endpoint."""
+    try:
+        resp = requests.post(
+            f"{COMFY_BASE}/free",
+            json={"unload_models": unload_models, "free_memory": True},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            logger.info("ComfyUI memory freed (unload_models=%s)", unload_models)
+            return True
+        logger.warning("ComfyUI /free returned %s", resp.status_code)
+        return False
+    except Exception as exc:
+        logger.error("Failed to free ComfyUI memory: %s", exc)
+        return False
+
+
+def get_system_stats() -> Optional[dict]:
+    """Get ComfyUI system stats including VRAM usage."""
+    try:
+        resp = requests.get(f"{COMFY_BASE}/system_stats", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None

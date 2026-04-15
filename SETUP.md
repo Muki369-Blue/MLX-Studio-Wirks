@@ -10,6 +10,7 @@
 - The app is configured for a Flux-first workflow.
 - The frontend now defaults to `http://localhost:8000` for the backend API.
 - To use a different backend URL, set `NEXT_PUBLIC_API_URL` before starting the frontend.
+- To allow non-local frontend origins such as a Tailscale URL, set `FRONTEND_ORIGINS` on the backend as a comma-separated list.
 - Backend startup supports both `uvicorn backend.main:app` from repo root and local backend-module execution.
 
 ## Required Flux Models (in ComfyUI folders)
@@ -47,6 +48,8 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 cd ..
+# Optional: allow Mac frontend over Tailscale
+# $env:FRONTEND_ORIGINS="http://localhost:3000,http://maxbluewirks.tail891b50.ts.net:3000"
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -57,6 +60,8 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cd ..
+# Optional: allow Mac frontend over Tailscale
+# export FRONTEND_ORIGINS="http://localhost:3000,http://maxbluewirks.tail891b50.ts.net:3000"
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 > **Note:** Run uvicorn from the project root (`Empire/`), not from inside `backend/`.
@@ -70,7 +75,7 @@ Verify it's running: http://localhost:8000/health
 ```powershell
 cd frontend
 npm install
-$env:NEXT_PUBLIC_API_URL="http://localhost:8000"   # optional, only if overriding default
+$env:NEXT_PUBLIC_API_URL="http://shadow-wirks.tail891b50.ts.net:8000"   # optional, use this when frontend runs on your Mac against Shadow
 npm run dev
 ```
 
@@ -78,7 +83,7 @@ npm run dev
 ```bash
 cd frontend
 npm install
-# export NEXT_PUBLIC_API_URL=http://localhost:8000   # optional, only if overriding default
+# export NEXT_PUBLIC_API_URL=http://shadow-wirks.tail891b50.ts.net:8000   # optional, use this when frontend runs on your Mac against Shadow
 npm run dev
 ```
 Open: http://localhost:3000

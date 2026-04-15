@@ -1,8 +1,10 @@
+from pathlib import Path
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime, timezone
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./empire.db"
+DATABASE_PATH = Path(__file__).resolve().parent / "empire.db"
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
 
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL,

@@ -12,6 +12,7 @@ import ContentSetPanel from "./components/ContentSetPanel";
 import ShadowVidPanel from "./components/ShadowVidPanel";
 import AnimatedPreview from "./components/AnimatedPreview";
 import {
+  API,
   fetchPersonas,
   fetchLinks,
   fetchHealth,
@@ -154,7 +155,7 @@ export default function Dashboard() {
             title="Unload all models from GPU/RAM to free memory"
             onClick={async () => {
               try {
-                const res = await fetch("http://localhost:8001/system/cleanup", { method: "POST" });
+                const res = await fetch(`${API}/system/cleanup`, { method: "POST" });
                 if (res.ok) {
                   const data = await res.json();
                   const mem = data.memory ? ` — ${data.memory.vram_free_mb}MB free` : "";
@@ -320,7 +321,7 @@ export default function Dashboard() {
                             e.stopPropagation();
                             setPlayingPreview(p.id);
                             try {
-                              const res = await fetch(`http://localhost:8001/personas/${p.id}/preview-voice`, { method: "POST" });
+                              const res = await fetch(`${API}/personas/${p.id}/preview-voice`, { method: "POST" });
                               if (res.ok) {
                                 const blob = await res.blob();
                                 const url = URL.createObjectURL(blob);

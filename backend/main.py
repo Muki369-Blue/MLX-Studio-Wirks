@@ -87,6 +87,7 @@ async def lifespan(app: FastAPI):
     logger.info("ComfyUI status: %s", "ready" if comfy_ok else "NOT available")
     if comfy_ok:
         comfy_api.start_progress_listener()
+    _start_shadow_ping()
     start_scheduler()
     logger.info("Content scheduler started.")
     yield
@@ -105,22 +106,56 @@ app.add_middleware(
 )
 
 
+# ─── Shadow-Wirk status cache (background ping) ─────────────────────
+
+_shadow_status = {"online": False}
+_shadow_lock = threading.Lock()
+SHADOW_URL = os.environ.get("SHADOW_WIRKS_URL", "http://100.119.54.18:8800")
+
+
+def _shadow_ping_loop():
+    """Background thread: ping Shadow-Wirk every 15s, cache result."""
+    import time
+    while True:
+        try:
+            r = requests.get(f"{SHADOW_URL}/health?skip_shadow=true", timeout=12)
+            online = r.status_code == 200
+        except Exception:
+            online = False
+        with _shadow_lock:
+            _shadow_status["online"] = online
+        time.sleep(15)
+
+
+def _start_shadow_ping():
+    t = threading.Thread(target=_shadow_ping_loop, daemon=True)
+    t.start()
+
+
 # ─── Health ───────────────────────────────────────────────────────────
 
 @app.get("/health")
-def health():
-    shadow_wirks = False
-    shadow_url = os.environ.get("SHADOW_WIRKS_URL", "http://100.119.54.18:8800")
-    try:
-        r = requests.get(f"{shadow_url}/health", timeout=5)
-        shadow_wirks = r.status_code == 200
-    except Exception:
-        pass
+def health(skip_shadow: bool = False):
+    with _shadow_lock:
+        shadow_wirks = _shadow_status["online"] if not skip_shadow else False
     return {
         "api": "ok",
         "comfyui": comfy_api.is_comfy_running(),
         "shadow_wirks": shadow_wirks,
     }
+
+
+@app.post("/interrupt")
+def interrupt_generation():
+    comfy_api.interrupt()
+    return {"ok": True}
+
+
+@app.post("/clear-queue")
+def clear_queue():
+    comfy_api.clear_queue()
+    comfy_api.interrupt()
+    return {"ok": True}
 
 
 # ─── Personas ────────────────────────────────────────────────────────

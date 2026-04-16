@@ -971,3 +971,21 @@ def get_system_stats() -> Optional[dict]:
         return resp.json()
     except Exception:
         return None
+
+
+def interrupt():
+    """Interrupt the currently running ComfyUI generation."""
+    try:
+        resp = requests.post(f"{COMFY_BASE}/interrupt", timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def clear_queue():
+    """Clear all pending items from the ComfyUI queue."""
+    try:
+        resp = requests.post(f"{COMFY_BASE}/queue", json={"clear": True}, timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False

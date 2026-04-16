@@ -57,9 +57,13 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     fetchVideoPresets().then(setVideoPresets);
   }, []);
 
-  // Auto-enable Shadow-Wirk when it comes online (Mac has no Wan models)
+  // Auto-enable Shadow-Wirk on initial mount only (Mac has no Wan models)
+  const shadowInitRef = useRef(false);
   useEffect(() => {
-    if (shadowOnline) setUseShadow(true);
+    if (shadowOnline && !shadowInitRef.current) {
+      shadowInitRef.current = true;
+      setUseShadow(true);
+    }
   }, [shadowOnline]);
 
   // Fetch LoRAs from the active ComfyUI target
@@ -152,10 +156,6 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
       setVideoResult("Upload a start image first for Image-to-Video mode.");
       return;
     }
-    if (useShadow && !shadowOnline) {
-      setVideoResult("Shadow-Wirk is offline. Switch to local or check connection.");
-      return;
-    }
     setGeneratingVideo(true);
     setVideoResult(null);
     setVideoOutputs([]);
@@ -205,14 +205,11 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
           </p>
           <button
             onClick={() => setUseShadow(!useShadow)}
-            disabled={!shadowOnline && !useShadow}
-            title={shadowOnline ? (useShadow ? "Switch to local ComfyUI" : "Switch to Shadow-Wirk GPU") : "Shadow-Wirk is offline"}
+            title={useShadow ? "Switch to local ComfyUI" : "Switch to Shadow-Wirk GPU"}
             className={`flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
               useShadow
                 ? "bg-emerald-600/20 text-emerald-300 border-emerald-500"
-                : shadowOnline
-                  ? "bg-zinc-800 text-zinc-400 border-zinc-700 hover:border-zinc-500"
-                  : "bg-zinc-800/50 text-zinc-600 border-zinc-800 cursor-not-allowed"
+                : "bg-zinc-800 text-zinc-400 border-zinc-700 hover:border-zinc-500"
             }`}
           >
             <span className={`w-1.5 h-1.5 rounded-full ${

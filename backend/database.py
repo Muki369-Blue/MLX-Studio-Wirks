@@ -37,7 +37,7 @@ class Content(Base):
     __tablename__ = "contents"
 
     id = Column(Integer, primary_key=True, index=True)
-    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=False)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
     file_path = Column(String, nullable=True)
     prompt_used = Column(Text, nullable=True)
     comfy_job_id = Column(String, nullable=True)
@@ -153,8 +153,53 @@ class Link(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+def _migrate_persona_id_nullable():
+    """SQLite: recreate contents table to make persona_id nullable if needed."""
+    import sqlite3
+    conn = sqlite3.connect(str(DATABASE_PATH))
+    cur = conn.cursor()
+    # Check if persona_id is currently NOT NULL
+    cur.execute("PRAGMA table_info(contents)")
+    cols = cur.fetchall()
+    for col in cols:
+        # col = (cid, name, type, notnull, dflt_value, pk)
+        if col[1] == "persona_id" and col[3] == 1:  # notnull=1
+            cur.execute("PRAGMA foreign_keys=OFF")
+            cur.execute("""CREATE TABLE IF NOT EXISTS contents_new (
+                id INTEGER PRIMARY KEY,
+                persona_id INTEGER REFERENCES personas(id),
+                file_path TEXT,
+                prompt_used TEXT,
+                comfy_job_id TEXT,
+                status TEXT DEFAULT 'pending',
+                upscaled_path TEXT,
+                watermarked_path TEXT,
+                caption TEXT,
+                hashtags TEXT,
+                is_posted BOOLEAN DEFAULT 0,
+                posted_platforms TEXT,
+                set_id INTEGER REFERENCES content_sets(id),
+                set_order INTEGER,
+                is_favorite BOOLEAN DEFAULT 0,
+                tags TEXT,
+                seed INTEGER,
+                width INTEGER DEFAULT 1024,
+                height INTEGER DEFAULT 1024,
+                created_at DATETIME
+            )""")
+            cur.execute("INSERT INTO contents_new SELECT * FROM contents")
+            cur.execute("DROP TABLE contents")
+            cur.execute("ALTER TABLE contents_new RENAME TO contents")
+            cur.execute("PRAGMA foreign_keys=ON")
+            conn.commit()
+            break
+    conn.close()
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
+    # Migrate: make contents.persona_id nullable for existing DBs
+    _migrate_persona_id_nullable()
 
 
 def get_db():

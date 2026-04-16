@@ -357,7 +357,7 @@ export async function uploadVideoStartImage(file: File): Promise<{ comfy_image_n
 }
 
 export async function generateVideo(
-  personaId: number,
+  personaId: number | null,
   promptExtra: string,
   opts?: {
     negative_prompt?: string;
@@ -367,9 +367,11 @@ export async function generateVideo(
     steps?: number;
     cfg?: number;
     start_image?: string;
+    lora_name?: string;
   }
 ): Promise<any> {
-  const res = await fetch(`${VIDEO_API}/generate-video/${personaId}`, {
+  const url = personaId ? `${VIDEO_API}/generate-video/${personaId}` : `${VIDEO_API}/generate-video`;
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -381,6 +383,7 @@ export async function generateVideo(
       steps: opts?.steps ?? 20,
       cfg: opts?.cfg ?? 6.0,
       start_image: opts?.start_image || null,
+      lora_name: opts?.lora_name || null,
     }),
   });
   if (!res.ok) {
@@ -390,7 +393,7 @@ export async function generateVideo(
   return res.json();
 }
 
-export async function checkVideoStatus(contentId: number): Promise<{ status: string; outputs: any[] }> {
+export async function checkVideoStatus(contentId: number): Promise<{ status: string; progress?: number; outputs: any[] }> {
   const res = await fetch(`${VIDEO_API}/video-status/${contentId}`);
   if (!res.ok) throw new Error("Failed to check video status");
   return res.json();
@@ -400,9 +403,19 @@ export async function checkVideoStatus(contentId: number): Promise<{ status: str
 
 export const SHADOW_WIRKS_URL = "http://100.119.54.18:8800";
 
+export async function fetchVideoLoras(baseUrl: string = VIDEO_API): Promise<string[]> {
+  try {
+    const res = await fetch(`${baseUrl}/video-loras`);
+    if (!res.ok) return [];
+    return res.json();
+  } catch {
+    return [];
+  }
+}
+
 export async function generateVideoRemote(
   shadowUrl: string,
-  personaId: number,
+  personaId: number | null,
   fullPrompt: string,
   promptExtra: string,
   opts?: {
@@ -413,9 +426,11 @@ export async function generateVideoRemote(
     steps?: number;
     cfg?: number;
     start_image?: string;
+    lora_name?: string;
   }
 ): Promise<any> {
-  const res = await fetch(`${shadowUrl}/generate-video/${personaId}`, {
+  const url = personaId ? `${shadowUrl}/generate-video/${personaId}` : `${shadowUrl}/generate-video`;
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -428,6 +443,7 @@ export async function generateVideoRemote(
       steps: opts?.steps ?? 20,
       cfg: opts?.cfg ?? 6.0,
       start_image: opts?.start_image || null,
+      lora_name: opts?.lora_name || null,
     }),
   });
   if (!res.ok) {
@@ -440,7 +456,7 @@ export async function generateVideoRemote(
 export async function checkVideoStatusRemote(
   shadowUrl: string,
   contentId: number
-): Promise<{ status: string; outputs: any[] }> {
+): Promise<{ status: string; progress?: number; outputs: any[] }> {
   const res = await fetch(`${shadowUrl}/video-status/${contentId}`);
   if (!res.ok) throw new Error("Failed to check Shadow-Wirk video status");
   return res.json();

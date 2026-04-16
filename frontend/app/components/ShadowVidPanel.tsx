@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef } from "react";
 import {
   fetchVideoPresets,
+  fetchVideoLoras,
   generateVideo,
   generateVideoRemote,
   refineVideoPrompt,
@@ -22,7 +23,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const [videoPresets, setVideoPresets] = useState<VideoPreset[]>([]);
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const [videoResult, setVideoResult] = useState<string | null>(null);
-  const [useShadow, setUseShadow] = useState(false);
+  const [useShadow, setUseShadow] = useState(shadowOnline);
   const [refiningVideo, setRefiningVideo] = useState(false);
   const [videoIntensity, setVideoIntensity] = useState<"light" | "medium" | "heavy">("medium");
 
@@ -34,42 +35,65 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const [comfyImageName, setComfyImageName] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // LoRA state
+  const [videoLoras, setVideoLoras] = useState<string[]>([]);
+  const [selectedLora, setSelectedLora] = useState<string>("");
+
   // Video settings
   const [width, setWidth] = useState(832);
   const [height, setHeight] = useState(480);
-  const [length, setLength] = useState(81);
-  const [steps, setSteps] = useState(20);
+  const [length, setLength] = useState(241);
+  const [steps, setSteps] = useState(30);
   const [cfg, setCfg] = useState(6.0);
   const [showSettings, setShowSettings] = useState(false);
 
   // Status polling
   const [contentId, setContentId] = useState<number | null>(null);
   const [videoStatus, setVideoStatus] = useState<string | null>(null);
+  const [videoProgress, setVideoProgress] = useState(0);
   const [videoOutputs, setVideoOutputs] = useState<any[]>([]);
 
   useEffect(() => {
     fetchVideoPresets().then(setVideoPresets);
   }, []);
 
+  // Auto-enable Shadow-Wirk when it comes online (Mac has no Wan models)
+  useEffect(() => {
+    if (shadowOnline) setUseShadow(true);
+  }, [shadowOnline]);
+
+  // Fetch LoRAs from the active ComfyUI target
+  useEffect(() => {
+    const base = useShadow ? SHADOW_WIRKS_URL : API;
+    fetchVideoLoras(base).then(setVideoLoras);
+  }, [useShadow]);
+
   // Poll for video completion
   useEffect(() => {
-    if (!contentId || videoStatus === "completed" || videoStatus === "error") return;
+    if (!contentId || videoStatus === "completed" || videoStatus === "error" || videoStatus === "failed") return;
     const interval = setInterval(async () => {
       try {
         const result = useShadow
           ? await checkVideoStatusRemote(SHADOW_WIRKS_URL, contentId)
           : await checkVideoStatus(contentId);
         setVideoStatus(result.status);
+        if (result.progress !== undefined) setVideoProgress(result.progress);
         if (result.status === "completed" && result.outputs?.length) {
           setVideoOutputs(result.outputs);
           setGeneratingVideo(false);
+          setVideoProgress(100);
           setVideoResult("Video generation complete!");
+          clearInterval(interval);
+        } else if (result.status === "failed") {
+          setGeneratingVideo(false);
+          setVideoProgress(0);
+          setVideoResult("Video generation failed.");
           clearInterval(interval);
         }
       } catch {
         // keep polling
       }
-    }, 3000);
+    }, 2000);
     return () => clearInterval(interval);
   }, [contentId, videoStatus, useShadow]);
 
@@ -121,7 +145,9 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   };
 
   const handleGenerateVideo = async () => {
-    if (!videoPersona || !videoPrompt.trim()) return;
+    // Persona required for T2V, optional for I2V
+    if (mode === "t2v" && !videoPersona) return;
+    if (!videoPrompt.trim()) return;
     if (mode === "i2v" && !comfyImageName) {
       setVideoResult("Upload a start image first for Image-to-Video mode.");
       return;
@@ -134,9 +160,10 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     setVideoResult(null);
     setVideoOutputs([]);
     setVideoStatus(null);
+    setVideoProgress(0);
     setContentId(null);
     try {
-      const persona = personas.find((p) => p.id === videoPersona);
+      const persona = videoPersona ? personas.find((p) => p.id === videoPersona) : null;
       const fullPrompt = persona ? `${persona.prompt_base}, ${videoPrompt}` : videoPrompt;
       const videoOpts = {
         width,
@@ -145,6 +172,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
         steps,
         cfg,
         start_image: mode === "i2v" ? comfyImageName ?? undefined : undefined,
+        lora_name: selectedLora || undefined,
       };
       const res = useShadow
         ? await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, fullPrompt, videoPrompt, videoOpts)
@@ -269,11 +297,28 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
             value={videoPersona ?? ""}
             onChange={(e) => setVideoPersona(Number(e.target.value) || null)}
           >
-            <option value="">Select persona...</option>
+            <option value="">{mode === "i2v" ? "Persona (optional for I2V)..." : "Select persona..."}</option>
             {personas.map((persona) => (
               <option key={persona.id} value={persona.id}>{persona.name}</option>
             ))}
           </select>
+
+          {/* LoRA selector */}
+          {videoLoras.length > 0 && (
+            <div>
+              <label className="text-xs text-zinc-500 mb-1 block">LoRA (optional)</label>
+              <select
+                className="w-full p-2.5 bg-zinc-800 border border-zinc-700 rounded-lg text-sm focus:border-violet-500 focus:outline-none"
+                value={selectedLora}
+                onChange={(e) => setSelectedLora(e.target.value)}
+              >
+                <option value="">No LoRA</option>
+                {videoLoras.map((lora) => (
+                  <option key={lora} value={lora}>{lora.replace(/\.safetensors$/, "")}</option>
+                ))}
+              </select>
+            </div>
+          )}
 
           {/* Motion presets */}
           <div>
@@ -374,7 +419,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
           {/* Generate button */}
           <button
             onClick={handleGenerateVideo}
-            disabled={generatingVideo || !videoPersona || !videoPrompt.trim() || (mode === "i2v" && !comfyImageName)}
+            disabled={generatingVideo || !videoPrompt.trim() || (mode === "t2v" && !videoPersona) || (mode === "i2v" && !comfyImageName)}
             className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
           >
             {generatingVideo
@@ -382,10 +427,33 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
               : `Generate ${mode === "i2v" ? "Image→Video" : "Text→Video"}`}
           </button>
 
+          {/* Progress bar */}
+          {generatingVideo && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-zinc-400">
+                  {videoProgress === 0 ? "Queued — waiting for GPU..." : videoProgress >= 100 ? "Finalizing..." : "Generating..."}
+                </span>
+                <span className="text-violet-300 font-mono">{videoProgress}%</span>
+              </div>
+              <div className="w-full h-2 bg-zinc-800 rounded-full overflow-hidden border border-zinc-700">
+                <div
+                  className="h-full rounded-full transition-all duration-700 ease-out"
+                  style={{
+                    width: `${Math.max(videoProgress, 2)}%`,
+                    background: videoProgress >= 100
+                      ? "linear-gradient(90deg, #10b981, #34d399)"
+                      : "linear-gradient(90deg, #6366f1, #8b5cf6)",
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* Status / result */}
           {videoResult && (
             <p className={`text-xs p-2 rounded-lg ${
-              videoResult.includes("Failed") || videoResult.includes("error")
+              videoResult.includes("Failed") || videoResult.includes("failed")
                 ? "bg-red-900/30 text-red-300"
                 : videoResult.includes("complete")
                   ? "bg-emerald-900/30 text-emerald-300"
@@ -403,6 +471,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
               <label className="text-xs text-zinc-500 block mb-2">Output{useShadow ? " (from Shadow-Wirk)" : ""}</label>
               {videoOutputs.map((out, i) => {
                 const src = `${videoBase}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`;
+                const downloadUrl = `${videoBase}/download/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`;
                 return (
                 <div key={i} className="text-center">
                   <img
@@ -411,7 +480,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
                     className="max-w-full rounded-lg mx-auto"
                   />
                   <a
-                    href={src}
+                    href={downloadUrl}
                     download={out.filename}
                     className="inline-block mt-2 text-xs text-violet-400 hover:text-violet-300"
                   >

@@ -244,3 +244,4 @@ class VideoGenerationRequest(BaseModel):
     steps: int = 20
     cfg: float = 6.0
     start_image: Optional[str] = None  # ComfyUI image name for I2V
+    lora_name: Optional[str] = None  # LoRA filename for Wan video generation

@@ -21,6 +21,8 @@ import subprocess
 import atexit
 import time
 import os
+import json
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +36,80 @@ CLIENT_ID = str(uuid.uuid4())
 
 # Managed ComfyUI subprocess (if we started it)
 _comfyui_process: Optional[subprocess.Popen] = None
+
+# ─── Progress Tracking ───────────────────────────────────────────────
+
+# Stores progress per prompt_id: {"value": current_step, "max": total_steps}
+_progress: dict[str, dict] = {}
+_progress_lock = threading.Lock()
+_ws_thread: Optional[threading.Thread] = None
+
+
+def get_progress(prompt_id: str) -> dict:
+    """Get progress for a prompt_id. Returns {"value": N, "max": M} or empty dict."""
+    with _progress_lock:
+        return _progress.get(prompt_id, {}).copy()
+
+
+def _ws_listener():
+    """Background thread: listen to ComfyUI WebSocket for progress events."""
+    try:
+        import websocket
+    except ImportError:
+        logger.warning("websocket-client not installed, progress tracking disabled")
+        return
+
+    ws_url = f"ws://127.0.0.1:{COMFY_PORT}/ws?clientId={CLIENT_ID}"
+    while True:
+        try:
+            ws = websocket.WebSocket()
+            ws.connect(ws_url, timeout=5)
+            logger.info("ComfyUI WebSocket connected for progress tracking")
+            while True:
+                msg = ws.recv()
+                if not msg:
+                    continue
+                try:
+                    data = json.loads(msg)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                msg_type = data.get("type")
+                msg_data = data.get("data", {})
+                if msg_type == "progress":
+                    pid = msg_data.get("prompt_id", "")
+                    if pid:
+                        with _progress_lock:
+                            _progress[pid] = {
+                                "value": msg_data.get("value", 0),
+                                "max": msg_data.get("max", 1),
+                            }
+                elif msg_type == "executed":
+                    # Node finished — keep progress at 100%
+                    pid = msg_data.get("prompt_id", "")
+                    if pid:
+                        with _progress_lock:
+                            if pid in _progress:
+                                _progress[pid]["value"] = _progress[pid]["max"]
+                elif msg_type == "execution_cached":
+                    pass
+                elif msg_type == "executing" and msg_data.get("node") is None:
+                    # Execution complete for this prompt
+                    pid = msg_data.get("prompt_id", "")
+                    if pid:
+                        with _progress_lock:
+                            _progress.pop(pid, None)
+        except Exception as e:
+            logger.debug("ComfyUI WebSocket disconnected: %s — reconnecting in 5s", e)
+            time.sleep(5)
+
+
+def start_progress_listener():
+    """Start the background WebSocket listener (call once at startup)."""
+    global _ws_thread
+    if _ws_thread and _ws_thread.is_alive():
+        return
+    _ws_thread = threading.Thread(target=_ws_listener, daemon=True, name="comfy-progress")
+    _ws_thread.start()
 
 
 # ─── ComfyUI Launcher ────────────────────────────────────────────────
@@ -445,6 +521,7 @@ def _wan_t2v_workflow(
     steps: int = 20,
     cfg: float = 6.0,
     seed: Optional[int] = None,
+    lora_name: Optional[str] = None,
 ) -> dict:
     """
     Wan 2.1 Text-to-Video workflow (1.3B).
@@ -544,6 +621,24 @@ def _wan_t2v_workflow(
             },
         },
     }
+
+    # Inject LoRA loader if specified
+    if lora_name:
+        workflow["13"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "lora_name": lora_name,
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "model": ["1", 0],
+                "clip": ["2", 0],
+            },
+        }
+        # Re-wire: KSampler uses LoRA-modified model, CLIP encodes use LoRA-modified clip
+        workflow["7"]["inputs"]["model"] = ["13", 0]
+        workflow["4"]["inputs"]["clip"] = ["13", 1]
+        workflow["5"]["inputs"]["clip"] = ["13", 1]
+
     return workflow
 
 
@@ -557,6 +652,7 @@ def _wan_i2v_workflow(
     steps: int = 20,
     cfg: float = 6.0,
     seed: Optional[int] = None,
+    lora_name: Optional[str] = None,
 ) -> dict:
     """
     Wan 2.1 Image-to-Video workflow (14B fp8).
@@ -677,6 +773,23 @@ def _wan_i2v_workflow(
             },
         },
     }
+
+    # Inject LoRA loader if specified
+    if lora_name:
+        workflow["13"] = {
+            "class_type": "LoraLoader",
+            "inputs": {
+                "lora_name": lora_name,
+                "strength_model": 1.0,
+                "strength_clip": 1.0,
+                "model": ["1", 0],
+                "clip": ["2", 0],
+            },
+        }
+        workflow["7"]["inputs"]["model"] = ["13", 0]
+        workflow["4"]["inputs"]["clip"] = ["13", 1]
+        workflow["5"]["inputs"]["clip"] = ["13", 1]
+
     return workflow
 
 
@@ -690,17 +803,18 @@ def queue_video(
     steps: int = 20,
     cfg: float = 6.0,
     seed: Optional[int] = None,
+    lora_name: Optional[str] = None,
 ) -> dict:
     """Queue a Wan 2.1 video generation job. Uses I2V workflow if start_image is provided."""
     if start_image:
         workflow = _wan_i2v_workflow(
             positive_prompt, start_image, negative_prompt,
-            width, height, length, steps, cfg, seed,
+            width, height, length, steps, cfg, seed, lora_name,
         )
     else:
         workflow = _wan_t2v_workflow(
             positive_prompt, negative_prompt,
-            width, height, length, steps, cfg, seed,
+            width, height, length, steps, cfg, seed, lora_name,
         )
     payload = {
         "prompt": workflow,
@@ -751,6 +865,18 @@ def get_video_job_status(prompt_id: str) -> dict:
         return {"status": "error", "detail": "ComfyUI unreachable"}
     except Exception as exc:
         return {"status": "error", "detail": str(exc)}
+
+
+def list_loras() -> list[str]:
+    """Get list of available LoRA filenames from ComfyUI."""
+    try:
+        resp = requests.get(f"{COMFY_BASE}/object_info/LoraLoader", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        lora_list = data.get("LoraLoader", {}).get("input", {}).get("required", {}).get("lora_name", [[]])[0]
+        return sorted(lora_list) if isinstance(lora_list, list) else []
+    except Exception:
+        return []
 
 
 def queue_prompt(

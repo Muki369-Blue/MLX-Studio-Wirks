@@ -1,158 +1,144 @@
 # AI Content Empire — Setup Guide
 
-## Prerequisites
-- Python 3.10+
-- Node.js 18+
-- ComfyUI installed with Flux Schnell models
-- Ollama optional for prompt refining, caption generation, and chat
+## Network & Machines
 
-## Runtime Notes
-- The app is configured for a Flux-first workflow.
-- The frontend now defaults to `http://localhost:8000` for the backend API.
-- To use a different backend URL, set `NEXT_PUBLIC_API_URL` before starting the frontend.
-- To route only ShadowVid/video generation to a different backend, set `NEXT_PUBLIC_VIDEO_API_URL`. If omitted, video uses the same backend as the rest of the app.
-- To proxy ShadowVid from the backend into a dedicated true-video service, set `VIDEO_SERVICE_URL` on that backend. Optional overrides: `VIDEO_SERVICE_PRESETS_PATH`, `VIDEO_SERVICE_GENERATE_PATH`, and `VIDEO_SERVICE_REFINE_PATH`.
-- To allow non-local frontend origins such as a Tailscale URL, set `FRONTEND_ORIGINS` on the backend as a comma-separated list.
-- Backend startup supports both `uvicorn backend.main:app` from repo root and local backend-module execution.
+| Machine | Role | LAN IP | Tailscale IP |
+|---------|------|--------|--------------|
+| **Windows PC** | Backend + ComfyUI + GPU | `10.0.1.10` | `100.119.54.18` |
+| **Mac** | Frontend (dev) | — | — |
 
-## Required Flux Models (in ComfyUI folders)
-Place these in your ComfyUI `models/` directories:
-- `models/unet/flux1-schnell.safetensors`
-- `models/clip/t5xxl_fp16.safetensors`
-- `models/clip/clip_l.safetensors`
-- `models/vae/ae.safetensors`
+### Ports
+
+| Service | Port | Binding |
+|---------|------|---------|
+| ComfyUI | `8000` | `127.0.0.1` (local only) |
+| Backend (FastAPI) | `8800` | `0.0.0.0` (LAN accessible) |
+| Frontend (Next.js) | `3000` | `localhost` |
 
 ---
 
-## Step 1: Start ComfyUI
+## Prerequisites
+- **Windows PC**: Python 3.13, ComfyUI Desktop, NVIDIA GPU (RTX A4500 20GB)
+- **Mac**: Node.js 18+
+- **Optional**: Ollama for prompt refining, caption generation, and chat
 
-If you have a local ComfyUI checkout in `~/Documents/ComfyUI`, the backend can try to detect and use it automatically. Manual startup is still the most reliable option.
+## Required Models (already installed on Windows PC)
 
-### Windows PowerShell
+### Flux (image generation) — `ComfyUI/models/`
+- `unet/flux1-schnell.safetensors`
+- `clip/t5xxl_fp16.safetensors`
+- `clip/clip_l.safetensors`
+- `vae/ae.safetensors`
+
+### Wan 2.1 (video generation) — `ComfyUI/models/`
+- `diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors` (2.64 GB) — Text-to-Video
+- `diffusion_models/wan2.1_i2v_480p_14B_fp8_scaled.safetensors` (15.27 GB) — Image-to-Video
+- `text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors` (6.27 GB) — shared
+- `vae/wan_2.1_vae.safetensors` (0.24 GB) — shared
+- `clip_vision/clip_vision_h.safetensors` (1.18 GB) — for I2V
+
+---
+
+## Windows PC Setup (Backend + ComfyUI)
+
+### Step 1: Start ComfyUI
+Launch **ComfyUI Desktop** from Start Menu or desktop shortcut.
+It listens on `http://127.0.0.1:8000`.
+
+### Step 2: Start Backend
 ```powershell
-cd $HOME\Documents\ComfyUI
-python main.py --force-fp16
+cd C:\Users\Shadow\Desktop\Empire
+& .\.venv\Scripts\Activate.ps1
+python -m uvicorn backend.main:app --host 0.0.0.0 --port 8800 --reload
 ```
+Verify: http://localhost:8800/health
 
-### macOS / Linux
-```bash
-cd ~/Documents/ComfyUI   # or wherever yours is installed
-python main.py --force-fp16
-```
-Verify it's running: http://127.0.0.1:8188
-
-## Step 2: Start Backend
-
-### Windows PowerShell
+### Step 3 (optional): Start Frontend locally on PC
 ```powershell
-cd backend
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-cd ..
-# Optional: allow Mac frontend over Tailscale
-# $env:FRONTEND_ORIGINS="http://localhost:3000,http://maxbluewirks.tail891b50.ts.net:3000"
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### macOS / Linux
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cd ..
-# Optional: allow Mac frontend over Tailscale
-# export FRONTEND_ORIGINS="http://localhost:3000,http://maxbluewirks.tail891b50.ts.net:3000"
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
-```
-> **Note:** Run uvicorn from the project root (`Empire/`), not from inside `backend/`.
-> The command is: `cd /path/to/Empire && uvicorn backend.main:app --reload`
-
-Verify it's running: http://localhost:8000/health
-
-## Step 3: Start Frontend
-
-Tracked frontend modes:
-- `npm run dev:local` copies `frontend/env/local.env` to `frontend/.env.local` and starts the app.
-- `npm run dev:split` copies `frontend/env/split.env` to `frontend/.env.local` and starts the app.
-
-### Windows PowerShell
-```powershell
-cd frontend
+cd C:\Users\Shadow\Desktop\Empire\frontend
 npm install
-$env:NEXT_PUBLIC_API_URL="http://your-mac-backend:8000"   # optional, keep main app traffic on your Mac
-$env:NEXT_PUBLIC_VIDEO_API_URL="http://shadow-wirks.tail891b50.ts.net:8000"   # optional, send only ShadowVid traffic to the PC over Tailscale
 npm run dev
-# or use one of the tracked modes:
-# npm run dev:local
-# npm run dev:split
-```
-
-### macOS / Linux
-```bash
-cd frontend
-npm install
-# export NEXT_PUBLIC_API_URL=http://your-mac-backend:8000   # optional, keep main app traffic on your Mac
-# export NEXT_PUBLIC_VIDEO_API_URL=http://shadow-wirks.tail891b50.ts.net:8000   # optional, send only ShadowVid traffic to the PC over Tailscale
-npm run dev
-# or use one of the tracked modes:
-# npm run dev:local
-# npm run dev:split
 ```
 Open: http://localhost:3000
 
-## Split Deployment Map
-- Keep these on the main backend: personas, image generation, generations polling, image proxying, content sets, vault, chat, analytics, links, schedules, captions, prompt refine, voice features, LoRA training, cleanup.
-- ShadowVid can be split to a dedicated video backend or a dedicated video service behind that backend.
-- The ShadowVid frontend now uses `GET /presets/videos`, `POST /refine-video-prompt`, and `POST /generate-video/{persona_id}` on the video side.
+---
 
-## Dedicated Video Service
-- ShadowVid no longer falls back to the built-in local 16-frame workflow. The video backend now requires `VIDEO_SERVICE_URL`.
-- `GET /presets/videos` proxies to the dedicated video service path in `VIDEO_SERVICE_PRESETS_PATH`.
-- `POST /refine-video-prompt` proxies to the dedicated video service path in `VIDEO_SERVICE_REFINE_PATH`.
-- `POST /generate-video/{persona_id}` proxies to the dedicated video service path in `VIDEO_SERVICE_GENERATE_PATH`.
-- `VIDEO_SERVICE_GENERATE_PATH` supports `{persona_id}` in the path template, for example `/api/v1/personas/{persona_id}/generate`.
-- Proxied payload fields: `persona_id`, `persona_name`, `persona_prompt_base`, `prompt_extra`, `full_prompt`, `batch_size`, `negative_prompt`, `lora_override`.
-- Video prompt refinement payload fields: `prompt`, `intensity`.
+## Mac Setup (Frontend pointing to Windows PC)
 
-### Example Video Backend Environment
-```powershell
-$env:VIDEO_SERVICE_URL="http://your-true-video-service:9000"
-$env:VIDEO_SERVICE_PRESETS_PATH="/api/v1/video-presets"
-$env:VIDEO_SERVICE_REFINE_PATH="/api/v1/refine"
-$env:VIDEO_SERVICE_GENERATE_PATH="/api/v1/personas/{persona_id}/generate"
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+### Clone & install
+```bash
+git clone https://github.com/Muki369-Blue/MLX-Studio-Wirks.git Empire
+cd Empire/frontend
+npm install
 ```
 
-## PC Verification Notes
-- This PC currently does not have the required Flux model files detected under the ComfyUI model folders.
-- This PC also does not currently show any ComfyUI custom nodes installed.
-- If you use a dedicated external video service through `VIDEO_SERVICE_URL`, those missing local ComfyUI assets on the PC may no longer matter.
+### Run (LAN — same network)
+```bash
+NEXT_PUBLIC_API_URL=http://10.0.1.10:8800 npm run dev
+```
+
+### Run (Tailscale — anywhere)
+```bash
+NEXT_PUBLIC_API_URL=http://100.119.54.18:8800 npm run dev
+```
+
+Open: http://localhost:3000
+
+> All API calls (personas, generation, video, presets, etc.) go to the Windows PC.
+> ComfyUI runs locally on the PC — the Mac never talks to ComfyUI directly.
+
+---
+
+## Environment Variables
+
+### Backend (Windows PC)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `COMFY_PORT` | `8000` | ComfyUI API port |
+| `FRONTEND_ORIGINS` | `localhost:3000,3001` | Extra CORS origins (comma-separated) |
+| `OLLAMA_MODEL` | (see code) | Ollama model name for refine/chat |
+
+### Frontend (Mac or PC)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEXT_PUBLIC_API_URL` | `http://localhost:8800` | Backend URL |
+| `NEXT_PUBLIC_VIDEO_API_URL` | same as API | Video-specific backend URL (optional) |
 
 ---
 
 ## Architecture
 ```
-User → Next.js (:3000) → FastAPI (:8000) → ComfyUI (:8188) → outputs/
+Mac Browser → Next.js (:3000) → FastAPI on PC (:8800) → ComfyUI on PC (:8000) → outputs/
 ```
 
 ## API Endpoints
-| Method | Endpoint                        | Description          |
-|--------|---------------------------------|----------------------|
-| GET    | /health                         | API + ComfyUI status |
-| POST   | /personas/                      | Create persona       |
-| GET    | /personas/                      | List all personas    |
-| DELETE | /personas/{id}                  | Delete persona       |
-| POST   | /generate/{persona_id}          | Trigger generation   |
-| GET    | /generations/                   | List recent jobs     |
-| GET    | /generations/{id}/status        | Check job status     |
-| POST   | /links/                         | Add money link       |
-| GET    | /links/                         | List all links       |
-| DELETE | /links/{id}                     | Delete link          |
+| Method | Endpoint                        | Description              |
+|--------|---------------------------------|--------------------------|
+| GET    | /health                         | API + ComfyUI status     |
+| POST   | /personas/                      | Create persona           |
+| GET    | /personas/                      | List all personas        |
+| DELETE | /personas/{id}                  | Delete persona           |
+| POST   | /generate/{persona_id}          | Trigger image generation |
+| GET    | /generations/                   | List recent jobs         |
+| GET    | /generations/{id}/status        | Check image job status   |
+| POST   | /generate-video/{persona_id}    | Trigger video generation |
+| GET    | /video-status/{content_id}      | Check video job status   |
+| POST   | /upload-video-start-image       | Upload I2V start image   |
+| GET    | /presets/videos                 | Video motion presets     |
+| GET    | /presets/personas               | Persona presets          |
+| GET    | /presets/scenes                 | Scene presets            |
+| GET    | /presets/content-sets            | Content set presets      |
+| GET    | /presets/negative-prompts        | Negative prompt presets  |
+| GET    | /presets/voices                 | Voice presets            |
+| POST   | /refine-video-prompt            | AI video prompt refine   |
+| POST   | /refine-prompt                  | AI image prompt refine   |
+| POST   | /links/                         | Add money link           |
+| GET    | /links/                         | List all links           |
+| DELETE | /links/{id}                     | Delete link              |
 
 ## Troubleshooting
-- Frontend cannot connect: confirm the backend is running on `http://localhost:8000` or set `NEXT_PUBLIC_API_URL` to the correct URL before `npm run dev`.
-- ShadowVid video errors: confirm the video backend has `VIDEO_SERVICE_URL` configured and that `VIDEO_SERVICE_PRESETS_PATH`, `VIDEO_SERVICE_REFINE_PATH`, and `VIDEO_SERVICE_GENERATE_PATH` match the real service.
-- ComfyUI not detected: start ComfyUI manually first, then refresh `/health`.
-- Prompt refine or chat errors: Ollama is optional, but those features require it to be running locally.
+- **Frontend can't connect from Mac**: Ensure backend is running on `0.0.0.0:8800` on the PC and `NEXT_PUBLIC_API_URL` is set to the PC's IP.
+- **CORS errors**: Add your Mac's origin to `FRONTEND_ORIGINS` on the backend, e.g. `FRONTEND_ORIGINS=http://macbook.local:3000`.
+- **Video generation stuck**: Check ComfyUI Desktop is running. First video takes longer (model loading into VRAM).
+- **ComfyUI not detected**: Start ComfyUI Desktop manually, then restart the backend.
+- **Prompt refine errors**: Ollama must be running locally on the PC (`ollama serve`).

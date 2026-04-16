@@ -1,6 +1,8 @@
 import logging
+import mimetypes
 import os
 import random
+import re
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -73,10 +75,76 @@ DEFAULT_FRONTEND_ORIGINS = [
     "http://127.0.0.1:3001",
 ]
 
+_VIDEO_CONTEXT_SKIP_PATTERNS = [
+    re.compile(r"masterpiece", re.I),
+    re.compile(r"best quality", re.I),
+    re.compile(r"photorealistic", re.I),
+    re.compile(r"\b8k\b", re.I),
+    re.compile(r"ultra detailed", re.I),
+    re.compile(r"\bcanon\b", re.I),
+    re.compile(r"\blens\b", re.I),
+    re.compile(r"\biso\b", re.I),
+    re.compile(r"shutter speed", re.I),
+    re.compile(r"\baperture\b", re.I),
+    re.compile(r"f/\d", re.I),
+    re.compile(r"depth of field", re.I),
+    re.compile(r"selective focus", re.I),
+    re.compile(r"post-processing", re.I),
+    re.compile(r"adobe lightroom", re.I),
+]
+
 
 def _allowed_frontend_origins() -> List[str]:
     extra = [origin.strip() for origin in os.environ.get("FRONTEND_ORIGINS", "").split(",") if origin.strip()]
     return list(dict.fromkeys(DEFAULT_FRONTEND_ORIGINS + extra))
+
+
+def _join_natural(parts: List[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return f"{', '.join(parts[:-1])}, and {parts[-1]}"
+
+
+def _build_video_persona_context(prompt_base: Optional[str]) -> str:
+    if not prompt_base:
+        return ""
+
+    segments = []
+    for raw_segment in re.split(r"[,\n.]+", prompt_base):
+        segment = re.sub(r"\s+", " ", raw_segment).strip(" -•–\t")
+        if not segment:
+            continue
+        if any(pattern.search(segment) for pattern in _VIDEO_CONTEXT_SKIP_PATTERNS):
+            continue
+        segments.append(segment)
+
+    if not segments:
+        return ""
+
+    subject = segments[0]
+    age = next((segment for segment in segments[1:] if re.search(r"\byears old\b", segment, re.I)), None)
+    attrs = [segment for segment in segments[1:] if segment != age][:4]
+
+    subject_text = subject if re.match(r"^(a|an|the)\b", subject, re.I) else f"A {subject}"
+    if age and attrs:
+        return f"{subject_text}, {age}, with {_join_natural(attrs)}."
+    if age:
+        return f"{subject_text}, {age}."
+    if attrs:
+        return f"{subject_text} with {_join_natural(attrs)}."
+    return f"{subject_text}."
+
+
+def _compose_video_prompt(prompt_extra: str, prompt_base: Optional[str]) -> str:
+    motion = (prompt_extra or "").strip()
+    context = _build_video_persona_context(prompt_base)
+    if context and motion:
+        return f"{context} {motion}"
+    return context or motion
 
 
 @asynccontextmanager
@@ -484,6 +552,21 @@ def get_image(filename: str, subfolder: str = "Empire"):
         raise HTTPException(status_code=404, detail="Image not found")
 
 
+@app.get("/vault-files/{filename:path}")
+def get_vault_file(filename: str):
+    """Serve files stored in the local Empire vault."""
+    vault_root = VAULT_DIR.resolve()
+    vault_file = (VAULT_DIR / filename).resolve()
+    try:
+        vault_file.relative_to(vault_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid vault path")
+    if not vault_file.exists() or not vault_file.is_file():
+        raise HTTPException(status_code=404, detail="Vault file not found")
+    media_type = mimetypes.guess_type(str(vault_file))[0] or "application/octet-stream"
+    return FileResponse(vault_file, media_type=media_type)
+
+
 @app.get("/download/{filename:path}")
 def download_file(filename: str, subfolder: str = "Empire"):
     """Download a file from ComfyUI output with proper Content-Disposition header."""
@@ -858,213 +941,213 @@ CONTENT_SET_PRESETS = [
     },
 ]
 
-# ─── Video / GIF Presets (motion-oriented for 16-frame sequences) ────
+# ─── Video / GIF Presets (Wan-style single-shot motion prompts) ──────
 VIDEO_PRESETS = [
     # ─── Casual & Lifestyle ───
     {
         "id": "hair_flip",
         "label": "Hair Flip",
-        "prompt": "flipping hair to one side, gentle head turn, hair flowing in slow motion, soft smile, looking at camera, natural daylight",
+        "prompt": "Medium close-up. She begins facing the camera with a calm expression, then slowly turns her head and lets her hair sweep across one shoulder. Static camera with a subtle push in, soft natural daylight, sharp focus on her eyes and individual hair strands.",
     },
     {
         "id": "morning_stretch",
         "label": "Morning Stretch",
-        "prompt": "stretching arms above head in bed, arching back, yawning, morning sunlight through curtains, cozy bedroom, lazy morning",
+        "prompt": "Medium shot in bed. She wakes slowly, stretches both arms overhead, arches her back slightly, and exhales with a sleepy smile. Static camera, warm sunrise light through curtains, soft sheets shifting gently, the shot ends with her glancing toward the camera.",
     },
     {
         "id": "blowing_kiss",
         "label": "Blowing a Kiss",
-        "prompt": "blowing a kiss to camera, winking, playful smile, hand near lips, flirty gesture, close-up portrait, warm lighting",
+        "prompt": "Close-up portrait. She raises her hand to her lips, gives a playful wink, and slowly blows a kiss toward the camera. Static camera, warm flattering key light, soft background blur, the shot ends on a bright teasing smile.",
     },
     {
         "id": "coffee_sip",
         "label": "Coffee Sip",
-        "prompt": "lifting coffee mug to lips, taking a sip, looking over rim at camera, cozy cafe setting, steam rising, warm morning light",
+        "prompt": "Medium close-up at a table. She lifts a coffee mug, pauses for a small sip, then looks over the rim directly at the camera. Static camera, warm morning window light, visible steam drifting upward, cozy intimate atmosphere.",
     },
     {
         "id": "looking_over_shoulder",
         "label": "Looking Over Shoulder",
-        "prompt": "slowly turning head to look over shoulder, mysterious glance, walking away pose, dramatic lighting, cinematic",
+        "prompt": "Medium shot from behind. She begins angled away from the camera, then slowly turns her head over one shoulder and holds a mysterious glance. Subtle camera push in, cinematic contrast lighting, the motion stays smooth and deliberate.",
     },
     # ─── Glamour & Sensual ───
     {
         "id": "lip_bite",
         "label": "Lip Bite",
-        "prompt": "gently biting lower lip, sultry eye contact, close-up face portrait, soft focus background, warm studio lighting, seductive",
+        "prompt": "Close-up portrait. She holds steady eye contact, gently bites her lower lip, then relaxes into a soft expression without breaking the gaze. Static camera, warm studio key light with soft fill, sharp focus on lips and eyes.",
     },
     {
         "id": "body_wave",
         "label": "Body Wave",
-        "prompt": "slow sensual body wave movement, hands running through hair, smooth motion, moody lighting, dark background, confident expression",
+        "prompt": "Medium shot. She begins upright, rolls into one slow body wave, and lets one hand pass through her hair as the motion finishes. Static camera, dark background, moody rim light shaping the body, smooth controlled movement from start to finish.",
     },
     {
         "id": "robe_drop",
         "label": "Robe Reveal",
-        "prompt": "sliding silk robe off one shoulder, revealing collarbone, lingerie underneath, bedroom setting, warm golden light, elegant seductive",
+        "prompt": "Medium close-up. She lightly touches the robe collar, slowly slides it off one shoulder, and settles into a confident pose. Static camera, warm golden bedroom light, visible silk texture catching highlights, the shot ends on direct eye contact.",
     },
     {
         "id": "mirror_pose",
         "label": "Mirror Pose",
-        "prompt": "posing in front of full-length mirror, adjusting outfit, checking reflection, natural movements, bedroom or bathroom, candid self-admiration",
+        "prompt": "Medium shot beside a mirror. She adjusts her outfit with small natural motions, turns slightly to check her reflection, then relaxes into a composed pose. Static camera, soft indoor light, clean bedroom or dressing-room atmosphere, gentle realistic movement.",
     },
     {
         "id": "wine_swirl",
         "label": "Wine Swirl",
-        "prompt": "swirling glass of red wine, bringing to lips, sipping slowly, lounging on velvet couch, candlelight, intimate evening atmosphere",
+        "prompt": "Medium shot while seated. She slowly swirls a glass of red wine, brings it toward her lips, and takes a measured sip before lowering it again. Static camera, candlelit evening mood, warm highlights on glass and skin, rich intimate atmosphere.",
     },
     # ─── Active & Fun ───
     {
         "id": "dance_move",
         "label": "Dance Move",
-        "prompt": "dancing with arms raised, spinning slightly, joyful expression, music vibes, colorful club lighting, rhythmic movement, party energy",
+        "prompt": "Medium full-body shot. She lifts her arms, sways into a small rhythmic dance move, and turns slightly with a joyful expression. Static camera, colorful club-inspired lighting, smooth repeatable motion, the shot ends with her facing camera again.",
     },
     {
         "id": "pool_splash",
         "label": "Pool Splash",
-        "prompt": "entering pool slowly, water splashing around legs, bright sunlight, bikini, wet skin glistening, summer fun, slow motion effect",
+        "prompt": "Medium shot at poolside. She steps slowly into the water, creating a gentle splash around her legs, then looks back toward the camera with a relaxed smile. Static camera, bright summer sunlight, wet skin and water reflections rendered in high detail.",
     },
     {
         "id": "workout_rep",
         "label": "Workout Rep",
-        "prompt": "doing exercise rep, lifting weights or squatting, gym setting, athletic wear, focused determination, muscle definition, fitness content",
+        "prompt": "Medium full-body shot in a gym. She performs one clean exercise repetition with controlled form, pauses briefly at the top, and resets with focused breathing. Static camera, crisp athletic lighting, visible muscle definition and fabric movement.",
     },
     {
         "id": "running_slow_mo",
         "label": "Running Slow-Mo",
-        "prompt": "slow motion jogging on beach, hair bouncing, athletic wear, sunset lighting, waves in background, fitness lifestyle, dynamic motion",
+        "prompt": "Medium full-body shot on a beach path. She jogs forward in smooth slow motion as her hair bounces naturally and the wind catches her clothing. Tracking camera moving gently with her, warm sunset light, waves softly moving in the background.",
     },
     # ─── Dramatic & Cinematic ───
     {
         "id": "wind_blown",
         "label": "Wind Blown",
-        "prompt": "standing on rooftop or cliff edge, wind blowing hair and clothes dramatically, sunset backdrop, cinematic wide shot, powerful pose",
+        "prompt": "Wide shot. She stands still against the skyline while strong wind pushes her hair and clothing to one side, then she lifts her chin into the light. Static camera, sunset backlight and rim light, powerful posture, cinematic atmosphere.",
     },
     {
         "id": "rain_walk",
         "label": "Rain Walk",
-        "prompt": "walking slowly in rain, wet hair and clothes, city street at night, neon reflections on wet pavement, moody cinematic, dramatic atmosphere",
+        "prompt": "Medium full-body shot on a city street at night. She walks slowly through light rain, wet hair clinging softly as reflections shimmer across the pavement. Tracking camera with gentle forward motion, neon light in the background, moody cinematic tone.",
     },
     {
         "id": "candle_blow",
         "label": "Candle Blow",
-        "prompt": "leaning forward to blow out candles, flickering light on face, birthday or romantic setting, soft focus, intimate warm atmosphere",
+        "prompt": "Medium close-up at a table. She leans toward a cluster of candles, inhales softly, then blows them out in one smooth motion as the flame flickers across her face. Static camera, warm intimate light, the shot ends in a soft afterglow.",
     },
     {
         "id": "smoke_exhale",
         "label": "Smoke Exhale",
-        "prompt": "exhaling smoke or mist slowly, dark moody background, colored lighting, mysterious aesthetic, dramatic portrait, cinematic atmosphere",
+        "prompt": "Close-up portrait. She holds still for a beat, then slowly exhales a soft stream of smoke or mist that drifts across the frame. Static camera, dark background, colored edge lighting, mysterious expression, clean controlled motion.",
     },
     # ─── Social Media & Trending ───
     {
         "id": "outfit_reveal",
         "label": "Outfit Reveal",
-        "prompt": "spinning around to show full outfit, hands on hips pose at end, confident strut, bright studio backdrop, fashion content, trending style",
+        "prompt": "Medium full-body shot. She turns in a slow confident half spin to reveal the outfit, then settles with both hands on her hips. Static camera, bright studio backdrop, crisp fashion lighting, the shot ends in a clean hero pose.",
     },
     {
         "id": "wink_and_wave",
         "label": "Wink & Wave",
-        "prompt": "winking at camera with small wave, friendly greeting, bright natural lighting, casual cute outfit, social media intro, warm personality",
+        "prompt": "Close-up portrait. She smiles warmly, gives a small wave, then adds a quick wink before relaxing back into a friendly expression. Static camera, bright natural light, casual social-media intro energy, sharp focus on face and hands.",
     },
     {
         "id": "tongue_out",
         "label": "Playful Tongue Out",
-        "prompt": "sticking tongue out playfully, peace sign with hand, fun energetic expression, colorful background, gen-z aesthetic, social media content",
+        "prompt": "Medium close-up. She leans slightly toward the camera, flashes a peace sign, sticks her tongue out for a beat, then laughs and relaxes. Static camera, colorful backdrop, bright playful lighting, energetic but simple motion.",
     },
     {
         "id": "glasses_on",
         "label": "Glasses On",
-        "prompt": "slowly putting on designer sunglasses, cool confident expression, urban background, fashion forward, smooth motion, influencer aesthetic",
+        "prompt": "Medium close-up. She raises a pair of sunglasses, slowly places them on, then lowers her chin into a cool confident look. Static camera, urban background softly out of focus, clean fashion lighting, smooth deliberate timing.",
     },
     # ─── Intimate & Bedroom ───
     {
         "id": "pillow_hug",
         "label": "Pillow Hug",
-        "prompt": "hugging pillow on bed, rolling over slowly, sleepy cozy expression, oversized shirt, morning sunlight, soft sheets, intimate bedroom atmosphere",
+        "prompt": "Medium shot on a bed. She hugs a pillow close, rolls gently onto one side, and settles into a sleepy smile. Static camera, soft morning light, textured sheets and fabric movement, cozy intimate bedroom mood.",
     },
     {
         "id": "bedsheet_peek",
         "label": "Bedsheet Peek",
-        "prompt": "peeking out from under white bedsheets, playful smile, pulling sheet down slowly, messy bed hair, soft window light, lazy morning vibes",
+        "prompt": "Medium close-up in bed. She starts partly hidden under white sheets, slowly lowers the sheet just below her face, and reveals a playful smile. Static camera, soft window light, tousled hair and gentle fabric movement in clear detail.",
     },
     {
         "id": "lingerie_walk",
         "label": "Lingerie Walk",
-        "prompt": "walking slowly toward camera in lingerie, confident stride, hand on hip, soft warm studio lighting, elegant backdrop, empowered feminine energy",
+        "prompt": "Medium full-body shot. She walks slowly toward the camera with one clean confident stride, then shifts one hand to her hip and holds the pose. Static camera, soft warm studio light, elegant backdrop, poised controlled movement.",
     },
     {
         "id": "getting_ready",
         "label": "Getting Ready",
-        "prompt": "applying lipstick in vanity mirror, adjusting hair, putting on earrings, getting dressed, bathroom or bedroom, behind-the-scenes morning routine",
+        "prompt": "Medium shot at a vanity. She applies lipstick with a steady hand, adjusts a strand of hair, and gives herself one final look in the mirror. Static camera, flattering indoor light, behind-the-scenes morning routine with small realistic motions.",
     },
     # ─── Bath & Water ───
     {
         "id": "bubble_bath",
         "label": "Bubble Bath",
-        "prompt": "relaxing in bubble bath, playing with foam, lifting leg out of water slowly, candles flickering, steam rising, warm bathroom lighting, spa vibes",
+        "prompt": "Medium shot in a bath. She lifts a hand through the foam, lets the bubbles slide away, and settles back into the water with a calm expression. Static camera, warm bathroom light, candle flicker and soft steam, gentle spa-like motion.",
     },
     {
         "id": "shower_steam",
         "label": "Shower Steam",
-        "prompt": "standing in steamy shower, water running over shoulders, tilting head back, foggy glass, warm tones, sensual silhouette, artistic nude aesthetic",
+        "prompt": "Medium close-up through soft steam. Water runs over her shoulders as she slowly tilts her head back and closes her eyes for a moment. Static camera, warm diffused bathroom light, fogged glass and moisture rendered with high detail.",
     },
     # ─── Fashion & Transition ───
     {
         "id": "outfit_change",
         "label": "Outfit Change",
-        "prompt": "quick outfit transition, snapping fingers to switch looks, multiple outfit reveals, dynamic camera angle changes, trending transition style, fashion showcase",
+        "prompt": "Medium shot designed as a single continuous reveal. She starts adjusting the outer layer of her outfit, opens it in one smooth motion to reveal the styled look underneath, then holds a confident finishing pose. Static camera, clean studio lighting, no jump cuts.",
     },
     {
         "id": "catwalk",
         "label": "Catwalk Strut",
-        "prompt": "walking down runway toward camera, fierce confident expression, high fashion outfit, dramatic lighting, shoulders back, model walk, editorial vibe",
+        "prompt": "Medium full-body runway shot. She takes two measured model steps toward the camera with shoulders back and a fierce expression, then pauses at the end mark. Static camera, dramatic editorial lighting, smooth forward motion and clean posture.",
     },
     {
         "id": "jacket_drop",
         "label": "Jacket Drop",
-        "prompt": "slowly sliding jacket off shoulders, revealing outfit underneath, looking back at camera, moody lighting, confident body language, fashion reveal",
+        "prompt": "Medium shot. She slowly slides a jacket off her shoulders, reveals the outfit beneath, and turns her face back toward the camera at the end of the motion. Static camera, moody fashion lighting, crisp fabric detail and confident body language.",
     },
     # ─── Mood & Aesthetic ───
     {
         "id": "golden_hour",
         "label": "Golden Hour",
-        "prompt": "posing during golden hour sunset, warm light on face and body, hair glowing, gentle breeze, field or rooftop, dreamy lens flare, ethereal beauty",
+        "prompt": "Medium shot outdoors at sunset. She shifts her weight slowly, turns slightly into the light, and lets a gentle breeze move her hair while she keeps a serene expression. Static camera, golden backlight, soft lens flare, dreamy high-detail atmosphere.",
     },
     {
         "id": "neon_glow",
         "label": "Neon Glow",
-        "prompt": "standing under neon lights, pink and blue glow on skin, urban night scene, looking at camera, moody expression, cyberpunk aesthetic, cinematic colors",
+        "prompt": "Medium close-up in an urban night scene. She stands nearly still, slowly lifts her gaze to the camera, and lets the neon colors shift across her face. Static camera, pink and blue edge light, moody cyberpunk atmosphere, sharp skin detail.",
     },
     {
         "id": "polaroid_snap",
         "label": "Polaroid Snap",
-        "prompt": "holding up polaroid camera, taking selfie, flash going off, candid smile, retro aesthetic, film grain, vintage room, nostalgic casual vibes",
+        "prompt": "Medium close-up. She lifts a polaroid camera, frames the shot, presses the shutter, and breaks into a candid smile just after the flash. Static camera, vintage room, retro color tone, small natural hand motion and nostalgic mood.",
     },
     # ─── Playful & Engaging ───
     {
         "id": "pillow_fight",
         "label": "Pillow Fight",
-        "prompt": "swinging pillow playfully, feathers flying in slow motion, laughing, pajamas, bedroom setting, bright warm light, fun youthful energy",
+        "prompt": "Medium shot in a bedroom. She swings a pillow once in a playful arc, laughs as it lands, and settles back into frame with lively energy. Static camera, bright warm indoor light, soft fabric movement, simple readable action.",
     },
     {
         "id": "ice_cream_lick",
         "label": "Ice Cream Lick",
-        "prompt": "licking ice cream cone slowly, playful eye contact with camera, summer sunshine, colorful sprinkles, sweet flirty expression, warm outdoor setting",
+        "prompt": "Medium close-up outdoors. She brings an ice cream cone toward her lips, takes one slow lick, and gives the camera a playful look before smiling. Static camera, summer sunshine, colorful detail in the cone, warm flirty tone.",
     },
     {
         "id": "flower_smell",
         "label": "Flower Smell",
-        "prompt": "bringing bouquet of flowers to face, inhaling scent with closed eyes, gentle smile, soft natural lighting, garden or meadow, romantic aesthetic",
+        "prompt": "Medium close-up. She raises a bouquet toward her face, closes her eyes for one slow inhale, and opens them into a soft smile. Static camera, natural garden light, delicate petal texture, romantic calm mood.",
     },
     # ─── Behind the Scenes ───
     {
         "id": "bts_photoshoot",
         "label": "BTS Photoshoot",
-        "prompt": "behind the scenes of photoshoot, adjusting pose between clicks, laughing with crew, studio setup visible, candid natural moments, documentary style",
+        "prompt": "Medium shot on a studio set. She relaxes between poses, adjusts her stance, then breaks into a candid laugh as if responding to someone off camera. Static camera, visible studio setup in the background, documentary-style natural motion.",
     },
     {
         "id": "phone_scroll",
         "label": "Phone Scroll",
-        "prompt": "lying on stomach scrolling phone, kicking feet in air, bed or couch, casual loungewear, natural candid movement, relatable content creator moment",
+        "prompt": "Medium shot while lounging on a bed or couch. She scrolls her phone with one hand, shifts her elbows slightly, and glances up from the screen with a relaxed expression. Static camera, soft ambient light, casual candid everyday motion.",
     },
 ]
 
@@ -2254,7 +2337,7 @@ def generate_video(
         persona = db.query(Persona).filter(Persona.id == persona_id).first()
         if not persona:
             raise HTTPException(status_code=404, detail="Persona not found")
-        full_prompt = f"{persona.prompt_base}, {body.prompt_extra}"
+        full_prompt = _compose_video_prompt(body.prompt_extra, persona.prompt_base)
     else:
         full_prompt = body.prompt_extra
 
@@ -2396,6 +2479,33 @@ def _save_output_locally(content, output_info: dict, db):
 VAULT_DIR = Path.home() / "Documents" / "ComfyUI" / "output" / "Empire" / "vault"
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _lookup_local_persona_by_name(name: Optional[str], db: Session) -> Optional[Persona]:
+    if not name:
+        return None
+    normalized = name.strip().lower()
+    if not normalized:
+        return None
+    return db.query(Persona).filter(func.lower(Persona.name) == normalized).first()
+
+
+def _lookup_local_persona_by_prompt(prompt: Optional[str], db: Session) -> Optional[Persona]:
+    if not prompt:
+        return None
+    normalized_prompt = prompt.strip()
+    if not normalized_prompt:
+        return None
+
+    personas = db.query(Persona).all()
+    # Prefer the longest prompt_base prefix to avoid partial matches.
+    personas.sort(key=lambda persona: len((persona.prompt_base or "").strip()), reverse=True)
+    for persona in personas:
+        prompt_base = (persona.prompt_base or "").strip()
+        if prompt_base and normalized_prompt.startswith(prompt_base):
+            return persona
+    return None
+
+
 def _save_video_to_vault(content, output_info: dict, db):
     """Save a completed video to the vault alongside image generations."""
     try:
@@ -2425,6 +2535,139 @@ def _save_video_to_vault(content, output_info: dict, db):
         logger.info("Saved video to vault: %s", vault_path)
     except Exception as e:
         logger.warning("Failed to save video to vault: %s", e)
+
+
+# ─── Remote video sync (Shadow-Wirk → Mac) ──────────────────────────
+
+@app.post("/sync-remote-video/{remote_content_id}")
+def sync_remote_video(remote_content_id: int, db: Session = Depends(get_db)):
+    """Download a completed video from Shadow-Wirk and save locally to vault + outputs."""
+    # 1. Fetch status from Shadow-Wirk
+    try:
+        status_resp = requests.get(
+            f"{SHADOW_URL}/video-status/{remote_content_id}",
+            timeout=15,
+        )
+        status_resp.raise_for_status()
+        status_data = status_resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach Shadow-Wirk: {e}")
+
+    if status_data.get("status") != "completed" or not status_data.get("outputs"):
+        raise HTTPException(status_code=409, detail="Remote video not yet completed")
+
+    output_info = status_data["outputs"][0]
+    filename = output_info["filename"]
+    subfolder = output_info.get("subfolder", "Empire")
+
+    # 2. Fetch persona info from Shadow-Wirk for folder naming
+    persona_name = "unknown"
+    remote_persona_id = None
+    remote_persona_name = None
+    remote_prompt = None
+    local_persona = None
+    try:
+        content_resp = requests.get(
+            f"{SHADOW_URL}/vault/",
+            timeout=15,
+        )
+        if content_resp.ok:
+            vault_items = content_resp.json()
+            for item in vault_items:
+                if item.get("id") == remote_content_id:
+                    remote_persona_id = item.get("persona_id")
+                    remote_prompt = item.get("prompt_used")
+                    break
+
+        if remote_persona_id:
+            persona_resp = requests.get(
+                f"{SHADOW_URL}/personas/{remote_persona_id}",
+                timeout=15,
+            )
+            if persona_resp.ok:
+                remote_persona_name = persona_resp.json().get("name")
+
+        local_persona = _lookup_local_persona_by_prompt(remote_prompt, db)
+        if not local_persona:
+            local_persona = _lookup_local_persona_by_name(remote_persona_name, db)
+        if local_persona:
+            persona_name = local_persona.name.replace(" ", "_")
+        elif remote_persona_name:
+            persona_name = remote_persona_name.replace(" ", "_")
+    except Exception:
+        pass  # Fall back to "unknown" folder
+
+    # 3. Download the actual video bytes from Shadow-Wirk's ComfyUI
+    try:
+        video_resp = requests.get(
+            f"{SHADOW_URL}/images/{filename}",
+            params={"subfolder": subfolder},
+            timeout=120,
+        )
+        video_resp.raise_for_status()
+        video_bytes = video_resp.content
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to download video from Shadow-Wirk: {e}")
+
+    if len(video_bytes) < 1000:
+        raise HTTPException(status_code=502, detail="Downloaded file too small — likely an error response")
+
+    # 4. Save to local vault
+    safe_name = f"vault_sw{remote_content_id}_{filename}"
+    media_path = f"vault/{safe_name}"
+    vault_path = VAULT_DIR / safe_name
+    if not vault_path.exists():
+        vault_path.write_bytes(video_bytes)
+        logger.info("Synced remote video to vault: %s (%d bytes)", vault_path, len(video_bytes))
+
+    # 5. Save to outputs/<persona>/
+    dest_dir = OUTPUT_ROOT / persona_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_file = dest_dir / filename
+    if not dest_file.exists():
+        dest_file.write_bytes(video_bytes)
+        logger.info("Synced remote video to outputs: %s", dest_file)
+
+    # 6. Create local Content record so it appears in Mac's vault
+    existing = db.query(Content).filter(
+        Content.upscaled_path == media_path,
+    ).first()
+    if existing:
+        changed = False
+        if local_persona and existing.persona_id != local_persona.id:
+            existing.persona_id = local_persona.id
+            changed = True
+        if existing.file_path != media_path:
+            existing.file_path = media_path
+            changed = True
+        if existing.watermarked_path != media_path:
+            existing.watermarked_path = media_path
+            changed = True
+        if changed:
+            db.commit()
+        return {"id": existing.id, "status": "already_synced", "vault_path": media_path}
+
+    content = Content(
+        persona_id=local_persona.id if local_persona else None,
+        prompt_used=remote_prompt or f"[synced from Shadow-Wirk #{remote_content_id}]",
+        comfy_job_id=None,
+        status="completed",
+        file_path=media_path,
+        upscaled_path=media_path,
+        watermarked_path=media_path,
+        tags="video,video-sync",
+    )
+    db.add(content)
+    db.commit()
+    db.refresh(content)
+
+    logger.info("Created local content #%d for synced remote video #%d", content.id, remote_content_id)
+    return {
+        "id": content.id,
+        "status": "synced",
+        "vault_path": media_path,
+        "output_path": str(dest_file),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════

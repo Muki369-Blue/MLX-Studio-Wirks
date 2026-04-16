@@ -60,14 +60,19 @@ def _ws_listener():
         return
 
     ws_url = f"ws://127.0.0.1:{COMFY_PORT}/ws?clientId={CLIENT_ID}"
+    _first_connect = True
     while True:
         try:
             ws = websocket.WebSocket()
-            ws.connect(ws_url, timeout=5)
-            logger.info("ComfyUI WebSocket connected for progress tracking")
+            ws.connect(ws_url, timeout=10)
+            if _first_connect:
+                logger.info("ComfyUI WebSocket connected for progress tracking")
+                _first_connect = False
+            else:
+                logger.debug("ComfyUI WebSocket reconnected")
             while True:
                 msg = ws.recv()
-                if not msg:
+                if not msg or not isinstance(msg, str):
                     continue
                 try:
                     data = json.loads(msg)
@@ -101,6 +106,11 @@ def _ws_listener():
         except Exception as e:
             logger.debug("ComfyUI WebSocket disconnected: %s — reconnecting in 5s", e)
             time.sleep(5)
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
 
 def start_progress_listener():

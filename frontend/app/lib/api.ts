@@ -1,7 +1,81 @@
 export const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8800";
 export const VIDEO_API = process.env.NEXT_PUBLIC_VIDEO_API_URL ?? API;
 
+const VIDEO_CONTEXT_SKIP_PATTERNS = [
+  /masterpiece/i,
+  /best quality/i,
+  /photorealistic/i,
+  /\b8k\b/i,
+  /ultra detailed/i,
+  /canon\b/i,
+  /\blens\b/i,
+  /\biso\b/i,
+  /shutter speed/i,
+  /\baperture\b/i,
+  /f\/\d/i,
+  /depth of field/i,
+  /selective focus/i,
+  /post-processing/i,
+  /adobe lightroom/i,
+];
+
+function encodePath(path: string): string {
+  return path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+}
+
+function joinNatural(parts: string[]): string {
+  if (parts.length === 0) return "";
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return `${parts[0]} and ${parts[1]}`;
+  return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
+}
+
+export function buildVideoPersonaContext(promptBase?: string | null): string {
+  if (!promptBase) return "";
+
+  const segments = promptBase
+    .replace(/\n+/g, ", ")
+    .split(/[.,]/)
+    .map((segment) => segment.replace(/\s+/g, " ").trim().replace(/^[\-•–\s]+/, ""))
+    .filter(Boolean)
+    .filter((segment) => !VIDEO_CONTEXT_SKIP_PATTERNS.some((pattern) => pattern.test(segment)));
+
+  if (segments.length === 0) return "";
+
+  const subject = segments[0];
+  const age = segments.slice(1).find((segment) => /\byears old\b/i.test(segment));
+  const attrs = segments
+    .slice(1)
+    .filter((segment) => segment !== age)
+    .slice(0, 4);
+
+  const subjectText = /^(a|an|the)\b/i.test(subject) ? subject : `A ${subject}`;
+  if (age && attrs.length > 0) {
+    return `${subjectText}, ${age}, with ${joinNatural(attrs)}.`;
+  }
+  if (age) {
+    return `${subjectText}, ${age}.`;
+  }
+  if (attrs.length > 0) {
+    return `${subjectText} with ${joinNatural(attrs)}.`;
+  }
+  return `${subjectText}.`;
+}
+
+export function composeVideoPrompt(promptExtra: string, promptBase?: string | null): string {
+  const motion = promptExtra.trim();
+  const context = buildVideoPersonaContext(promptBase);
+  if (context && motion) return `${context} ${motion}`;
+  return context || motion;
+}
+
 export function imageUrl(filename: string, subfolder: string = "Empire"): string {
+  if (filename.startsWith("vault/")) {
+    return `${API}/vault-files/${encodePath(filename.slice("vault/".length))}`;
+  }
   return `${API}/images/${encodeURIComponent(filename)}?subfolder=${encodeURIComponent(subfolder)}`;
 }
 
@@ -360,6 +434,7 @@ export async function generateVideo(
   personaId: number | null,
   promptExtra: string,
   opts?: {
+    full_prompt?: string;
     negative_prompt?: string;
     width?: number;
     height?: number;
@@ -376,6 +451,7 @@ export async function generateVideo(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       prompt_extra: promptExtra,
+      full_prompt: opts?.full_prompt || null,
       negative_prompt: opts?.negative_prompt || null,
       width: opts?.width ?? 832,
       height: opts?.height ?? 480,
@@ -416,9 +492,9 @@ export async function fetchVideoLoras(baseUrl: string = VIDEO_API): Promise<stri
 export async function generateVideoRemote(
   shadowUrl: string,
   personaId: number | null,
-  fullPrompt: string,
   promptExtra: string,
   opts?: {
+    full_prompt?: string;
     negative_prompt?: string;
     width?: number;
     height?: number;
@@ -435,7 +511,7 @@ export async function generateVideoRemote(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       prompt_extra: promptExtra,
-      full_prompt: fullPrompt,
+      full_prompt: opts?.full_prompt || null,
       negative_prompt: opts?.negative_prompt || null,
       width: opts?.width ?? 832,
       height: opts?.height ?? 480,
@@ -459,6 +535,17 @@ export async function checkVideoStatusRemote(
 ): Promise<{ status: string; progress?: number; outputs: any[] }> {
   const res = await fetch(`${shadowUrl}/video-status/${contentId}`);
   if (!res.ok) throw new Error("Failed to check Shadow-Wirk video status");
+  return res.json();
+}
+
+export async function syncRemoteVideo(
+  remoteContentId: number
+): Promise<{ id: number; status: string; vault_path: string; output_path?: string }> {
+  const res = await fetch(`${API}/sync-remote-video/${remoteContentId}`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Sync failed" }));
+    throw new Error(err.detail || "Failed to sync remote video");
+  }
   return res.json();
 }
 

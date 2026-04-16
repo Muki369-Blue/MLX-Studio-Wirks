@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useRef } from "react";
 import {
+  buildVideoPersonaContext,
+  composeVideoPrompt,
   fetchVideoPresets,
   fetchVideoLoras,
   generateVideo,
@@ -11,6 +13,7 @@ import {
   uploadVideoStartImageRemote,
   checkVideoStatus,
   checkVideoStatusRemote,
+  syncRemoteVideo,
   SHADOW_WIRKS_URL,
   type Persona,
   type VideoPreset,
@@ -88,6 +91,16 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
           setVideoProgress(100);
           setVideoResult("Video generation complete!");
           clearInterval(interval);
+          // Auto-sync Shadow-Wirk video to Mac vault
+          if (useShadow) {
+            try {
+              const sync = await syncRemoteVideo(contentId);
+              setVideoResult(`Video synced to Mac vault! (local #${sync.id})`);
+            } catch (e: any) {
+              console.warn("Auto-sync failed:", e.message);
+              setVideoResult("Video complete on Shadow-Wirk (sync to Mac failed — retry from vault)");
+            }
+          }
         } else if (result.status === "failed") {
           setGeneratingVideo(false);
           setVideoProgress(0);
@@ -112,7 +125,11 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     setVideoResult(null);
     try {
       const persona = personas.find((p) => p.id === videoPersona);
-      const data = await refineVideoPrompt(videoPrompt, videoIntensity, persona?.prompt_base);
+      const data = await refineVideoPrompt(
+        videoPrompt,
+        videoIntensity,
+        buildVideoPersonaContext(persona?.prompt_base)
+      );
       setVideoPrompt(data.refined);
       setVideoResult(`✨ Motion prompt refined${persona ? ` for ${persona.name}` : ""}`);
     } catch (error) {
@@ -164,8 +181,9 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     setContentId(null);
     try {
       const persona = videoPersona ? personas.find((p) => p.id === videoPersona) : null;
-      const fullPrompt = persona ? `${persona.prompt_base}, ${videoPrompt}` : videoPrompt;
+      const fullPrompt = composeVideoPrompt(videoPrompt, persona?.prompt_base);
       const videoOpts = {
+        full_prompt: fullPrompt,
         width,
         height,
         length,
@@ -175,7 +193,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
         lora_name: selectedLora || undefined,
       };
       const res = useShadow
-        ? await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, fullPrompt, videoPrompt, videoOpts)
+        ? await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, videoPrompt, videoOpts)
         : await generateVideo(videoPersona, videoPrompt, videoOpts);
       setContentId(res.id);
       setVideoStatus("processing");

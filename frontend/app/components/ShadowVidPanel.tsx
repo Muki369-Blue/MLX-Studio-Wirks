@@ -4,20 +4,25 @@ import { useEffect, useState, useRef } from "react";
 import {
   fetchVideoPresets,
   generateVideo,
+  generateVideoRemote,
   refineVideoPrompt,
   uploadVideoStartImage,
+  uploadVideoStartImageRemote,
   checkVideoStatus,
+  checkVideoStatusRemote,
+  SHADOW_WIRKS_URL,
   type Persona,
   type VideoPreset,
   API,
 } from "../lib/api";
 
-export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
+export default function ShadowVidPanel({ personas, shadowOnline }: { personas: Persona[]; shadowOnline: boolean }) {
   const [videoPersona, setVideoPersona] = useState<number | null>(null);
   const [videoPrompt, setVideoPrompt] = useState("");
   const [videoPresets, setVideoPresets] = useState<VideoPreset[]>([]);
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const [videoResult, setVideoResult] = useState<string | null>(null);
+  const [useShadow, setUseShadow] = useState(false);
   const [refiningVideo, setRefiningVideo] = useState(false);
   const [videoIntensity, setVideoIntensity] = useState<"light" | "medium" | "heavy">("medium");
 
@@ -51,7 +56,9 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
     if (!contentId || videoStatus === "completed" || videoStatus === "error") return;
     const interval = setInterval(async () => {
       try {
-        const result = await checkVideoStatus(contentId);
+        const result = useShadow
+          ? await checkVideoStatusRemote(SHADOW_WIRKS_URL, contentId)
+          : await checkVideoStatus(contentId);
         setVideoStatus(result.status);
         if (result.status === "completed" && result.outputs?.length) {
           setVideoOutputs(result.outputs);
@@ -64,7 +71,7 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
       }
     }, 3000);
     return () => clearInterval(interval);
-  }, [contentId, videoStatus]);
+  }, [contentId, videoStatus, useShadow]);
 
   const handleSelectVideoPreset = (presetId: string) => {
     const preset = videoPresets.find((item) => item.id === presetId);
@@ -76,9 +83,10 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
     setRefiningVideo(true);
     setVideoResult(null);
     try {
-      const data = await refineVideoPrompt(videoPrompt, videoIntensity);
+      const persona = personas.find((p) => p.id === videoPersona);
+      const data = await refineVideoPrompt(videoPrompt, videoIntensity, persona?.prompt_base);
       setVideoPrompt(data.refined);
-      setVideoResult("✨ Motion prompt refined");
+      setVideoResult(`✨ Motion prompt refined${persona ? ` for ${persona.name}` : ""}`);
     } catch (error) {
       setVideoResult(error instanceof Error ? error.message : "Refine failed.");
     }
@@ -95,7 +103,9 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
     // Upload to ComfyUI immediately
     setUploadingImage(true);
     try {
-      const result = await uploadVideoStartImage(file);
+      const result = useShadow
+        ? await uploadVideoStartImageRemote(SHADOW_WIRKS_URL, file)
+        : await uploadVideoStartImage(file);
       setComfyImageName(result.comfy_image_name);
     } catch (error) {
       setVideoResult(error instanceof Error ? error.message : "Failed to upload image");
@@ -116,23 +126,33 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
       setVideoResult("Upload a start image first for Image-to-Video mode.");
       return;
     }
+    if (useShadow && !shadowOnline) {
+      setVideoResult("Shadow-Wirk is offline. Switch to local or check connection.");
+      return;
+    }
     setGeneratingVideo(true);
     setVideoResult(null);
     setVideoOutputs([]);
     setVideoStatus(null);
     setContentId(null);
     try {
-      const res = await generateVideo(videoPersona, videoPrompt, {
+      const persona = personas.find((p) => p.id === videoPersona);
+      const fullPrompt = persona ? `${persona.prompt_base}, ${videoPrompt}` : videoPrompt;
+      const videoOpts = {
         width,
         height,
         length,
         steps,
         cfg,
         start_image: mode === "i2v" ? comfyImageName ?? undefined : undefined,
-      });
+      };
+      const res = useShadow
+        ? await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, fullPrompt, videoPrompt, videoOpts)
+        : await generateVideo(videoPersona, videoPrompt, videoOpts);
       setContentId(res.id);
       setVideoStatus("processing");
-      setVideoResult(`Video queued (${res.mode === "i2v" ? "Image→Video" : "Text→Video"}) — polling...`);
+      const target = useShadow ? " on Shadow-Wirk" : "";
+      setVideoResult(`Video queued${target} (${res.mode === "i2v" ? "Image→Video" : "Text→Video"}) — polling...`);
     } catch (error) {
       setVideoResult(error instanceof Error ? error.message : "Failed to generate video.");
       setGeneratingVideo(false);
@@ -151,9 +171,28 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
             Wan 2.1
           </span>
         </h2>
-        <p className="text-xs text-zinc-500 mb-3">
-          Video generation powered by Wan 2.1 via local ComfyUI.
-        </p>
+        <div className="flex items-center justify-between mb-3">
+          <p className="text-xs text-zinc-500">
+            Video generation powered by Wan 2.1 via {useShadow ? "Shadow-Wirk GPU" : "local ComfyUI"}.
+          </p>
+          <button
+            onClick={() => setUseShadow(!useShadow)}
+            disabled={!shadowOnline && !useShadow}
+            title={shadowOnline ? (useShadow ? "Switch to local ComfyUI" : "Switch to Shadow-Wirk GPU") : "Shadow-Wirk is offline"}
+            className={`flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+              useShadow
+                ? "bg-emerald-600/20 text-emerald-300 border-emerald-500"
+                : shadowOnline
+                  ? "bg-zinc-800 text-zinc-400 border-zinc-700 hover:border-zinc-500"
+                  : "bg-zinc-800/50 text-zinc-600 border-zinc-800 cursor-not-allowed"
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${
+              useShadow ? "bg-emerald-400" : shadowOnline ? "bg-zinc-500" : "bg-zinc-700"
+            }`} />
+            Shadow-Wirk
+          </button>
+        </div>
 
         <div className="space-y-3">
           {/* Mode selector */}
@@ -357,27 +396,33 @@ export default function ShadowVidPanel({ personas }: { personas: Persona[] }) {
           )}
 
           {/* Video output display */}
-          {videoOutputs.length > 0 && (
+          {videoOutputs.length > 0 && (() => {
+            const videoBase = useShadow ? SHADOW_WIRKS_URL : API;
+            return (
             <div className="border border-zinc-700 rounded-lg p-3">
-              <label className="text-xs text-zinc-500 block mb-2">Output</label>
-              {videoOutputs.map((out, i) => (
+              <label className="text-xs text-zinc-500 block mb-2">Output{useShadow ? " (from Shadow-Wirk)" : ""}</label>
+              {videoOutputs.map((out, i) => {
+                const src = `${videoBase}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`;
+                return (
                 <div key={i} className="text-center">
                   <img
-                    src={`${API}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`}
+                    src={src}
                     alt="Generated video"
                     className="max-w-full rounded-lg mx-auto"
                   />
                   <a
-                    href={`${API}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`}
+                    href={src}
                     download={out.filename}
                     className="inline-block mt-2 text-xs text-violet-400 hover:text-violet-300"
                   >
                     ⬇ Download {out.filename}
                   </a>
                 </div>
-              ))}
+                );
+              })}
             </div>
-          )}
+            );
+          })()}
         </div>
       </div>
     </div>

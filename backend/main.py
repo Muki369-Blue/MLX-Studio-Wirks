@@ -107,9 +107,17 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
+    shadow_wirks = False
+    shadow_url = os.environ.get("SHADOW_WIRKS_URL", "http://100.119.54.18:8800")
+    try:
+        r = requests.get(f"{shadow_url}/health", timeout=2)
+        shadow_wirks = r.status_code == 200
+    except Exception:
+        pass
     return {
         "api": "ok",
         "comfyui": comfy_api.is_comfy_running(),
+        "shadow_wirks": shadow_wirks,
     }
 
 
@@ -911,6 +919,97 @@ VIDEO_PRESETS = [
         "label": "Glasses On",
         "prompt": "slowly putting on designer sunglasses, cool confident expression, urban background, fashion forward, smooth motion, influencer aesthetic",
     },
+    # ─── Intimate & Bedroom ───
+    {
+        "id": "pillow_hug",
+        "label": "Pillow Hug",
+        "prompt": "hugging pillow on bed, rolling over slowly, sleepy cozy expression, oversized shirt, morning sunlight, soft sheets, intimate bedroom atmosphere",
+    },
+    {
+        "id": "bedsheet_peek",
+        "label": "Bedsheet Peek",
+        "prompt": "peeking out from under white bedsheets, playful smile, pulling sheet down slowly, messy bed hair, soft window light, lazy morning vibes",
+    },
+    {
+        "id": "lingerie_walk",
+        "label": "Lingerie Walk",
+        "prompt": "walking slowly toward camera in lingerie, confident stride, hand on hip, soft warm studio lighting, elegant backdrop, empowered feminine energy",
+    },
+    {
+        "id": "getting_ready",
+        "label": "Getting Ready",
+        "prompt": "applying lipstick in vanity mirror, adjusting hair, putting on earrings, getting dressed, bathroom or bedroom, behind-the-scenes morning routine",
+    },
+    # ─── Bath & Water ───
+    {
+        "id": "bubble_bath",
+        "label": "Bubble Bath",
+        "prompt": "relaxing in bubble bath, playing with foam, lifting leg out of water slowly, candles flickering, steam rising, warm bathroom lighting, spa vibes",
+    },
+    {
+        "id": "shower_steam",
+        "label": "Shower Steam",
+        "prompt": "standing in steamy shower, water running over shoulders, tilting head back, foggy glass, warm tones, sensual silhouette, artistic nude aesthetic",
+    },
+    # ─── Fashion & Transition ───
+    {
+        "id": "outfit_change",
+        "label": "Outfit Change",
+        "prompt": "quick outfit transition, snapping fingers to switch looks, multiple outfit reveals, dynamic camera angle changes, trending transition style, fashion showcase",
+    },
+    {
+        "id": "catwalk",
+        "label": "Catwalk Strut",
+        "prompt": "walking down runway toward camera, fierce confident expression, high fashion outfit, dramatic lighting, shoulders back, model walk, editorial vibe",
+    },
+    {
+        "id": "jacket_drop",
+        "label": "Jacket Drop",
+        "prompt": "slowly sliding jacket off shoulders, revealing outfit underneath, looking back at camera, moody lighting, confident body language, fashion reveal",
+    },
+    # ─── Mood & Aesthetic ───
+    {
+        "id": "golden_hour",
+        "label": "Golden Hour",
+        "prompt": "posing during golden hour sunset, warm light on face and body, hair glowing, gentle breeze, field or rooftop, dreamy lens flare, ethereal beauty",
+    },
+    {
+        "id": "neon_glow",
+        "label": "Neon Glow",
+        "prompt": "standing under neon lights, pink and blue glow on skin, urban night scene, looking at camera, moody expression, cyberpunk aesthetic, cinematic colors",
+    },
+    {
+        "id": "polaroid_snap",
+        "label": "Polaroid Snap",
+        "prompt": "holding up polaroid camera, taking selfie, flash going off, candid smile, retro aesthetic, film grain, vintage room, nostalgic casual vibes",
+    },
+    # ─── Playful & Engaging ───
+    {
+        "id": "pillow_fight",
+        "label": "Pillow Fight",
+        "prompt": "swinging pillow playfully, feathers flying in slow motion, laughing, pajamas, bedroom setting, bright warm light, fun youthful energy",
+    },
+    {
+        "id": "ice_cream_lick",
+        "label": "Ice Cream Lick",
+        "prompt": "licking ice cream cone slowly, playful eye contact with camera, summer sunshine, colorful sprinkles, sweet flirty expression, warm outdoor setting",
+    },
+    {
+        "id": "flower_smell",
+        "label": "Flower Smell",
+        "prompt": "bringing bouquet of flowers to face, inhaling scent with closed eyes, gentle smile, soft natural lighting, garden or meadow, romantic aesthetic",
+    },
+    # ─── Behind the Scenes ───
+    {
+        "id": "bts_photoshoot",
+        "label": "BTS Photoshoot",
+        "prompt": "behind the scenes of photoshoot, adjusting pose between clicks, laughing with crew, studio setup visible, candid natural moments, documentary style",
+    },
+    {
+        "id": "phone_scroll",
+        "label": "Phone Scroll",
+        "prompt": "lying on stomach scrolling phone, kicking feet in air, bed or couch, casual loungewear, natural candid movement, relatable content creator moment",
+    },
 ]
 
 PERSONA_PRESETS = [
@@ -1156,6 +1255,7 @@ _INTENSITY_INSTRUCTIONS = {
 class RefineRequest(BaseModel):
     prompt: str
     intensity: str = "medium"  # "light", "medium", "heavy"
+    persona_description: Optional[str] = None  # persona prompt_base for context-aware refining
 
 
 @app.post("/refine-prompt")
@@ -1203,12 +1303,16 @@ def refine_prompt(body: RefineRequest):
 
 @app.post("/refine-video-prompt")
 def refine_video_prompt(body: RefineRequest):
-    """Enhance a video motion prompt using Celeste via Ollama — same as refine_prompt but video-tuned."""
+    """Enhance a video motion prompt using Celeste via Ollama — video-tuned and persona-aware."""
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
     intensity_note = _INTENSITY_INSTRUCTIONS.get(body.intensity, _INTENSITY_INSTRUCTIONS["medium"])
+
+    persona_note = ""
+    if body.persona_description:
+        persona_note = f"\n\nThe model/persona is: {body.persona_description}. Tailor the motion and scene to suit this persona's appearance and style."
 
     try:
         resp = requests.post(
@@ -1219,11 +1323,14 @@ def refine_video_prompt(body: RefineRequest):
                 "options": {"temperature": 0.8, "num_predict": 300},
                 "messages": [
                     {"role": "system", "content": (
-                        "You are a video motion prompt expert. Rewrite motion prompts to be more detailed and cinematic "
-                        "for AI video generation. Focus on describing motion, camera movement, lighting changes, and temporal flow. "
+                        "You are a video motion prompt expert for AI-generated content creator videos. "
+                        "Rewrite motion prompts to be more detailed and cinematic for AI video generation. "
+                        "Focus on describing motion, camera movement, lighting changes, temporal flow, "
+                        "and subtle body language that makes the video feel alive and engaging. "
+                        "Think like a cinematographer directing a short social-media clip. "
                         "Return ONLY the rewritten prompt, no explanations."
                     )},
-                    {"role": "user", "content": f"{intensity_note}\n\nRewrite this video prompt:\n{prompt}"},
+                    {"role": "user", "content": f"{intensity_note}{persona_note}\n\nRewrite this video prompt:\n{prompt}"},
                 ],
             },
             timeout=60,
@@ -2076,11 +2183,13 @@ def generate_video(
     if not comfy_api.is_comfy_running():
         raise HTTPException(status_code=503, detail="ComfyUI is not running. Start it first.")
 
-    persona = db.query(Persona).filter(Persona.id == persona_id).first()
-    if not persona:
-        raise HTTPException(status_code=404, detail="Persona not found")
-
-    full_prompt = f"{persona.prompt_base}, {body.prompt_extra}"
+    if body.full_prompt:
+        full_prompt = body.full_prompt
+    else:
+        persona = db.query(Persona).filter(Persona.id == persona_id).first()
+        if not persona:
+            raise HTTPException(status_code=404, detail="Persona not found")
+        full_prompt = f"{persona.prompt_base}, {body.prompt_extra}"
 
     result = comfy_api.queue_video(
         positive_prompt=full_prompt,
@@ -2124,6 +2233,17 @@ def get_video_status(content_id: int, db: Session = Depends(get_db)):
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
+    # If already completed in DB, return the saved output directly
+    if content.status == "completed" and content.file_path:
+        return {
+            "status": "completed",
+            "outputs": [{
+                "filename": content.file_path,
+                "subfolder": "Empire",
+                "type": "output",
+            }],
+        }
+
     if not content.comfy_job_id:
         return {"status": content.status, "outputs": []}
 
@@ -2133,6 +2253,9 @@ def get_video_status(content_id: int, db: Session = Depends(get_db)):
         first_output = result["outputs"][0]
         content.file_path = first_output["filename"]
         content.status = "completed"
+        db.commit()
+    elif result["status"] == "error":
+        content.status = "failed"
         db.commit()
 
     return result

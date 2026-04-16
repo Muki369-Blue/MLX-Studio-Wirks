@@ -6,16 +6,16 @@ set -euo pipefail
 echo "🚀 Starting AI Content Empire..."
 
 # Clear existing app ports if stale processes are hanging around
-lsof -ti:8000 | xargs kill -9 2>/dev/null || true
+lsof -ti:8800 | xargs kill -9 2>/dev/null || true
 lsof -ti:3000 | xargs kill -9 2>/dev/null || true
 
-echo "✓ Ports 8000 and 3000 cleared"
+echo "✓ Ports 8800 and 3000 cleared"
 
 # Start backend in a new Terminal window
 osascript <<'EOF'
 tell application "Terminal"
-    do script "cd /Users/bluewirks.max/dev/apps/Empire && source backend/.venv/bin/activate && uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload 2>&1"
-    set custom title of front window to "Empire - Backend :8000"
+    do script "cd /Users/bluewirks.max/dev/apps/Empire && backend/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 8800 --reload 2>&1"
+    set custom title of front window to "Empire - Backend :8800"
     activate
 end tell
 EOF

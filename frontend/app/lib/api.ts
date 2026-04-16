@@ -396,14 +396,76 @@ export async function checkVideoStatus(contentId: number): Promise<{ status: str
   return res.json();
 }
 
+// ─── Shadow-Wirk Remote Video ─────
+
+export const SHADOW_WIRKS_URL = "http://100.119.54.18:8800";
+
+export async function generateVideoRemote(
+  shadowUrl: string,
+  personaId: number,
+  fullPrompt: string,
+  promptExtra: string,
+  opts?: {
+    negative_prompt?: string;
+    width?: number;
+    height?: number;
+    length?: number;
+    steps?: number;
+    cfg?: number;
+    start_image?: string;
+  }
+): Promise<any> {
+  const res = await fetch(`${shadowUrl}/generate-video/${personaId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt_extra: promptExtra,
+      full_prompt: fullPrompt,
+      negative_prompt: opts?.negative_prompt || null,
+      width: opts?.width ?? 832,
+      height: opts?.height ?? 480,
+      length: opts?.length ?? 81,
+      steps: opts?.steps ?? 20,
+      cfg: opts?.cfg ?? 6.0,
+      start_image: opts?.start_image || null,
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: "Shadow-Wirk video generation failed" }));
+    throw new Error(err.detail || "Shadow-Wirk video generation failed");
+  }
+  return res.json();
+}
+
+export async function checkVideoStatusRemote(
+  shadowUrl: string,
+  contentId: number
+): Promise<{ status: string; outputs: any[] }> {
+  const res = await fetch(`${shadowUrl}/video-status/${contentId}`);
+  if (!res.ok) throw new Error("Failed to check Shadow-Wirk video status");
+  return res.json();
+}
+
+export async function uploadVideoStartImageRemote(
+  shadowUrl: string,
+  file: File
+): Promise<{ comfy_image_name: string }> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch(`${shadowUrl}/upload-video-start-image`, { method: "POST", body: form });
+  if (!res.ok) throw new Error("Failed to upload image to Shadow-Wirk");
+  return res.json();
+}
+
 export async function refineVideoPrompt(
   prompt: string,
-  intensity: "light" | "medium" | "heavy" = "medium"
+  intensity: "light" | "medium" | "heavy" = "medium",
+  personaDescription?: string
 ): Promise<{ original?: string; refined: string; model?: string }> {
   const res = await fetch(`${VIDEO_API}/refine-video-prompt`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, intensity }),
+    body: JSON.stringify({ prompt, intensity, persona_description: personaDescription || null }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: "Video refine failed" }));
@@ -632,7 +694,7 @@ export function previewVoiceUrl(personaId: number): string {
 
 // ─── Health ───────────────────────
 
-export async function fetchHealth(): Promise<{ api: string; comfyui: boolean }> {
+export async function fetchHealth(): Promise<{ api: string; comfyui: boolean; shadow_wirks: boolean }> {
   const res = await fetch(`${API}/health`);
   if (!res.ok) throw new Error("API unreachable");
   return res.json();

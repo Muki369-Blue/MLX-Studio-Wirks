@@ -50,7 +50,7 @@ export default function Dashboard() {
   const [personas, setPersonas] = useState<Persona[]>([]);
   const [links, setLinks] = useState<Link[]>([]);
   const [generations, setGenerations] = useState<Generation[]>([]);
-  const [health, setHealth] = useState<{ api: string; comfyui: boolean } | null>(null);
+  const [health, setHealth] = useState<{ api: string; comfyui: boolean; shadow_wirks: boolean } | null>(null);
   const [loading, setLoading] = useState(true);
   const [openFolder, setOpenFolder] = useState<number | null>(null);
   const [voicePresets, setVoicePresets] = useState<VoicePreset[]>([]);
@@ -149,6 +149,14 @@ export default function Dashboard() {
               }`}
             />
             <span className="text-zinc-400">ComfyUI</span>
+          </div>
+          <div className="flex items-center gap-1.5 text-xs">
+            <span
+              className={`w-2 h-2 rounded-full ${
+                health?.shadow_wirks ? "bg-emerald-400" : "bg-zinc-600"
+              }`}
+            />
+            <span className="text-zinc-400">Shadow-Wirk</span>
           </div>
           <button
             className="text-[10px] text-zinc-500 hover:text-orange-300 bg-zinc-800/50 hover:bg-orange-900/30 px-2 py-1 rounded transition-colors"
@@ -529,7 +537,7 @@ export default function Dashboard() {
 
         {/* ─── ShadowVid Tab ─── */}
         <div className={tab === "shadowvid" ? "" : "hidden"}>
-          <ShadowVidPanel personas={personas} />
+          <ShadowVidPanel personas={personas} shadowOnline={health?.shadow_wirks ?? false} />
         </div>
 
         {/* ─── Calendar Tab ─── */}

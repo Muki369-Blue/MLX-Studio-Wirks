@@ -2355,7 +2355,16 @@ def get_video_status(content_id: int, db: Session = Depends(get_db)):
         db.commit()
         result["progress"] = 0
     else:
-        result["progress"] = progress_pct
+        # Use WebSocket progress if available, otherwise estimate from elapsed time
+        if progress_pct > 0:
+            result["progress"] = progress_pct
+        elif result["status"] == "processing" and content.created_at:
+            elapsed = (datetime.now(timezone.utc) - content.created_at).total_seconds()
+            # Wan 2.1 typically takes 3-8 min; use 5 min as estimate
+            est = min(int(elapsed / 300 * 95), 95)
+            result["progress"] = max(est, 1)
+        else:
+            result["progress"] = progress_pct
 
     return result
 

@@ -842,6 +842,15 @@ def get_video_job_status(prompt_id: str) -> dict:
         history = resp.json()
 
         if prompt_id not in history:
+            # Check if it's actively running or still queued
+            try:
+                qr = requests.get(f"{COMFY_BASE}/queue", timeout=5)
+                qdata = qr.json()
+                running_ids = [item[1] for item in qdata.get("queue_running", [])]
+                if prompt_id in running_ids:
+                    return {"status": "processing", "outputs": []}
+            except Exception:
+                pass
             return {"status": "pending", "outputs": []}
 
         job = history[prompt_id]

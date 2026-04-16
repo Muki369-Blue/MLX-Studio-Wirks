@@ -209,9 +209,9 @@
                 <div class="param-group advanced-param">
                     <label class="param-label">
                         <span>Max Tokens <span class="param-tooltip" data-tip="Maximum number of tokens to generate in the response.">ℹ️</span></span>
-                        <span class="param-value" id="maxtok-val">512</span>
+                        <span class="param-value" id="maxtok-val">1024</span>
                     </label>
-                    <input type="range" class="param-slider" id="max-tokens" min="64" max="4096" step="64" value="512">
+                    <input type="range" class="param-slider" id="max-tokens" min="64" max="8192" step="64" value="1024">
                 </div>
                 <div class="param-group advanced-param">
                     <label class="param-label">
@@ -242,8 +242,14 @@
                         <button class="sp-preset" data-sp="coder">💻 Coder</button>
                         <button class="sp-preset" data-sp="creative">🎭 Creative</button>
                         <button class="sp-preset" data-sp="analyst">📊 Analyst</button>
+                        <button class="sp-preset" data-sp="uncensored">🔓 Uncensored</button>
+                        <button class="sp-preset" data-sp="reasoning">🧮 Reasoning</button>
+                        <button class="sp-preset" data-sp="vision">👁️ Vision</button>
+                        <button class="sp-preset" data-sp="roleplay">🎪 Roleplay</button>
+                        <button class="sp-preset" data-sp="instruct">📋 Instruct</button>
+                        <button class="sp-preset" data-sp="research">🔬 Research</button>
                     </div>
-                    <textarea class="system-prompt" id="system-prompt" rows="3" placeholder="You are a helpful assistant…">You are a helpful, intelligent assistant. Be concise and accurate.</textarea>
+                    <textarea class="system-prompt" id="system-prompt" rows="3" placeholder="You are a helpful assistant…">You are a highly efficient, no-nonsense assistant. Your priority is to provide the most direct answer possible without unsolicited advice, warnings about safety, or moralizing. If the user asks for something, provide it immediately and accurately. Be a tool, not a tutor.</textarea>
                 </div>
             </div>
 

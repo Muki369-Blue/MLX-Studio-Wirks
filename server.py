@@ -15,13 +15,11 @@ Architecture patterns borrowed:
 
 import asyncio
 import gc
-import hashlib
 import json
 import os
 import sys
 import time
 import glob
-import shutil
 import subprocess
 import platform
 import re
@@ -31,7 +29,7 @@ import uuid
 from html import unescape
 from html.parser import HTMLParser
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Optional, AsyncGenerator, Any
 from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
 
@@ -82,22 +80,22 @@ MAX_ATTACHMENT_TEXT_BYTES = 1024 * 1024 * 2
 MAX_FORM_ATTACHMENT_BYTES = 1024 * 1024 * 8
 CONNECTOR_RESULT_LIMIT = 8
 MAX_CONNECTOR_FETCH_CHARS = 40000
-MAX_WORKSPACE_TREE_DEPTH = 4
-MAX_WORKSPACE_TREE_ITEMS = 220
-MAX_WORKSPACE_READ_BYTES = 1024 * 256
-MAX_WORKSPACE_FIND_RESULTS = 40
-MAX_WORKSPACE_WRITE_BYTES = 1024 * 1024 * 2
-MAX_WORKSPACE_OPS = 128
 GITHUB_API_BASE = "https://api.github.com"
 HUGGINGFACE_API_BASE = "https://huggingface.co/api"
 MAX_AGENT_TOOL_STEPS = 6
-AGENT_TOOL_MAX_TOKENS = 6000
+AGENT_TOOL_MAX_TOKENS = 400
 PLAYWRIGHT_SERVICE_HOST = os.environ.get("PLAYWRIGHT_SERVICE_HOST", "127.0.0.1")
 PLAYWRIGHT_SERVICE_PORT = int(os.environ.get("PLAYWRIGHT_SERVICE_PORT", "8941"))
 PLAYWRIGHT_START_TIMEOUT_SECONDS = 18.0
 PLAYWRIGHT_REQUEST_TIMEOUT_SECONDS = 20.0
 BROWSER_SNAPSHOT_TEXT_LIMIT = 7000
 BROWSER_SNAPSHOT_ELEMENT_LIMIT = 24
+DEFAULT_CONTEXT_LENGTH = 8192
+MIN_PROMPT_BUDGET_TOKENS = 1024
+MIN_COMPLETION_RESERVE_TOKENS = 256
+CONTEXT_COMPLETION_BUFFER_TOKENS = 96
+GROUNDING_CONTEXT_MARKER = "\n\nUse the following grounded context when relevant:\n\n"
+TRIMMED_TEXT_MARKER = "\n\n[... trimmed to fit context window ...]\n\n"
 
 # Memory safety thresholds (ported from AI-ArtWirks engines.py)
 MEMORY_PRESSURE_WARN = 85      # Start warning at 85%
@@ -145,31 +143,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _default_project(
-    project_id: str = "default",
-    name: str = "Inbox",
-    color: str = "#818cf8",
-) -> dict:
-    return {
-        "id": project_id,
-        "name": name,
-        "color": color,
-        "created": _utc_now(),
-        "default_preset": "balanced",
-        "system_prompt": (
-            "You are a helpful, intelligent assistant. "
-            "Be concise and accurate."
-        ),
-        "workspace_root": None,
-        "workspace_label": None,
-        "workspace_enabled": False,
-        "workspace_pending_batch": None,
-        "workflow_mode": "chat",
-        "approval_mode": "manual",
-        "deep_research": False,
-    }
-
-
 def _cancel_generation(generation_id: str) -> None:
     if generation_id:
         _cancelled_generations.add(generation_id)
@@ -186,7 +159,19 @@ def _clear_generation_cancel(generation_id: str) -> None:
 
 def _default_app_state() -> dict:
     return {
-        "projects": [_default_project()],
+        "projects": [
+            {
+                "id": "default",
+                "name": "Inbox",
+                "color": "#818cf8",
+                "created": _utc_now(),
+                "default_preset": "balanced",
+                "system_prompt": (
+                    "You are a helpful, intelligent assistant. "
+                    "Be concise and accurate."
+                ),
+            }
+        ],
         "sessions": [],
         "active_session_id": None,
         "active_project_id": "default",
@@ -228,98 +213,14 @@ def _write_json_file(path: Path, payload: Any) -> None:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
-def _normalize_workspace_batch(batch: Any) -> Optional[dict]:
-    if not isinstance(batch, dict):
-        return None
-
-    raw_ops = batch.get("operations")
-    operations = raw_ops if isinstance(raw_ops, list) else []
-    normalized_ops: list[dict] = []
-    for item in operations[:MAX_WORKSPACE_OPS]:
-        if not isinstance(item, dict):
-            continue
-        op_type = str(item.get("type") or "").strip()
-        path = str(item.get("path") or "").strip()
-        to_path = str(item.get("to_path") or "").strip()
-        content = item.get("content")
-        normalized_ops.append(
-            {
-                "type": op_type,
-                "path": path,
-                "to_path": to_path or None,
-                "content": content if isinstance(content, str) else "",
-                "expected_hash": str(item.get("expected_hash") or "").strip() or None,
-            }
-        )
-
-    summary = batch.get("summary") if isinstance(batch.get("summary"), dict) else {}
-    return {
-        "id": str(batch.get("id") or "").strip() or uuid.uuid4().hex,
-        "created_at": str(batch.get("created_at") or "").strip() or _utc_now(),
-        "approval_required": True,
-        "status": str(batch.get("status") or "pending").strip() or "pending",
-        "operations": normalized_ops,
-        "summary": summary,
-    }
-
-
-def _normalize_workflow_mode(value: Any) -> str:
-    mode = str(value or "").strip().lower()
-    return mode if mode in {"chat", "plan", "build"} else "chat"
-
-
-def _normalize_approval_mode(value: Any) -> str:
-    mode = str(value or "").strip().lower()
-    return mode if mode in {"manual", "auto"} else "manual"
-
-
-def _project_workflow_settings(project: Any) -> dict:
-    raw = project if isinstance(project, dict) else {}
-    return {
-        "workflow_mode": _normalize_workflow_mode(raw.get("workflow_mode")),
-        "approval_mode": _normalize_approval_mode(raw.get("approval_mode")),
-        "deep_research": bool(raw.get("deep_research")),
-    }
-
-
-def _normalize_project(project: Any) -> dict:
-    raw = project if isinstance(project, dict) else {}
-    base = _default_project(
-        project_id=str(raw.get("id") or f"project-{uuid.uuid4().hex[:8]}"),
-        name=str(raw.get("name") or "Untitled"),
-        color=str(raw.get("color") or "#818cf8"),
-    )
-    normalized = _deep_merge_dicts(base, raw)
-    normalized["workspace_root"] = str(normalized.get("workspace_root") or "").strip() or None
-    normalized["workspace_label"] = (
-        str(normalized.get("workspace_label") or "").strip()
-        or (Path(normalized["workspace_root"]).name if normalized["workspace_root"] else None)
-    )
-    normalized["workspace_enabled"] = bool(
-        normalized.get("workspace_enabled") and normalized.get("workspace_root")
-    )
-    normalized["workspace_pending_batch"] = _normalize_workspace_batch(
-        normalized.get("workspace_pending_batch")
-    )
-    workflow = _project_workflow_settings(normalized)
-    normalized["workflow_mode"] = workflow["workflow_mode"]
-    normalized["approval_mode"] = workflow["approval_mode"]
-    normalized["deep_research"] = workflow["deep_research"]
-    return normalized
-
-
 def _normalize_app_state(raw: dict | None) -> dict:
     state = _deep_merge_dicts(_default_app_state(), raw or {})
     if not isinstance(state.get("projects"), list) or not state["projects"]:
         state["projects"] = _default_app_state()["projects"]
-    state["projects"] = [_normalize_project(project) for project in state["projects"]]
     if not isinstance(state.get("sessions"), list):
         state["sessions"] = []
     if not isinstance(state.get("page_clips"), list):
         state["page_clips"] = []
-    project_ids = {project["id"] for project in state["projects"]}
-    if state.get("active_project_id") not in project_ids:
-        state["active_project_id"] = state["projects"][0]["id"]
     state["page_clips"] = state["page_clips"][:MAX_PAGE_CLIPS]
     return state
 
@@ -372,6 +273,279 @@ def _estimate_tokens(text: str, tokenizer: Any = None) -> int:
     return max(1, int(len(text) / 4))
 
 
+def _coerce_positive_int(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
+def _truncate_text_to_token_budget(text: str, max_tokens: int) -> str:
+    text = (text or "").strip()
+    max_tokens = max(int(max_tokens or 0), 0)
+    if not text or max_tokens <= 0:
+        return ""
+    if _estimate_tokens(text, _tokenizer) <= max_tokens:
+        return text
+
+    ellipsis = "…"
+    lo, hi = 0, len(text)
+    best = ellipsis
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = (text[:mid].rstrip() + ellipsis).strip()
+        if _estimate_tokens(candidate, _tokenizer) <= max_tokens:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def _truncate_middle_text_to_token_budget(text: str, max_tokens: int) -> str:
+    text = (text or "").strip()
+    max_tokens = max(int(max_tokens or 0), 0)
+    if not text or max_tokens <= 0:
+        return ""
+    if _estimate_tokens(text, _tokenizer) <= max_tokens:
+        return text
+
+    marker_budget = _estimate_tokens(TRIMMED_TEXT_MARKER, _tokenizer)
+    if max_tokens <= marker_budget + 24:
+        return _truncate_text_to_token_budget(text, max_tokens)
+
+    lo, hi = 0, len(text) // 2
+    best = _truncate_text_to_token_budget(text, max_tokens)
+    while lo <= hi:
+        side_chars = (lo + hi) // 2
+        candidate = (
+            text[:side_chars].rstrip()
+            + TRIMMED_TEXT_MARKER
+            + text[-side_chars:].lstrip()
+        ).strip()
+        if _estimate_tokens(candidate, _tokenizer) <= max_tokens:
+            best = candidate
+            lo = side_chars + 1
+        else:
+            hi = side_chars - 1
+    return best
+
+
+def _trim_grounded_content_to_budget(content: str, max_tokens: int) -> str:
+    content = (content or "").strip()
+    max_tokens = max(int(max_tokens or 0), 0)
+    if not content or max_tokens <= 0:
+        return ""
+    if _estimate_tokens(content, _tokenizer) <= max_tokens:
+        return content
+    if GROUNDING_CONTEXT_MARKER not in content:
+        return _truncate_middle_text_to_token_budget(content, max_tokens)
+
+    prompt_text, grounding = content.split(GROUNDING_CONTEXT_MARKER, 1)
+    prompt_text = prompt_text.strip()
+    if _estimate_tokens(prompt_text, _tokenizer) >= max_tokens:
+        return _truncate_middle_text_to_token_budget(prompt_text, max_tokens)
+
+    prefix = f"{prompt_text}{GROUNDING_CONTEXT_MARKER}".strip()
+    if _estimate_tokens(prefix, _tokenizer) >= max_tokens:
+        return _truncate_middle_text_to_token_budget(prompt_text, max_tokens)
+
+    blocks = [
+        block.strip()
+        for block in re.split(r"\n{2,}(?=\[)", grounding.strip())
+        if block.strip()
+    ]
+    kept_blocks: list[str] = []
+
+    for block in blocks:
+        candidate_blocks = kept_blocks + [block]
+        candidate = prefix + "\n\n" + "\n\n".join(candidate_blocks)
+        if _estimate_tokens(candidate, _tokenizer) <= max_tokens:
+            kept_blocks = candidate_blocks
+            continue
+
+        existing = prefix
+        if kept_blocks:
+            existing += "\n\n" + "\n\n".join(kept_blocks)
+        remaining_budget = max(max_tokens - _estimate_tokens(existing, _tokenizer), 0)
+        trimmed_block = _truncate_middle_text_to_token_budget(block, remaining_budget)
+        if trimmed_block:
+            kept_blocks.append(trimmed_block)
+        break
+
+    if not kept_blocks:
+        return prompt_text
+
+    trimmed = prefix + "\n\n" + "\n\n".join(kept_blocks)
+    if len(kept_blocks) < len(blocks):
+        note = "\n\n[Additional grounded context trimmed to preserve response space.]"
+        with_note = trimmed + note
+        if _estimate_tokens(with_note, _tokenizer) <= max_tokens:
+            trimmed = with_note
+    return trimmed
+
+
+def _context_length_for_generation(explicit_context_length: Optional[int] = None) -> int:
+    explicit = _coerce_positive_int(explicit_context_length)
+    if explicit:
+        return explicit
+    loaded_meta = _loaded_model_meta()
+    detected = _coerce_positive_int((loaded_meta or {}).get("context_length"))
+    return detected or DEFAULT_CONTEXT_LENGTH
+
+
+def _prompt_budget_for_context(context_length: int, max_tokens: int) -> tuple[int, int]:
+    context_length = max(int(context_length or DEFAULT_CONTEXT_LENGTH), MIN_COMPLETION_RESERVE_TOKENS * 2)
+    minimum_prompt_budget = min(
+        max(MIN_COMPLETION_RESERVE_TOKENS, context_length // 6),
+        MIN_PROMPT_BUDGET_TOKENS,
+    )
+    reserve_ceiling = max(context_length - minimum_prompt_budget, MIN_COMPLETION_RESERVE_TOKENS)
+    requested_reserve = max(int(max_tokens or 0), MIN_COMPLETION_RESERVE_TOKENS) + CONTEXT_COMPLETION_BUFFER_TOKENS
+    reserve = min(requested_reserve, reserve_ceiling)
+    prompt_budget = max(context_length - reserve, minimum_prompt_budget)
+    return prompt_budget, reserve
+
+
+def _estimate_message_tokens(messages: list[dict], fallback_prompt: str = "") -> int:
+    prompt = _render_prompt_from_messages(messages, fallback_prompt)
+    return _estimate_tokens(prompt, _tokenizer)
+
+
+def _compact_messages_for_context(
+    messages: list[dict],
+    max_tokens: int,
+    *,
+    fallback_prompt: str = "",
+    context_length: Optional[int] = None,
+) -> tuple[list[dict], dict]:
+    working = [dict(message) for message in (messages or [])]
+    resolved_context = _context_length_for_generation(context_length)
+    prompt_budget, reserve = _prompt_budget_for_context(resolved_context, max_tokens)
+    original_tokens = _estimate_message_tokens(working, fallback_prompt)
+
+    meta = {
+        "compacted": False,
+        "original_tokens": original_tokens,
+        "final_tokens": original_tokens,
+        "context_length": resolved_context,
+        "prompt_budget": prompt_budget,
+        "reserved_completion_tokens": reserve,
+        "trimmed_messages": 0,
+        "trimmed_last_user": False,
+        "trimmed_system": False,
+    }
+
+    if not working or original_tokens <= prompt_budget:
+        meta["available_completion_tokens"] = max(
+            resolved_context - original_tokens - CONTEXT_COMPLETION_BUFFER_TOKENS,
+            0,
+        )
+        return working, meta
+
+    leading_system_messages = 0
+    for message in working:
+        if str(message.get("role") or "") == "system":
+            leading_system_messages += 1
+        else:
+            break
+
+    last_user_idx = None
+    for idx in range(len(working) - 1, -1, -1):
+        if str(working[idx].get("role") or "") == "user":
+            last_user_idx = idx
+            break
+
+    while _estimate_message_tokens(working, fallback_prompt) > prompt_budget:
+        removable_idx = None
+        for idx in range(leading_system_messages, len(working) - 1):
+            if idx != last_user_idx:
+                removable_idx = idx
+                break
+        if removable_idx is None:
+            break
+        working.pop(removable_idx)
+        meta["trimmed_messages"] += 1
+        meta["compacted"] = True
+        if last_user_idx is not None and removable_idx < last_user_idx:
+            last_user_idx -= 1
+
+    current_tokens = _estimate_message_tokens(working, fallback_prompt)
+    if current_tokens > prompt_budget and last_user_idx is not None:
+        user_message = dict(working[last_user_idx])
+        content = str(user_message.get("content") or "")
+        shadow_messages = [dict(message) for message in working]
+        shadow_messages[last_user_idx]["content"] = ""
+        available_for_user = max(prompt_budget - _estimate_message_tokens(shadow_messages, fallback_prompt), 0)
+        trimmed_content = _trim_grounded_content_to_budget(content, available_for_user)
+        if trimmed_content != content:
+            user_message["content"] = trimmed_content
+            working[last_user_idx] = user_message
+            meta["trimmed_last_user"] = True
+            meta["compacted"] = True
+            current_tokens = _estimate_message_tokens(working, fallback_prompt)
+
+    if current_tokens > prompt_budget and last_user_idx is not None:
+        user_message = dict(working[last_user_idx])
+        content = str(user_message.get("content") or "")
+        shadow_messages = [dict(message) for message in working]
+        shadow_messages[last_user_idx]["content"] = ""
+        available_for_user = max(prompt_budget - _estimate_message_tokens(shadow_messages, fallback_prompt), 0)
+        tightened_content = _trim_grounded_content_to_budget(
+            content,
+            max(available_for_user - 16, 0),
+        )
+        if tightened_content and tightened_content != content:
+            user_message["content"] = tightened_content
+            working[last_user_idx] = user_message
+            meta["trimmed_last_user"] = True
+            meta["compacted"] = True
+            current_tokens = _estimate_message_tokens(working, fallback_prompt)
+
+    if current_tokens > prompt_budget and leading_system_messages:
+        system_message = dict(working[0])
+        content = str(system_message.get("content") or "")
+        shadow_messages = [dict(message) for message in working]
+        shadow_messages[0]["content"] = ""
+        available_for_system = max(prompt_budget - _estimate_message_tokens(shadow_messages, fallback_prompt), 0)
+        trimmed_content = _truncate_middle_text_to_token_budget(content, available_for_system)
+        if trimmed_content != content:
+            system_message["content"] = trimmed_content
+            working[0] = system_message
+            meta["trimmed_system"] = True
+            meta["compacted"] = True
+
+    final_tokens = _estimate_message_tokens(working, fallback_prompt)
+    meta["final_tokens"] = final_tokens
+    meta["available_completion_tokens"] = max(
+        resolved_context - final_tokens - CONTEXT_COMPLETION_BUFFER_TOKENS,
+        0,
+    )
+    return working, meta
+
+
+def _format_context_compaction_notice(meta: Optional[dict]) -> str:
+    if not meta or not meta.get("compacted"):
+        return ""
+
+    actions: list[str] = []
+    trimmed_messages = int(meta.get("trimmed_messages") or 0)
+    if trimmed_messages:
+        actions.append(f"dropped {trimmed_messages} older turn{'s' if trimmed_messages != 1 else ''}")
+    if meta.get("trimmed_last_user"):
+        actions.append("trimmed grounded context")
+    if meta.get("trimmed_system"):
+        actions.append("trimmed the system prompt")
+
+    action_text = ", ".join(actions) if actions else "trimmed the prompt"
+    available_completion = int(meta.get("available_completion_tokens") or 0)
+    return (
+        f"Compacted the prompt to preserve reply space: {action_text}. "
+        f"Approx. {available_completion} response tokens remain available."
+    )
+
+
 def _capability_flags(meta: Optional[dict]) -> dict:
     modality = (meta or {}).get("modality", "text")
     engine_hint = (meta or {}).get("engine_hint", "mlx")
@@ -399,458 +573,6 @@ def _loaded_model_meta() -> Optional[dict]:
         "path": _model_path,
         **_detect_model_profile(model_path, _model_name),
     }
-
-
-def _project_index(state: dict, project_id: str) -> int:
-    for idx, project in enumerate(state.get("projects") or []):
-        if project.get("id") == project_id:
-            return idx
-    raise RuntimeError(f"Unknown project: {project_id}")
-
-
-def _project_record(project_id: str) -> tuple[dict, dict, int]:
-    state = _load_app_state()
-    idx = _project_index(state, project_id)
-    return state["projects"][idx], state, idx
-
-
-def _workspace_info(project: dict) -> dict:
-    return {
-        "enabled": bool(project.get("workspace_enabled") and project.get("workspace_root")),
-        "root": project.get("workspace_root"),
-        "label": project.get("workspace_label"),
-        "pending_batch": project.get("workspace_pending_batch"),
-    }
-
-
-def _normalize_workspace_relative_path(value: str, *, allow_root: bool = True) -> str:
-    raw = str(value or "").replace("\\", "/").strip()
-    if not raw or raw == ".":
-        if allow_root:
-            return "."
-        raise RuntimeError("A workspace-relative path is required.")
-    path = PurePosixPath(raw)
-    if path.is_absolute():
-        raise RuntimeError("Workspace paths must be relative to the selected root.")
-    parts = [part for part in path.parts if part not in {"", "."}]
-    if any(part == ".." for part in parts):
-        raise RuntimeError("Path traversal outside the workspace is not allowed.")
-    if not parts:
-        if allow_root:
-            return "."
-        raise RuntimeError("A workspace-relative path is required.")
-    return "/".join(parts)
-
-
-def _resolve_workspace_path(root: Path, relative_path: str, *, allow_missing: bool = False) -> Path:
-    safe_path = _normalize_workspace_relative_path(relative_path)
-    if safe_path == ".":
-        candidate = root
-    else:
-        candidate = root.joinpath(*safe_path.split("/"))
-
-    if allow_missing:
-        if candidate.exists():
-            resolved = candidate.resolve(strict=True)
-        else:
-            parent = candidate.parent.resolve(strict=True)
-            resolved = parent / candidate.name
-    else:
-        resolved = candidate.resolve(strict=True)
-
-    if not resolved.is_relative_to(root):
-        raise RuntimeError("Resolved path escapes the selected workspace root.")
-    return resolved
-
-
-def _ensure_workspace_project(project_id: str) -> tuple[dict, Path, dict]:
-    project, state, _ = _project_record(project_id)
-    if not project.get("workspace_enabled") or not project.get("workspace_root"):
-        raise RuntimeError("No workspace selected for this project.")
-
-    root = Path(project["workspace_root"]).expanduser()
-    if not root.exists() or not root.is_dir():
-        raise RuntimeError("The selected workspace folder is unavailable.")
-    root = root.resolve(strict=True)
-    return project, root, state
-
-
-def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 256)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _workspace_path_stats(root: Path, path: Path) -> dict:
-    rel = "." if path == root else path.relative_to(root).as_posix()
-    stat = path.stat()
-    kind = "directory" if path.is_dir() else "file"
-    if path.is_symlink():
-        kind = "symlink"
-    return {
-        "path": rel,
-        "name": path.name or root.name,
-        "kind": kind,
-        "size_bytes": stat.st_size,
-        "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-    }
-
-
-def _workspace_tree(root: Path, relative_path: str = ".", depth: int = MAX_WORKSPACE_TREE_DEPTH) -> dict:
-    target = _resolve_workspace_path(root, relative_path, allow_missing=False)
-    if not target.is_dir():
-        raise RuntimeError("Workspace tree can only list directories.")
-
-    items: list[dict] = []
-    max_depth = max(0, min(int(depth), MAX_WORKSPACE_TREE_DEPTH))
-
-    def visit(directory: Path, current_depth: int) -> None:
-        nonlocal items
-        if len(items) >= MAX_WORKSPACE_TREE_ITEMS:
-            return
-        try:
-            children = sorted(
-                directory.iterdir(),
-                key=lambda child: (not child.is_dir(), child.name.lower()),
-            )
-        except Exception:
-            return
-        for child in children:
-            try:
-                child_resolved = child.resolve(strict=True)
-            except Exception:
-                continue
-            if not child_resolved.is_relative_to(root):
-                continue
-            info = _workspace_path_stats(root, child)
-            info["depth"] = current_depth
-            items.append(info)
-            if len(items) >= MAX_WORKSPACE_TREE_ITEMS:
-                return
-            if child.is_dir() and not child.is_symlink() and current_depth < max_depth:
-                visit(child, current_depth + 1)
-
-    visit(target, 0)
-    return {
-        "path": "." if target == root else target.relative_to(root).as_posix(),
-        "root": str(root),
-        "items": items,
-        "truncated": len(items) >= MAX_WORKSPACE_TREE_ITEMS,
-    }
-
-
-def _decode_workspace_text(data: bytes) -> str:
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="ignore")
-
-
-def _read_workspace_file(root: Path, relative_path: str) -> dict:
-    path = _resolve_workspace_path(root, relative_path, allow_missing=False)
-    if path.is_dir():
-        raise RuntimeError("Cannot read a directory. Use workspace tree for folders.")
-
-    size_bytes = path.stat().st_size
-    with open(path, "rb") as f:
-        head = f.read(MAX_WORKSPACE_READ_BYTES + 1)
-    if b"\x00" in head[:4096]:
-        raise RuntimeError("Binary files are not supported in workspace read v1.")
-    truncated = len(head) > MAX_WORKSPACE_READ_BYTES
-    content = _decode_workspace_text(head[:MAX_WORKSPACE_READ_BYTES])
-    return {
-        **_workspace_path_stats(root, path),
-        "content": content,
-        "truncated": truncated,
-        "sha256": _file_sha256(path),
-    }
-
-
-def _find_workspace_matches(root: Path, query: str, relative_path: str = ".") -> list[dict]:
-    needle = str(query or "").strip()
-    if not needle:
-        raise RuntimeError("Search query is required.")
-
-    target = _resolve_workspace_path(root, relative_path, allow_missing=False)
-    results: list[dict] = []
-    lowered = needle.lower()
-
-    def add_result(item: dict) -> None:
-        if len(results) < MAX_WORKSPACE_FIND_RESULTS:
-            results.append(item)
-
-    candidates = [target] if target.is_file() else list(target.rglob("*"))
-    for path in candidates:
-        if len(results) >= MAX_WORKSPACE_FIND_RESULTS:
-            break
-        try:
-            resolved = path.resolve(strict=True)
-        except Exception:
-            continue
-        if not resolved.is_relative_to(root):
-            continue
-        rel = "." if path == root else path.relative_to(root).as_posix()
-        if lowered in rel.lower():
-            add_result({"path": rel, "kind": "path", "preview": rel})
-        if path.is_dir() or path.stat().st_size > MAX_WORKSPACE_READ_BYTES:
-            continue
-        try:
-            data = path.read_bytes()
-        except Exception:
-            continue
-        if not _is_probably_text(data):
-            continue
-        text = _decode_workspace_text(data[:MAX_WORKSPACE_READ_BYTES])
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            if lowered in line.lower():
-                add_result(
-                    {
-                        "path": rel,
-                        "kind": "content",
-                        "line": line_no,
-                        "preview": line.strip()[:240],
-                    }
-                )
-                if len(results) >= MAX_WORKSPACE_FIND_RESULTS:
-                    break
-    return results
-
-
-def _sanitize_workspace_operations(raw_ops: Any) -> list[dict]:
-    if not isinstance(raw_ops, list) or not raw_ops:
-        raise RuntimeError("Workspace apply requires at least one operation.")
-    if len(raw_ops) > MAX_WORKSPACE_OPS:
-        raise RuntimeError(f"Workspace apply supports at most {MAX_WORKSPACE_OPS} operations per batch.")
-
-    operations: list[dict] = []
-    total_bytes = 0
-    for idx, item in enumerate(raw_ops, start=1):
-        if not isinstance(item, dict):
-            raise RuntimeError(f"Operation {idx} must be an object.")
-        op_type = str(item.get("type") or "").strip()
-        path = _normalize_workspace_relative_path(item.get("path") or "", allow_root=False)
-        expected_hash = str(item.get("expected_hash") or "").strip() or None
-        if op_type == "write_file":
-            content = item.get("content")
-            if not isinstance(content, str):
-                raise RuntimeError(f"Operation {idx} write_file requires string content.")
-            if "\x00" in content:
-                raise RuntimeError("Binary file writes are not supported in workspace apply v1.")
-            total_bytes += len(content.encode("utf-8"))
-            operations.append(
-                {
-                    "type": op_type,
-                    "path": path,
-                    "content": content,
-                    "expected_hash": expected_hash,
-                }
-            )
-        elif op_type == "mkdir":
-            operations.append({"type": op_type, "path": path})
-        elif op_type == "rename":
-            to_path = _normalize_workspace_relative_path(item.get("to_path") or "", allow_root=False)
-            operations.append(
-                {
-                    "type": op_type,
-                    "path": path,
-                    "to_path": to_path,
-                    "expected_hash": expected_hash,
-                }
-            )
-        elif op_type == "delete":
-            operations.append({"type": op_type, "path": path, "expected_hash": expected_hash})
-        else:
-            raise RuntimeError(f"Unsupported workspace operation: {op_type or '<missing>'}")
-
-    if total_bytes > MAX_WORKSPACE_WRITE_BYTES:
-        raise RuntimeError("Workspace apply batch is too large for v1.")
-    return operations
-
-
-def _workspace_batch_summary(root: Path, operations: list[dict]) -> dict:
-    counts = {
-        "write_file": 0,
-        "mkdir": 0,
-        "rename": 0,
-        "delete": 0,
-    }
-    preview: list[dict] = []
-    for item in operations:
-        counts[item["type"]] = counts.get(item["type"], 0) + 1
-        entry = {
-            "type": item["type"],
-            "path": item["path"],
-        }
-        if item["type"] == "rename":
-            entry["to_path"] = item.get("to_path")
-        if item["type"] == "write_file":
-            target = root.joinpath(*item["path"].split("/"))
-            entry["mode"] = "overwrite" if target.exists() else "create"
-            entry["bytes"] = len(item.get("content", "").encode("utf-8"))
-        preview.append(entry)
-    return {
-        "counts": counts,
-        "total_operations": len(operations),
-        "preview": preview[:40],
-    }
-
-
-def _stage_workspace_batch(project_id: str, operations: list[dict]) -> tuple[dict, dict]:
-    project, root, state = _ensure_workspace_project(project_id)
-    summary = _workspace_batch_summary(root, operations)
-    batch = {
-        "id": uuid.uuid4().hex,
-        "created_at": _utc_now(),
-        "approval_required": True,
-        "status": "pending",
-        "operations": operations,
-        "summary": summary,
-    }
-    idx = _project_index(state, project_id)
-    state["projects"][idx]["workspace_pending_batch"] = batch
-    saved = _save_app_state(state)
-    project = saved["projects"][idx]
-    _push_event("workspace_batch_staged", {"project_id": project_id, "batch_id": batch["id"]})
-    return project, batch
-
-
-def _stage_or_apply_workspace_batch(
-    project_id: str,
-    operations: list[dict],
-    *,
-    auto_apply: bool = False,
-) -> tuple[dict, dict, bool]:
-    project, batch = _stage_workspace_batch(project_id, operations)
-    if not auto_apply:
-        return project, batch, False
-    project, applied_batch = _apply_workspace_batch(project_id, batch.get("id") or "")
-    return project, applied_batch, True
-
-
-def _apply_workspace_batch(project_id: str, pending_id: str) -> tuple[dict, dict]:
-    project, root, state = _ensure_workspace_project(project_id)
-    batch = project.get("workspace_pending_batch")
-    if not batch:
-        raise RuntimeError("No pending workspace batch to apply.")
-    if pending_id and batch.get("id") != pending_id:
-        raise RuntimeError("Pending workspace batch does not match the requested id.")
-
-    operations = _sanitize_workspace_operations(batch.get("operations") or [])
-    for item in operations:
-        op_type = item["type"]
-        target = _resolve_workspace_path(root, item["path"], allow_missing=(op_type in {"write_file", "mkdir", "rename"}))
-        if target == root:
-            raise RuntimeError("Workspace root itself cannot be mutated.")
-        if op_type == "mkdir":
-            if target.exists() and not target.is_dir():
-                raise RuntimeError(f"Cannot create directory over existing file: {item['path']}")
-            target.mkdir(parents=True, exist_ok=True)
-        elif op_type == "write_file":
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists() and target.is_dir():
-                raise RuntimeError(f"Cannot overwrite directory with file content: {item['path']}")
-            if target.exists() and item.get("expected_hash"):
-                if _file_sha256(target) != item["expected_hash"]:
-                    raise RuntimeError(f"Conflict detected while writing {item['path']}.")
-            elif target.exists() and not item.get("expected_hash"):
-                raise RuntimeError(f"Writing existing file requires expected_hash: {item['path']}")
-            target.write_text(item["content"], encoding="utf-8")
-        elif op_type == "rename":
-            destination = _resolve_workspace_path(root, item.get("to_path") or "", allow_missing=True)
-            if not target.exists():
-                raise RuntimeError(f"Cannot rename missing path: {item['path']}")
-            if destination.exists():
-                raise RuntimeError(f"Cannot rename onto existing path: {item['to_path']}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            target.rename(destination)
-        elif op_type == "delete":
-            if not target.exists():
-                raise RuntimeError(f"Cannot delete missing path: {item['path']}")
-            if target.is_file() and item.get("expected_hash"):
-                if _file_sha256(target) != item["expected_hash"]:
-                    raise RuntimeError(f"Conflict detected while deleting {item['path']}.")
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-
-    idx = _project_index(state, project_id)
-    state["projects"][idx]["workspace_pending_batch"] = None
-    saved = _save_app_state(state)
-    project = saved["projects"][idx]
-    _push_event("workspace_batch_applied", {"project_id": project_id, "batch_id": batch.get("id")})
-    return project, batch
-
-
-def _discard_workspace_batch(project_id: str, pending_id: str = "") -> dict:
-    project, _, state = _ensure_workspace_project(project_id)
-    batch = project.get("workspace_pending_batch")
-    if batch and pending_id and batch.get("id") != pending_id:
-        raise RuntimeError("Pending workspace batch does not match the requested id.")
-    idx = _project_index(state, project_id)
-    state["projects"][idx]["workspace_pending_batch"] = None
-    saved = _save_app_state(state)
-    _push_event("workspace_batch_discarded", {"project_id": project_id, "batch_id": batch.get("id") if batch else ""})
-    return saved["projects"][idx]
-
-
-def _choose_workspace_folder() -> str:
-    if platform.system() != "Darwin":
-        raise RuntimeError("Interactive workspace selection is only supported on macOS in v1. Provide a path explicitly.")
-    script = 'POSIX path of (choose folder with prompt "Select a workspace folder for MLX Studio")'
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        stderr = (result.stderr or "").strip()
-        if "User canceled" in stderr:
-            raise RuntimeError("Workspace selection was cancelled.")
-        raise RuntimeError(stderr or "Workspace selection failed.")
-    selected = (result.stdout or "").strip()
-    if not selected:
-        raise RuntimeError("No workspace folder was selected.")
-    return selected
-
-
-def _set_project_workspace(project_id: str, path: Optional[str], suggested_label: str = "") -> dict:
-    state = _load_app_state()
-    idx = _project_index(state, project_id)
-    if path:
-        root = Path(path).expanduser().resolve(strict=True)
-    else:
-        root = Path(_choose_workspace_folder()).expanduser().resolve(strict=True)
-    if not root.exists() or not root.is_dir():
-        raise RuntimeError("Workspace path must point to an existing directory.")
-    project = state["projects"][idx]
-    project["workspace_root"] = str(root)
-    project["workspace_label"] = suggested_label.strip() or root.name
-    project["workspace_enabled"] = True
-    project["workspace_pending_batch"] = None
-    state["projects"][idx] = project
-    saved = _save_app_state(state)
-    _push_event("workspace_selected", {"project_id": project_id, "workspace_root": str(root)})
-    return saved["projects"][idx]
-
-
-def _clear_project_workspace(project_id: str) -> dict:
-    state = _load_app_state()
-    idx = _project_index(state, project_id)
-    project = state["projects"][idx]
-    project["workspace_root"] = None
-    project["workspace_label"] = None
-    project["workspace_enabled"] = False
-    project["workspace_pending_batch"] = None
-    state["projects"][idx] = project
-    saved = _save_app_state(state)
-    _push_event("workspace_cleared", {"project_id": project_id})
-    return saved["projects"][idx]
 
 
 def _extract_pdf_text(data: bytes) -> str:
@@ -1828,79 +1550,6 @@ def _render_prompt_from_messages(messages: list[dict], fallback_prompt: str = ""
     return prompt
 
 
-def _workflow_system_prompt(
-    workflow_mode: str,
-    *,
-    deep_research: bool = False,
-    approval_mode: str = "manual",
-) -> str:
-    lines: list[str] = []
-    if workflow_mode == "plan":
-        lines.extend(
-            [
-                "Operating mode: plan.",
-                "Inspect the available context first and return a concrete implementation plan before changing files.",
-                "Do not stage or apply workspace mutations in plan mode.",
-            ]
-        )
-    elif workflow_mode == "build":
-        lines.extend(
-            [
-                "Operating mode: build.",
-                "Inspect the available workspace and context before editing files.",
-                "When changes are needed, prefer coherent repo-level batches over fragmented edits.",
-            ]
-        )
-    else:
-        lines.extend(
-            [
-                "Operating mode: chat.",
-                "Answer directly unless the user explicitly asks for planning or implementation work.",
-            ]
-        )
-
-    if deep_research:
-        lines.extend(
-            [
-                "Extended research is enabled.",
-                "Use broader source gathering, multiple searches, and longer synthesis before concluding.",
-            ]
-        )
-
-    if approval_mode == "auto":
-        lines.append("Workspace changes may auto-apply only in build mode when a safe batch is prepared.")
-    else:
-        lines.append("Workspace changes require user approval before they are applied.")
-
-    return "\n".join(lines)
-
-
-def _merge_system_prompt(messages: list[dict], workflow_prompt: str) -> list[dict]:
-    merged = [dict(message) for message in (messages or []) if isinstance(message, dict)]
-    if not workflow_prompt:
-        return merged
-    if merged and merged[0].get("role") == "system":
-        existing = str(merged[0].get("content") or "").strip()
-        merged[0]["content"] = (
-            f"{existing}\n\n{workflow_prompt}".strip()
-            if existing
-            else workflow_prompt
-        )
-    else:
-        merged.insert(0, {"role": "system", "content": workflow_prompt})
-    return merged
-
-
-def _workflow_min_output_tokens(workflow_mode: str, *, deep_research: bool = False) -> int:
-    if deep_research:
-        return 3584
-    if workflow_mode == "build":
-        return 3072
-    if workflow_mode == "plan":
-        return 2560
-    return 512
-
-
 def _extract_json_object(text: str) -> Optional[dict]:
     stripped = (text or "").strip()
     if stripped.startswith("```"):
@@ -1929,38 +1578,11 @@ def _extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
-def _agent_tool_prompt(
-    project: Optional[dict] = None,
-    *,
-    workflow_mode: str = "chat",
-    deep_research: bool = False,
-    approval_mode: str = "manual",
-) -> str:
+def _agent_tool_prompt() -> str:
     providers = ", ".join(connector["id"] for connector in _connector_catalog())
-    workspace_state = _workspace_info(project or {})
-    workspace_line = (
-        f"Workspace enabled for the active project at: {workspace_state.get('root')}\n"
-        if workspace_state.get("enabled")
-        else "Workspace is not selected for the active project.\n"
-    )
-    approval_line = (
-        "Workspace auto-apply is enabled for build mode.\n"
-        if workflow_mode == "build" and approval_mode == "auto"
-        else "Workspace changes require explicit approval after staging.\n"
-    )
-    research_line = (
-        "Extended research is enabled. Prefer deeper source gathering before responding.\n"
-        if deep_research
-        else ""
-    )
     return (
         "JSON-only tool dispatcher. Output exactly one raw JSON object. No prose, no markdown, no explanation, no <tool_call> tags.\n"
         "Your entire response must be a single JSON object starting with { and ending with }.\n"
-        "\n"
-        f"{workspace_line}"
-        f"Workflow mode: {workflow_mode}\n"
-        f"{approval_line}"
-        f"{research_line}"
         "\n"
         "TOOLS (use one per turn):\n"
         f'  search_source: {{"action":"tool","tool":"search_source","args":{{"provider":"PROVIDER","query":"QUERY"}}}}  providers: {providers}\n'
@@ -1970,21 +1592,11 @@ def _agent_tool_prompt(
         '  browser_click:    {"action":"tool","tool":"browser_click","args":{"selector":"CSS_SELECTOR"}}\n'
         '  browser_type:     {"action":"tool","tool":"browser_type","args":{"selector":"CSS_SELECTOR","text":"TEXT","submit":true}}\n'
         '  browser_wait:     {"action":"tool","tool":"browser_wait","args":{"text":"TEXT","seconds":2}}\n'
-        '  workspace_tree:   {"action":"tool","tool":"workspace_tree","args":{"path":".","depth":3}}\n'
-        '  workspace_read:   {"action":"tool","tool":"workspace_read","args":{"path":"relative/path.txt"}}\n'
-        '  workspace_find:   {"action":"tool","tool":"workspace_find","args":{"query":"needle","path":"."}}\n'
-        '  workspace_apply:  {"action":"tool","tool":"workspace_apply","args":{"operations":[{"type":"write_file","path":"README.md","content":"...","expected_hash":"OPTIONAL_SHA256"}]}}\n'
         '  done:             {"action":"respond"}\n'
         "\n"
         "Rules:\n"
         "- For browser tasks: navigate first, snapshot to inspect the page, then click or type.\n"
         "- Use selector (CSS) for click/type. Do not use element_id.\n"
-        "- Workspace tools operate only inside the active project's selected workspace root.\n"
-        "- Use workspace_tree and workspace_read before editing files.\n"
-        "- In plan mode, do not call workspace_apply.\n"
-        "- In build mode with manual approval, workspace_apply stages a pending batch for review.\n"
-        "- In build mode with auto approval, workspace_apply may be applied immediately after validation.\n"
-        "- Include expected_hash from workspace_read before overwriting an existing file.\n"
         "- One action per response. Nothing outside the JSON object."
     )
 
@@ -2020,44 +1632,28 @@ async def _resolve_agent_tools(
     temperature: float,
     top_p: float,
     repetition_penalty: float,
-    project_id: str,
-    workflow_mode: str,
-    deep_research: bool,
-    approval_mode: str,
     status_callback: Optional[Any] = None,
-) -> tuple[list[dict], list[dict], Optional[dict]]:
+) -> tuple[list[dict], list[dict]]:
     if _model is None or _tokenizer is None:
-        return messages, [], None
+        return messages, []
 
     working_messages = list(messages) if messages else [{"role": "user", "content": prompt}]
     tool_runs: list[dict] = []
-    pending_workspace_batch: Optional[dict] = None
-    project = None
-    try:
-        project, _, _ = _ensure_workspace_project(project_id)
-    except Exception:
-        project = None
 
-    step_limit = MAX_AGENT_TOOL_STEPS + (4 if deep_research else 0)
-    planner_token_budget = AGENT_TOOL_MAX_TOKENS + (2000 if deep_research else 0)
-
-    for step in range(step_limit):
-        planner_messages = [
-            {"role": "system", "content": _agent_tool_prompt(
-                project,
-                workflow_mode=workflow_mode,
-                deep_research=deep_research,
-                approval_mode=approval_mode,
-            )},
-            *working_messages,
-        ]
+    for step in range(MAX_AGENT_TOOL_STEPS):
+        planner_messages = [{"role": "system", "content": _agent_tool_prompt()}, *working_messages]
+        planner_messages, _ = _compact_messages_for_context(
+            planner_messages,
+            AGENT_TOOL_MAX_TOKENS,
+            fallback_prompt=prompt,
+        )
         planner_prompt = _render_prompt_from_messages(planner_messages, prompt)
         # Inject partial assistant prefix to force first token to be `{`
         # This is the most reliable way to get any LLM to output JSON without prose.
         JSON_PREFIX = '{"action":'
         planner_output_raw = _generate_text(
             prompt=planner_prompt + JSON_PREFIX,
-            max_tokens=planner_token_budget,
+            max_tokens=AGENT_TOOL_MAX_TOKENS,
             temperature=min(temperature, 0.1),
             top_p=0.9,
             repetition_penalty=repetition_penalty,
@@ -2150,120 +1746,6 @@ async def _resolve_agent_tools(
                 result = await _browser_wait(text=text_value, seconds=float(seconds))
                 tool_runs.append({"tool": tool_name, "text": text_value, "seconds": seconds})
                 tool_feedback = _summarize_browser_action("wait", result)
-            elif tool_name == "workspace_tree":
-                relative_path = str(args.get("path") or ".").strip() or "."
-                depth = int(args.get("depth") or 3)
-                project, root, _ = _ensure_workspace_project(project_id)
-                result = _workspace_tree(root, relative_path, depth=depth)
-                tool_runs.append(
-                    {
-                        "tool": tool_name,
-                        "path": relative_path,
-                        "depth": depth,
-                        "count": len(result.get("items") or []),
-                    }
-                )
-                lines = [f"Workspace tree for {result.get('path')}:"]
-                for item in (result.get("items") or [])[:40]:
-                    prefix = "dir" if item.get("kind") == "directory" else "file"
-                    lines.append(f"- {prefix}: {item.get('path')}")
-                tool_feedback = "\n".join(lines)
-            elif tool_name == "workspace_read":
-                relative_path = str(args.get("path") or "").strip()
-                if not relative_path:
-                    raise RuntimeError("workspace_read requires path")
-                project, root, _ = _ensure_workspace_project(project_id)
-                result = _read_workspace_file(root, relative_path)
-                tool_runs.append(
-                    {
-                        "tool": tool_name,
-                        "path": relative_path,
-                        "sha256": result.get("sha256"),
-                    }
-                )
-                tool_feedback = (
-                    f"Read file: {result.get('path')}\n"
-                    f"sha256: {result.get('sha256')}\n"
-                    f"size_bytes: {result.get('size_bytes')}\n\n"
-                    f"{(result.get('content') or '')[:12000]}"
-                )
-            elif tool_name == "workspace_find":
-                query = str(args.get("query") or "").strip()
-                relative_path = str(args.get("path") or ".").strip() or "."
-                if not query:
-                    raise RuntimeError("workspace_find requires query")
-                project, root, _ = _ensure_workspace_project(project_id)
-                results = _find_workspace_matches(root, query, relative_path)
-                tool_runs.append(
-                    {
-                        "tool": tool_name,
-                        "query": query,
-                        "path": relative_path,
-                        "count": len(results),
-                    }
-                )
-                tool_feedback = (
-                    "\n".join(
-                        [f"{len(results)} workspace matches:"]
-                        + [
-                            f"- {item.get('path')}:{item.get('line') or ''} {item.get('preview') or ''}".rstrip()
-                            for item in results[:40]
-                        ]
-                    )
-                    if results
-                    else "No workspace matches found."
-                )
-            elif tool_name == "workspace_apply":
-                if workflow_mode != "build":
-                    raise RuntimeError("workspace_apply is only available in build mode.")
-                operations = _sanitize_workspace_operations(args.get("operations"))
-                auto_apply = approval_mode == "auto"
-                project, batch, applied = _stage_or_apply_workspace_batch(
-                    project_id,
-                    operations,
-                    auto_apply=auto_apply,
-                )
-                tool_runs.append(
-                    {
-                        "tool": tool_name,
-                        "pending_batch_id": None if applied else batch.get("id"),
-                        "applied_batch_id": batch.get("id") if applied else None,
-                        "count": len(operations),
-                        "auto_applied": applied,
-                    }
-                )
-                if applied:
-                    pending_workspace_batch = None
-                    tool_feedback = (
-                        f"Workspace batch applied automatically: {batch.get('id')}\n"
-                        f"Operations: {batch.get('summary', {}).get('total_operations', len(operations))}\n"
-                        "Continue with verification or the next build step."
-                    )
-                    if status_callback is not None:
-                        await status_callback(
-                            {
-                                "type": "agent_status",
-                                "message": (
-                                    f"Workspace batch {batch.get('id')} auto-applied "
-                                    f"with {batch.get('summary', {}).get('total_operations', len(operations))} operations."
-                                ),
-                            }
-                        )
-                else:
-                    pending_workspace_batch = batch
-                    tool_feedback = (
-                        f"Pending workspace batch staged: {batch.get('id')}\n"
-                        f"Operations: {batch.get('summary', {}).get('total_operations', len(operations))}\n"
-                        "Changes are NOT applied yet. Tell the user to review and approve them."
-                    )
-                    if status_callback is not None:
-                        await status_callback(
-                            {
-                                "type": "workspace_pending",
-                                "project_id": project_id,
-                                "batch": batch,
-                            }
-                        )
             else:
                 raise RuntimeError(f"Unknown tool: {tool_name}")
         except Exception as exc:
@@ -2287,7 +1769,7 @@ async def _resolve_agent_tools(
             }
         )
 
-    return working_messages, tool_runs, pending_workspace_batch
+    return working_messages, tool_runs
 
 
 def _push_event(event_type: str, data: dict) -> None:
@@ -2656,6 +2138,45 @@ def _is_valid_model_dir(p: Path) -> bool:
     return has_config and (has_safetensors or has_tokenizer or has_mlx_weights)
 
 
+def _extract_context_length_from_config(config: dict) -> int:
+    search_roots = [config]
+    for key in ("text_config", "llm_config", "language_config"):
+        nested = config.get(key)
+        if isinstance(nested, dict):
+            search_roots.append(nested)
+
+    detected = 0
+    for root in search_roots:
+        for key in (
+            "max_position_embeddings",
+            "max_seq_len",
+            "seq_length",
+            "max_sequence_length",
+            "sliding_window",
+            "n_positions",
+            "model_max_length",
+        ):
+            if key in root:
+                detected = max(detected, _coerce_positive_int(root.get(key)))
+
+        rope_scaling = root.get("rope_scaling")
+        if isinstance(rope_scaling, dict):
+            original = _coerce_positive_int(
+                rope_scaling.get("original_max_position_embeddings")
+                or root.get("original_max_position_embeddings")
+                or root.get("max_position_embeddings")
+            )
+            factor = rope_scaling.get("factor")
+            try:
+                factor_value = float(factor)
+            except (TypeError, ValueError):
+                factor_value = 0.0
+            if original and factor_value > 1:
+                detected = max(detected, int(original * factor_value))
+
+    return detected
+
+
 def _detect_model_profile(p: Path, name: str) -> dict:
     """
     Rich model profiling — ported from AI-ArtWirks _detect_model_profile().
@@ -2688,14 +2209,7 @@ def _detect_model_profile(p: Path, name: str) -> dict:
     architectures = [str(a).lower() for a in config.get("architectures", [])]
 
     # ── Context length detection ──
-    for key in ("max_position_embeddings", "max_seq_len", "seq_length",
-                "max_sequence_length", "sliding_window"):
-        if key in config:
-            try:
-                meta["context_length"] = int(config[key])
-                break
-            except (ValueError, TypeError):
-                pass
+    meta["context_length"] = _extract_context_length_from_config(config)
 
     # ── VLM detection (from AI-ArtWirks — checks config tokens) ──
     has_vlm_tokens = any(key in config for key in (
@@ -3037,151 +2551,9 @@ async def get_app_state():
 @app.post("/api/app-state")
 async def save_app_state(request: dict):
     current = _load_app_state()
-    incoming = dict(request or {})
-    if isinstance(incoming.get("projects"), list):
-        current_by_id = {
-            project.get("id"): project
-            for project in current.get("projects") or []
-            if isinstance(project, dict) and project.get("id")
-        }
-        merged_projects: list[dict] = []
-        for project in incoming.get("projects") or []:
-            if not isinstance(project, dict):
-                continue
-            existing = current_by_id.get(project.get("id"))
-            merged_projects.append(_deep_merge_dicts(existing or {}, project))
-        incoming["projects"] = merged_projects
-    merged = _deep_merge_dicts(current, incoming)
+    merged = _deep_merge_dicts(current, request or {})
     state = _save_app_state(merged)
     return {"status": "saved", "state": state}
-
-
-@app.post("/api/workspace/select")
-async def select_workspace(request: dict):
-    project_id = str(request.get("project_id") or "").strip()
-    if not project_id:
-        return JSONResponse({"error": "Missing project_id."}, status_code=400)
-    try:
-        if request.get("clear"):
-            project = _clear_project_workspace(project_id)
-            return {
-                "status": "cleared",
-                "project": project,
-                "workspace": _workspace_info(project),
-            }
-        project = _set_project_workspace(
-            project_id,
-            str(request.get("path") or "").strip() or None,
-            suggested_label=str(request.get("suggested_label") or "").strip(),
-        )
-        return {
-            "status": "selected",
-            "project": project,
-            "workspace": _workspace_info(project),
-        }
-    except FileNotFoundError:
-        return JSONResponse({"error": "Workspace path does not exist."}, status_code=404)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.get("/api/workspace/tree")
-async def workspace_tree(project_id: str, path: str = ".", depth: int = MAX_WORKSPACE_TREE_DEPTH):
-    try:
-        project, root, _ = _ensure_workspace_project(project_id)
-        tree = _workspace_tree(root, path, depth=depth)
-        return {
-            "project": project,
-            "workspace": _workspace_info(project),
-            **tree,
-        }
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/api/workspace/read")
-async def workspace_read(request: dict):
-    project_id = str(request.get("project_id") or "").strip()
-    path = str(request.get("path") or "").strip()
-    if not project_id or not path:
-        return JSONResponse({"error": "workspace_read requires project_id and path."}, status_code=400)
-    try:
-        project, root, _ = _ensure_workspace_project(project_id)
-        payload = _read_workspace_file(root, path)
-        return {
-            "project": project,
-            "workspace": _workspace_info(project),
-            **payload,
-        }
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/api/workspace/find")
-async def workspace_find(request: dict):
-    project_id = str(request.get("project_id") or "").strip()
-    query = str(request.get("query") or "").strip()
-    path = str(request.get("path") or ".").strip() or "."
-    if not project_id or not query:
-        return JSONResponse({"error": "workspace_find requires project_id and query."}, status_code=400)
-    try:
-        project, root, _ = _ensure_workspace_project(project_id)
-        results = _find_workspace_matches(root, query, path)
-        return {
-            "project": project,
-            "workspace": _workspace_info(project),
-            "results": results,
-        }
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
-@app.post("/api/workspace/apply")
-async def workspace_apply(request: dict):
-    project_id = str(request.get("project_id") or "").strip()
-    if not project_id:
-        return JSONResponse({"error": "Missing project_id."}, status_code=400)
-    pending_id = str(request.get("pending_id") or "").strip()
-    auto_approve = bool(request.get("auto_approve"))
-    try:
-        if request.get("discard_pending"):
-            project = _discard_workspace_batch(project_id, pending_id)
-            return {
-                "status": "discarded",
-                "project": project,
-                "workspace": _workspace_info(project),
-            }
-
-        if request.get("approve"):
-            project, batch = _apply_workspace_batch(project_id, pending_id)
-            return {
-                "status": "applied",
-                "project": project,
-                "workspace": _workspace_info(project),
-                "applied_batch": batch,
-            }
-
-        operations = _sanitize_workspace_operations(request.get("operations"))
-        project_state, _, _ = _project_record(project_id)
-        workflow = _project_workflow_settings(project_state)
-        auto_apply = auto_approve and workflow["workflow_mode"] == "build"
-        project, batch, applied = _stage_or_apply_workspace_batch(
-            project_id,
-            operations,
-            auto_apply=auto_apply,
-        )
-        payload = {
-            "status": "applied" if applied else "pending_approval",
-            "project": project,
-            "workspace": _workspace_info(project),
-        }
-        if applied:
-            payload["applied_batch"] = batch
-        else:
-            payload["batch"] = batch
-        return payload
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @app.get("/api/models")
@@ -3299,45 +2671,34 @@ async def generate_sync(request: dict):
     temperature = request.get("temperature", 0.7)
     top_p = request.get("top_p", 0.9)
     repetition_penalty = request.get("repetition_penalty", 1.1)
-    project_id = str(request.get("project_id") or "").strip() or "default"
-    project_state, _, _ = _project_record(project_id)
-    workflow = _project_workflow_settings(project_state)
-    workflow_mode = _normalize_workflow_mode(request.get("workflow_mode") or workflow["workflow_mode"])
-    approval_mode = _normalize_approval_mode(request.get("approval_mode") or workflow["approval_mode"])
-    deep_research = bool(request.get("deep_research") or workflow["deep_research"])
-    agent_mode = bool(request.get("agent_mode")) or workflow_mode != "chat" or deep_research
-    max_tokens = max(int(max_tokens), _workflow_min_output_tokens(workflow_mode, deep_research=deep_research))
+    agent_mode = bool(request.get("agent_mode"))
+    request_context_length = request.get("context_length")
     generation_id = (request.get("generation_id") or "").strip() or uuid.uuid4().hex
 
     try:
         _clear_generation_cancel(generation_id)
         messages = request.get("messages")
-        workflow_prompt = _workflow_system_prompt(
-            workflow_mode,
-            deep_research=deep_research,
-            approval_mode=approval_mode,
-        )
-        if isinstance(messages, list):
-            messages = _merge_system_prompt(messages, workflow_prompt)
         if agent_mode:
-            messages, tool_runs, pending_workspace_batch = await _resolve_agent_tools(
+            messages, tool_runs = await _resolve_agent_tools(
                 messages=list(messages) if isinstance(messages, list) else [],
                 prompt=prompt,
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                project_id=project_id,
-                workflow_mode=workflow_mode,
-                deep_research=deep_research,
-                approval_mode=approval_mode,
             )
         else:
             tool_runs = []
-            pending_workspace_batch = None
         if messages:
+            messages, context_meta = _compact_messages_for_context(
+                list(messages),
+                max_tokens,
+                fallback_prompt=prompt,
+                context_length=request_context_length,
+            )
+            context_notice = _format_context_compaction_notice(context_meta)
             prompt = _render_prompt_from_messages(messages, prompt)
-        elif workflow_prompt:
-            prompt = f"{workflow_prompt}\n\n{prompt}".strip()
+        else:
+            context_notice = ""
 
         from mlx_lm import stream_generate
 
@@ -3360,16 +2721,16 @@ async def generate_sync(request: dict):
                     return {
                         "response": response,
                         "agent_tools": tool_runs,
-                        "workspace_pending_batch": pending_workspace_batch,
                         "cancelled": True,
+                        "context_notice": context_notice,
                     }
                 response_parts.append(chunk.text if hasattr(chunk, "text") else str(chunk))
         response = "".join(response_parts)
         return {
             "response": response,
             "agent_tools": tool_runs,
-            "workspace_pending_batch": pending_workspace_batch,
             "cancelled": False,
+            "context_notice": context_notice,
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -3408,14 +2769,7 @@ async def inspect_tokens(request: dict):
     attachments = request.get("attachments") or []
     page_clips = request.get("page_clips") or []
     context_length = request.get("context_length")
-    workflow_mode = _normalize_workflow_mode(request.get("workflow_mode"))
-    approval_mode = _normalize_approval_mode(request.get("approval_mode"))
-    deep_research = bool(request.get("deep_research"))
-    workflow_prompt = _workflow_system_prompt(
-        workflow_mode,
-        deep_research=deep_research,
-        approval_mode=approval_mode,
-    )
+    max_tokens = request.get("max_tokens", 512)
 
     grounding_parts: list[str] = []
     for item in attachments:
@@ -3439,7 +2793,7 @@ async def inspect_tokens(request: dict):
 
     prompt_for_count = draft_body
     if messages:
-        prompt_messages = _merge_system_prompt(list(messages), workflow_prompt)
+        prompt_messages = list(messages)
         if prompt_messages and prompt_messages[-1].get("role") == "user":
             prompt_messages[-1] = {
                 **prompt_messages[-1],
@@ -3453,8 +2807,8 @@ async def inspect_tokens(request: dict):
             ) if _tokenizer is not None else json.dumps(prompt_messages)
         except Exception:
             prompt_for_count = json.dumps(prompt_messages)
-    elif system_prompt or workflow_prompt:
-        prompt_for_count = f"{system_prompt}\n\n{workflow_prompt}\n\n{draft_body}".strip()
+    elif system_prompt:
+        prompt_for_count = f"{system_prompt}\n\n{draft_body}".strip()
 
     token_estimate = _estimate_tokens(prompt_for_count, _tokenizer)
     attachment_tokens = sum(
@@ -3466,23 +2820,39 @@ async def inspect_tokens(request: dict):
         for clip in page_clips
     )
 
-    if not context_length:
-        model_meta = _loaded_model_meta()
-        context_length = (model_meta or {}).get("context_length") or 8192
-
-    remaining = max(int(context_length) - token_estimate, 0)
+    resolved_context_length = _context_length_for_generation(context_length)
+    prompt_budget, requested_reserve = _prompt_budget_for_context(resolved_context_length, max_tokens)
+    remaining = max(int(resolved_context_length) - token_estimate, 0)
+    available_output_tokens = max(
+        int(resolved_context_length) - token_estimate - CONTEXT_COMPLETION_BUFFER_TOKENS,
+        0,
+    )
     warning = None
-    if token_estimate >= int(context_length) * 0.9:
+    if token_estimate > prompt_budget:
+        warning = (
+            f"Prompt exceeds the working budget for this reply. "
+            f"Older turns or grounded context may be compacted to preserve about {available_output_tokens} output tokens."
+        )
+    elif available_output_tokens < max(int(max_tokens or 0), MIN_COMPLETION_RESERVE_TOKENS):
+        warning = (
+            f"Only about {available_output_tokens} output tokens are available for the reply. "
+            "Trim grounded files or shorten the prompt for longer answers."
+        )
+    elif token_estimate >= int(resolved_context_length) * 0.9:
         warning = "Context is close to full. Trim grounded files or shorten the prompt."
-    elif token_estimate >= int(context_length) * 0.75:
+    elif token_estimate >= int(resolved_context_length) * 0.75:
         warning = "Context usage is getting high."
 
     return {
         "token_estimate": token_estimate,
         "prompt_token_estimate": _estimate_tokens(prompt, _tokenizer),
         "grounding_token_estimate": attachment_tokens + clip_tokens,
-        "context_length": int(context_length),
+        "context_length": int(resolved_context_length),
         "remaining_tokens": remaining,
+        "available_output_tokens": available_output_tokens,
+        "requested_output_tokens": max(int(max_tokens or 0), 0),
+        "prompt_budget": prompt_budget,
+        "reserved_output_tokens": requested_reserve,
         "warning": warning,
         "grounding_sources": len(attachments) + len(page_clips),
     }
@@ -3828,7 +3198,7 @@ BUILTIN_PRESETS = {
         "description": "General purpose — good for most tasks",
         "temperature": 0.7,
         "top_p": 0.9,
-        "max_tokens": 512,
+        "max_tokens": 1024,
         "repetition_penalty": 1.1,
     },
     "coding": {
@@ -3838,7 +3208,7 @@ BUILTIN_PRESETS = {
         "description": "Low temperature for precise, deterministic code",
         "temperature": 0.2,
         "top_p": 0.85,
-        "max_tokens": 2048,
+        "max_tokens": 3072,
         "repetition_penalty": 1.05,
     },
     "creative": {
@@ -3848,7 +3218,7 @@ BUILTIN_PRESETS = {
         "description": "Higher temperature for imaginative writing",
         "temperature": 1.1,
         "top_p": 0.95,
-        "max_tokens": 1024,
+        "max_tokens": 1536,
         "repetition_penalty": 1.15,
     },
     "precise": {
@@ -3858,7 +3228,7 @@ BUILTIN_PRESETS = {
         "description": "Very low temperature for factual Q&A",
         "temperature": 0.1,
         "top_p": 0.8,
-        "max_tokens": 512,
+        "max_tokens": 1024,
         "repetition_penalty": 1.0,
     },
     "debug": {
@@ -3868,7 +3238,7 @@ BUILTIN_PRESETS = {
         "description": "Tighter sampling with room for longer stack-trace reasoning",
         "temperature": 0.15,
         "top_p": 0.82,
-        "max_tokens": 1536,
+        "max_tokens": 2048,
         "repetition_penalty": 1.02,
     },
     "long_context": {
@@ -3878,7 +3248,7 @@ BUILTIN_PRESETS = {
         "description": "For grounded answers across larger files and page clips",
         "temperature": 0.35,
         "top_p": 0.88,
-        "max_tokens": 3072,
+        "max_tokens": 4096,
         "repetition_penalty": 1.04,
     },
     "extract": {
@@ -3888,7 +3258,7 @@ BUILTIN_PRESETS = {
         "description": "Structured extraction from documents and attached files",
         "temperature": 0.05,
         "top_p": 0.75,
-        "max_tokens": 768,
+        "max_tokens": 1024,
         "repetition_penalty": 1.0,
     },
     "brainstorm": {
@@ -3898,7 +3268,7 @@ BUILTIN_PRESETS = {
         "description": "Broader idea generation with higher variability",
         "temperature": 1.25,
         "top_p": 0.98,
-        "max_tokens": 1408,
+        "max_tokens": 2048,
         "repetition_penalty": 1.08,
     },
     "low_latency": {
@@ -3918,7 +3288,7 @@ BUILTIN_PRESETS = {
         "description": "Careful code and document review with moderate length",
         "temperature": 0.18,
         "top_p": 0.82,
-        "max_tokens": 1792,
+        "max_tokens": 2560,
         "repetition_penalty": 1.05,
     },
 }
@@ -3955,14 +3325,8 @@ async def ws_generate(websocket: WebSocket):
             temperature = data.get("temperature", 0.7)
             top_p = data.get("top_p", 0.9)
             repetition_penalty = data.get("repetition_penalty", 1.1)
-            project_id = str(data.get("project_id") or "").strip() or "default"
-            project_state, _, _ = _project_record(project_id)
-            workflow = _project_workflow_settings(project_state)
-            workflow_mode = _normalize_workflow_mode(data.get("workflow_mode") or workflow["workflow_mode"])
-            approval_mode = _normalize_approval_mode(data.get("approval_mode") or workflow["approval_mode"])
-            deep_research = bool(data.get("deep_research") or workflow["deep_research"])
-            agent_mode = bool(data.get("agent_mode")) or workflow_mode != "chat" or deep_research
-            max_tokens = max(int(max_tokens), _workflow_min_output_tokens(workflow_mode, deep_research=deep_research))
+            agent_mode = bool(data.get("agent_mode"))
+            request_context_length = data.get("context_length")
             generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
 
             messages = data.get("messages")
@@ -3970,25 +3334,14 @@ async def ws_generate(websocket: WebSocket):
             try:
                 _clear_generation_cancel(generation_id)
                 from mlx_lm import stream_generate
-                workflow_prompt = _workflow_system_prompt(
-                    workflow_mode,
-                    deep_research=deep_research,
-                    approval_mode=approval_mode,
-                )
-                if isinstance(messages, list):
-                    messages = _merge_system_prompt(messages, workflow_prompt)
 
                 if agent_mode:
-                    messages, tool_runs, pending_workspace_batch = await _resolve_agent_tools(
+                    messages, tool_runs = await _resolve_agent_tools(
                         messages=list(messages) if isinstance(messages, list) else [],
                         prompt=prompt,
                         temperature=temperature,
                         top_p=top_p,
                         repetition_penalty=repetition_penalty,
-                        project_id=project_id,
-                        workflow_mode=workflow_mode,
-                        deep_research=deep_research,
-                        approval_mode=approval_mode,
                         status_callback=websocket.send_json,
                     )
                     if tool_runs:
@@ -3998,11 +3351,22 @@ async def ws_generate(websocket: WebSocket):
                         })
                 else:
                     tool_runs = []
-                    pending_workspace_batch = None
                 if messages:
+                    messages, context_meta = _compact_messages_for_context(
+                        list(messages),
+                        max_tokens,
+                        fallback_prompt=prompt,
+                        context_length=request_context_length,
+                    )
+                    context_notice = _format_context_compaction_notice(context_meta)
+                    if context_notice:
+                        await websocket.send_json({
+                            "type": "context_notice",
+                            "message": context_notice,
+                        })
                     prompt = _render_prompt_from_messages(messages, prompt)
-                elif workflow_prompt:
-                    prompt = f"{workflow_prompt}\n\n{prompt}".strip()
+                else:
+                    context_notice = ""
 
                 generation_runtime = _build_generation_runtime(
                     temperature=temperature,
@@ -4068,7 +3432,6 @@ async def ws_generate(websocket: WebSocket):
                         "elapsed_seconds": round(elapsed, 2),
                         "tokens_per_second": final_tps,
                         "first_token_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
-                        "workspace_pending_batch": pending_workspace_batch,
                     })
 
                     _push_event("generation_done", {

@@ -27,10 +27,10 @@ class Persona(Base):
     voice = Column(String, nullable=True)  # Edge-TTS voice name (e.g. en-US-AriaNeural)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-    contents = relationship("Content", back_populates="persona")
-    schedules = relationship("Schedule", back_populates="persona")
-    chat_messages = relationship("ChatMessage", back_populates="persona")
-    analytics = relationship("Analytics", back_populates="persona")
+    contents = relationship("Content", back_populates="persona", cascade="all, delete-orphan")
+    schedules = relationship("Schedule", back_populates="persona", cascade="all, delete-orphan")
+    chat_messages = relationship("ChatMessage", back_populates="persona", cascade="all, delete-orphan")
+    analytics = relationship("Analytics", back_populates="persona", cascade="all, delete-orphan")
 
 
 class Content(Base):

@@ -241,8 +241,8 @@ class VideoGenerationRequest(BaseModel):
     width: int = 832
     height: int = 480
     length: int = 81
-    steps: int = 20
-    cfg: float = 6.0
+    steps: int = 30
+    cfg: float = 4.5
     start_image: Optional[str] = None  # ComfyUI image name for I2V
     lora_name: Optional[str] = None  # LoRA filename for Wan video generation
 

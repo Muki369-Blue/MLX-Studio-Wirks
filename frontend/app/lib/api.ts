@@ -493,9 +493,9 @@ export async function checkVideoStatus(contentId: number): Promise<{ status: str
   return res.json();
 }
 
-// ─── Shadow-Wirk Remote Video ─────
+// ─── Shadow-Wirk Remote Video (proxied through local backend) ─────
 
-export const SHADOW_WIRKS_URL = "http://100.119.54.18:8800";
+export const SHADOW_WIRKS_URL = `${API}/shadow`;
 
 export async function fetchVideoLoras(baseUrl: string = VIDEO_API): Promise<string[]> {
   try {
@@ -576,6 +576,20 @@ export async function uploadVideoStartImageRemote(
   const res = await fetch(`${shadowUrl}/upload-video-start-image`, { method: "POST", body: form });
   if (!res.ok) throw new Error("Failed to upload image to Shadow-Wirk");
   return res.json();
+}
+
+export async function pingShadowHealth(): Promise<{ comfyui: boolean; latency_ms: number } | null> {
+  try {
+    const t0 = performance.now();
+    const res = await fetch(`${API}/shadow/health`, { signal: AbortSignal.timeout(12000) });
+    if (!res.ok) return null;
+    const data = await res.json();
+    // Use server-measured latency if available, fall back to round-trip
+    const latency = data.latency_ms ?? Math.round(performance.now() - t0);
+    return { comfyui: data.comfyui ?? false, latency_ms: latency };
+  } catch {
+    return null;
+  }
 }
 
 export async function refineVideoPrompt(

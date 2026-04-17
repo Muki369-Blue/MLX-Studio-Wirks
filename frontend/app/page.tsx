@@ -18,7 +18,7 @@ import PersonaMemoryPanel from "./components/PersonaMemoryPanel";
 import MetricsPanel from "./components/MetricsPanel";
 import {
   API,
-  SHADOW_WIRKS_URL,
+  pingShadowHealth,
   fetchPersonas,
   fetchLinks,
   fetchHealth,
@@ -75,12 +75,9 @@ export default function Dashboard() {
   const pingShadow = useCallback(async () => {
     setShadowPinging(true);
     try {
-      const t0 = performance.now();
-      const res = await fetch(`${SHADOW_WIRKS_URL}/health`, { signal: AbortSignal.timeout(8000) });
-      const latency = Math.round(performance.now() - t0);
-      if (res.ok) {
-        const data = await res.json();
-        setShadowPing({ latency, comfyui: data.comfyui ?? false });
+      const result = await pingShadowHealth();
+      if (result) {
+        setShadowPing({ latency: result.latency_ms, comfyui: result.comfyui });
       } else {
         setShadowPing(null);
       }

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.environ.get(
     "OLLAMA_MODEL",
-    "vanilj/mistral-nemo-12b-celeste-v1.9:Q3_K_M",
+    "empire-qwen2.5-14b",
 )
 
 # ── shared prompt templates ─────────────────────────────────────────

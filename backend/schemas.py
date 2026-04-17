@@ -35,7 +35,7 @@ class GenerationRequest(BaseModel):
 
 class GenerationOut(BaseModel):
     id: int
-    persona_id: int
+    persona_id: Optional[int] = None
     file_path: Optional[str]
     prompt_used: Optional[str]
     comfy_job_id: Optional[str]

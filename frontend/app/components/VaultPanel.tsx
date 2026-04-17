@@ -8,6 +8,8 @@ import {
   generateCaption,
   queuePost,
   imageUrl,
+  downloadMp4Url,
+  isVideoItem,
   type Persona,
   type VaultItem,
 } from "../lib/api";
@@ -190,8 +192,9 @@ export default function VaultPanel({ personas }: { personas: Persona[] }) {
                 </div>
                 {/* Badges */}
                 <div className="absolute top-1 right-1 flex gap-1">
+                  {isVideoItem(item) && <span className="text-[10px] bg-purple-600/80 px-1.5 py-0.5 rounded-full">🎬</span>}
                   {item.is_favorite && <span className="text-[10px] bg-red-600/80 px-1.5 py-0.5 rounded-full">❤️</span>}
-                  {item.upscaled_path && <span className="text-[10px] bg-blue-600/80 px-1.5 py-0.5 rounded-full">4K</span>}
+                  {item.upscaled_path && !isVideoItem(item) && <span className="text-[10px] bg-blue-600/80 px-1.5 py-0.5 rounded-full">4K</span>}
                   {item.is_posted && <span className="text-[10px] bg-emerald-600/80 px-1.5 py-0.5 rounded-full">📤</span>}
                 </div>
                 {/* Prompt preview on hover */}
@@ -264,6 +267,19 @@ export default function VaultPanel({ personas }: { personas: Persona[] }) {
                   </button>
                 ))}
               </div>
+
+              {/* Download MP4 for videos */}
+              {isVideoItem(selected) && (
+                <div>
+                  <a
+                    href={downloadMp4Url(selected.id)}
+                    download
+                    className="inline-block text-[11px] px-3 py-1.5 bg-gradient-to-r from-violet-700 to-purple-700 hover:from-violet-800 hover:to-purple-800 rounded-lg transition-colors"
+                  >
+                    ⬇️ Download MP4
+                  </a>
+                </div>
+              )}
 
               {selected.posted_platforms && (
                 <p className="text-[10px] text-emerald-400">

@@ -79,6 +79,24 @@ export function imageUrl(filename: string, subfolder: string = "Empire"): string
   return `${API}/images/${encodeURIComponent(filename)}?subfolder=${encodeURIComponent(subfolder)}`;
 }
 
+export function downloadMp4Url(contentId: number): string {
+  return `${API}/download-mp4/${contentId}`;
+}
+
+export function isVideoFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith(".mp4") || lower.endsWith(".webm");
+}
+
+export function isVideoItem(item: { tags?: string | null; file_path?: string | null }): boolean {
+  if (item.tags && item.tags.split(",").some((t) => t.trim() === "video")) return true;
+  if (item.file_path) {
+    const lower = item.file_path.toLowerCase();
+    if (lower.includes("video_") || lower.endsWith(".mp4") || lower.endsWith(".webm")) return true;
+  }
+  return false;
+}
+
 export function referenceImageUrl(personaId: number): string {
   return `${API}/personas/${personaId}/reference-image`;
 }

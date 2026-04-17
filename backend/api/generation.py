@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 import mimetypes
 import os
+import subprocess
+import tempfile
 import threading
 from pathlib import Path
 from typing import List, Optional
@@ -241,6 +243,7 @@ def retry_generation(content_id: int, db: Session = Depends(get_db)):
 
 @router.get("/images/{filename:path}")
 def get_image(filename: str, subfolder: str = "Empire"):
+    # Try ComfyUI proxy first
     try:
         resp = requests.get(
             f"{comfy_api.COMFY_BASE}/view",
@@ -252,7 +255,19 @@ def get_image(filename: str, subfolder: str = "Empire"):
         content_type = resp.headers.get("content-type", "image/png")
         return StreamingResponse(resp.iter_content(chunk_size=8192), media_type=content_type)
     except Exception:
-        raise HTTPException(status_code=404, detail="Image not found")
+        pass
+
+    # Fallback: serve from local outputs/ directory
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    for child in OUTPUT_ROOT.iterdir():
+        if child.is_dir():
+            candidate = child / safe_name
+            if candidate.exists() and candidate.is_file():
+                media_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+                return FileResponse(candidate, media_type=media_type)
+    raise HTTPException(status_code=404, detail="Image not found")
 
 
 @router.get("/vault-files/{filename:path}")
@@ -283,4 +298,98 @@ def download_file(filename: str, subfolder: str = "Empire"):
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
         return StreamingResponse(resp.iter_content(chunk_size=8192), media_type=content_type, headers=headers)
     except Exception:
-        raise HTTPException(status_code=404, detail="File not found")
+        pass
+
+    # Fallback: serve from local outputs/ directory
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    for child in OUTPUT_ROOT.iterdir():
+        if child.is_dir():
+            candidate = child / safe_name
+            if candidate.exists() and candidate.is_file():
+                media_type = mimetypes.guess_type(str(candidate))[0] or "application/octet-stream"
+                return FileResponse(candidate, media_type=media_type, filename=safe_name)
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+def _find_source_file(filename: str) -> Optional[Path]:
+    """Locate a media file in vault or outputs directories."""
+    # Check vault first
+    vault_path = VAULT_DIR / filename
+    if vault_path.exists() and vault_path.is_file():
+        return vault_path
+    # Check outputs subdirs
+    safe_name = Path(filename).name
+    for child in OUTPUT_ROOT.iterdir():
+        if child.is_dir():
+            candidate = child / safe_name
+            if candidate.exists() and candidate.is_file():
+                return candidate
+    return None
+
+
+@router.get("/download-mp4/{content_id}")
+def download_mp4(content_id: int, db: Session = Depends(get_db)):
+    content = db.query(Content).filter(Content.id == content_id).first()
+    if not content:
+        raise HTTPException(status_code=404, detail="Content not found")
+    if not content.file_path:
+        raise HTTPException(status_code=404, detail="No file for this content")
+
+    # Resolve source file
+    raw_name = content.file_path
+    if raw_name.startswith("vault/"):
+        raw_name = raw_name[len("vault/"):]
+    source = _find_source_file(raw_name)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source file not found on disk")
+
+    # If already mp4, serve directly
+    if source.suffix.lower() == ".mp4":
+        return FileResponse(source, media_type="video/mp4", filename=source.stem + ".mp4")
+
+    # Animated WebP → MP4 via Pillow frame extraction + ffmpeg
+    from PIL import Image
+    tmp_mp4 = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp_mp4.close()
+    try:
+        img = Image.open(source)
+        n_frames = getattr(img, "n_frames", 1)
+        width, height = img.size
+        # Ensure even dimensions for h264
+        width = width if width % 2 == 0 else width + 1
+        height = height if height % 2 == 0 else height + 1
+        duration_ms = img.info.get("duration", 100)
+        fps = max(1, round(1000 / duration_ms)) if duration_ms else 16
+
+        proc = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{width}x{height}", "-r", str(fps),
+             "-i", "pipe:0", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart", tmp_mp4.name],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        for i in range(n_frames):
+            img.seek(i)
+            frame = img.convert("RGB").resize((width, height))
+            proc.stdin.write(frame.tobytes())
+        proc.stdin.close()
+        proc.wait(timeout=60)
+
+        if proc.returncode != 0:
+            stderr = proc.stderr.read().decode(errors="replace")[:500]
+            os.unlink(tmp_mp4.name)
+            logger.error("ffmpeg failed: %s", stderr)
+            raise HTTPException(status_code=500, detail="Video conversion failed")
+
+        out_name = source.stem + ".mp4"
+        return FileResponse(tmp_mp4.name, media_type="video/mp4", filename=out_name,
+                            background=lambda: os.unlink(tmp_mp4.name))
+    except HTTPException:
+        raise
+    except Exception as e:
+        if os.path.exists(tmp_mp4.name):
+            os.unlink(tmp_mp4.name)
+        logger.error("MP4 conversion error: %s", e)
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")

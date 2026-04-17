@@ -8,3 +8,4 @@ croniter
 Pillow
 numpy
 websocket-client
+alembic==1.18.4

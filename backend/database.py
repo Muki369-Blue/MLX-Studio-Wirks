@@ -1,7 +1,25 @@
+import enum
 from pathlib import Path
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey, Float, Boolean, JSON, Index
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime, timezone
+
+
+class JobState(str, enum.Enum):
+    QUEUED = "queued"
+    DISPATCHING = "dispatching"
+    RUNNING = "running"
+    POSTPROCESSING = "postprocessing"
+    SCORING = "scoring"
+    NEEDS_REVIEW = "needs_review"
+    APPROVED = "approved"
+    SCHEDULED = "scheduled"
+    PUBLISHED = "published"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+TERMINAL_JOB_STATES = {JobState.PUBLISHED, JobState.FAILED, JobState.CANCELLED}
 
 DATABASE_PATH = Path(__file__).resolve().parent / "empire.db"
 SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
@@ -153,6 +171,94 @@ class Link(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+class GenerationJob(Base):
+    """Canonical job record. Every image/video/scoring task is a job."""
+    __tablename__ = "generation_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
+    job_type = Column(String, nullable=False)  # image | video | score | analytics | caption | plan | ...
+    status = Column(String, nullable=False, default=JobState.QUEUED.value, index=True)
+    payload = Column(JSON, nullable=True)  # full request params (prompt, size, lora, etc)
+    content_id = Column(Integer, ForeignKey("contents.id"), nullable=True)
+    campaign_task_id = Column(Integer, nullable=True)
+    machine = Column(String, nullable=True)  # mac | shadowwirk
+    priority = Column(Integer, default=0)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    persona = relationship("Persona")
+    content = relationship("Content")
+    runs = relationship("GenerationRun", back_populates="job", cascade="all, delete-orphan")
+
+
+class GenerationRun(Base):
+    """One execution attempt of a GenerationJob. Retries get new rows."""
+    __tablename__ = "generation_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("generation_jobs.id"), nullable=False, index=True)
+    attempt = Column(Integer, default=1)
+    prompt = Column(Text, nullable=True)
+    refined_prompt = Column(Text, nullable=True)
+    negative_prompt = Column(Text, nullable=True)
+    loras = Column(JSON, nullable=True)  # [{"name": "...", "strength": 0.8}, ...]
+    backend = Column(String, nullable=True)  # comfy | shadowwirk
+    model = Column(String, nullable=True)
+    seed = Column(Integer, nullable=True)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    machine = Column(String, nullable=True)  # mac | shadowwirk
+    duration_seconds = Column(Float, nullable=True)
+    output_path = Column(String, nullable=True)
+    preview_path = Column(String, nullable=True)
+    status = Column(String, default="running")  # running | completed | failed
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished_at = Column(DateTime, nullable=True)
+
+    job = relationship("GenerationJob", back_populates="runs")
+
+
+class AssetScore(Base):
+    """QA scoring output for a produced Content row."""
+    __tablename__ = "asset_scores"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content_id = Column(Integer, ForeignKey("contents.id"), nullable=False, index=True)
+    aesthetic = Column(Float, nullable=True)
+    persona_consistency = Column(Float, nullable=True)
+    prompt_adherence = Column(Float, nullable=True)
+    artifact_penalty = Column(Float, nullable=True)
+    novelty = Column(Float, nullable=True)
+    overall = Column(Float, nullable=True)
+    verdict = Column(String, nullable=True)  # auto_approve | needs_review | auto_reject
+    notes = Column(Text, nullable=True)
+    model_used = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class EventLog(Base):
+    """Append-only audit trail. Every state change, decision, error lands here."""
+    __tablename__ = "event_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String, nullable=False, index=True)  # job.state_change, asset.reviewed, ...
+    subject_type = Column(String, nullable=True)  # generation_job | content | campaign | persona
+    subject_id = Column(Integer, nullable=True)
+    actor = Column(String, nullable=True)  # system | agent:planner | user | ...
+    payload = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+
+Index("ix_event_log_subject", EventLog.subject_type, EventLog.subject_id)
+
+
 def _migrate_persona_id_nullable():
     """SQLite: recreate contents table to make persona_id nullable if needed."""
     import sqlite3
@@ -196,9 +302,20 @@ def _migrate_persona_id_nullable():
     conn.close()
 
 
+def run_migrations():
+    """Apply pending Alembic migrations. Source of truth for schema."""
+    from alembic.config import Config
+    from alembic import command
+
+    cfg = Config(str(Path(__file__).resolve().parent / "alembic.ini"))
+    command.upgrade(cfg, "head")
+
+
 def init_db():
+    # Alembic is the schema authority; create_all stays as a safety net for
+    # any table that hasn't been captured in a migration yet.
+    run_migrations()
     Base.metadata.create_all(bind=engine)
-    # Migrate: make contents.persona_id nullable for existing DBs
     _migrate_persona_id_nullable()
 
 

@@ -212,27 +212,31 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const handleStopVideo = async () => {
     setStopping(true);
     setVideoResult(null);
+    let remoteOk = false;
     try {
       // Cancel on Shadow-Wirk + local DB
       const res = await fetch(`${SHADOW_WIRKS_URL}/generations/cancel-active`, { method: "POST" });
-      if (!res.ok) throw new Error("Cancel failed");
-      const data = await res.json();
-      try { await cancelActiveGenerations(); } catch {}
-      const n = data.cancelled_content_ids?.length ?? 0;
-      setVideoResult(
-        n > 0
-          ? `Stopped ${n} generation(s) — GPU interrupted & memory freed`
-          : "GPU interrupted & queue cleared — no active DB rows"
-      );
-      setGeneratingVideo(false);
-      setVideoProgress(0);
-      setVideoStatus(null);
-      setContentId(null);
-    } catch {
-      setVideoResult("Error: Could not stop video generation");
-    } finally {
-      setStopping(false);
+      if (res.ok) {
+        const data = await res.json();
+        const n = data.cancelled_content_ids?.length ?? 0;
+        setVideoResult(
+          n > 0
+            ? `Stopped ${n} generation(s) — GPU interrupted & memory freed`
+            : "GPU interrupted & queue cleared — no active DB rows"
+        );
+        remoteOk = true;
+      }
+    } catch {}
+    try { await cancelActiveGenerations(); } catch {}
+    // Always reset local UI state
+    setGeneratingVideo(false);
+    setVideoProgress(0);
+    setVideoStatus(null);
+    setContentId(null);
+    if (!remoteOk) {
+      setVideoResult("Generation stopped locally — Shadow-Wirk unreachable. Ready for next gen.");
     }
+    setStopping(false);
   };
 
   const frameCount = Math.floor((length - 1) / 4) + 1;

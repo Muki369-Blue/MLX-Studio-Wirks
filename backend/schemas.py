@@ -245,3 +245,235 @@ class VideoGenerationRequest(BaseModel):
     cfg: float = 6.0
     start_image: Optional[str] = None  # ComfyUI image name for I2V
     lora_name: Optional[str] = None  # LoRA filename for Wan video generation
+
+
+# ─── Jobs ────────────────────────────────────────────────────────────
+
+class JobOut(BaseModel):
+    id: int
+    persona_id: Optional[int] = None
+    job_type: str
+    status: str
+    payload: Optional[dict] = None
+    content_id: Optional[int] = None
+    campaign_task_id: Optional[int] = None
+    machine: Optional[str] = None
+    priority: int = 0
+    error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class JobCancel(BaseModel):
+    reason: Optional[str] = None
+
+
+class EventLogOut(BaseModel):
+    id: int
+    event_type: str
+    subject_type: Optional[str] = None
+    subject_id: Optional[int] = None
+    actor: Optional[str] = None
+    payload: Optional[dict] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Campaigns ───────────────────────────────────────────────────────
+
+class CampaignCreate(BaseModel):
+    persona_id: int
+    name: str
+    description: Optional[str] = None
+    total_days: int = 4
+    config: Optional[dict] = None
+
+
+class CampaignOut(BaseModel):
+    id: int
+    persona_id: int
+    name: str
+    description: Optional[str] = None
+    status: str
+    total_days: int
+    current_day: int
+    config: Optional[dict] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CampaignTaskOut(BaseModel):
+    id: int
+    campaign_id: int
+    day: int
+    task_type: str
+    status: str
+    config: Optional[dict] = None
+    job_id: Optional[int] = None
+    depends_on: Optional[list] = None
+    scheduled_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    error: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Persona Memory ─────────────────────────────────────────────────
+
+class PersonaMemoryCreate(BaseModel):
+    persona_id: int
+    partition: str  # canonical | operational | learned
+    key: str
+    value: dict
+    source: Optional[str] = "user"
+
+
+class PersonaMemoryOut(BaseModel):
+    id: int
+    persona_id: int
+    partition: str
+    key: str
+    value: dict
+    source: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Agent Runs ──────────────────────────────────────────────────────
+
+class AgentRunOut(BaseModel):
+    id: int
+    agent_type: str
+    persona_id: Optional[int] = None
+    campaign_id: Optional[int] = None
+    input_payload: Optional[dict] = None
+    output_payload: Optional[dict] = None
+    model_used: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    status: str
+    error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── Asset Scoring ───────────────────────────────────────────────────
+
+class AssetScoreOut(BaseModel):
+    id: int
+    content_id: int
+    aesthetic: Optional[float] = None
+    persona_consistency: Optional[float] = None
+    prompt_adherence: Optional[float] = None
+    artifact_penalty: Optional[float] = None
+    novelty: Optional[float] = None
+    overall: Optional[float] = None
+    verdict: Optional[str] = None
+    notes: Optional[str] = None
+    model_used: Optional[str] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AssetReviewAction(BaseModel):
+    action: str  # approve | reject | rerun
+    notes: Optional[str] = None
+
+
+# ─── Metrics ─────────────────────────────────────────────────────────
+
+class ContentMetricsIn(BaseModel):
+    content_id: int
+    platform: str
+    views: int = 0
+    likes: int = 0
+    comments: int = 0
+    tips: float = 0.0
+    unlocks: int = 0
+    saves: int = 0
+
+
+class ContentMetricsOut(ContentMetricsIn):
+    id: int
+    collected_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PersonaMetricsDailyIn(BaseModel):
+    persona_id: int
+    date: datetime
+    platform: str
+    new_subscribers: int = 0
+    churned_subscribers: int = 0
+    revenue: float = 0.0
+    tips: float = 0.0
+    messages_received: int = 0
+    messages_sent: int = 0
+    content_posted: int = 0
+    avg_engagement_rate: float = 0.0
+
+
+class PersonaMetricsDailyOut(PersonaMetricsDailyIn):
+    id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CampaignMetricsIn(BaseModel):
+    campaign_id: int
+    day: int
+    content_produced: int = 0
+    content_approved: int = 0
+    content_rejected: int = 0
+    content_posted: int = 0
+    revenue_attributed: float = 0.0
+    new_subscribers: int = 0
+    total_engagement: int = 0
+
+
+class CampaignMetricsOut(CampaignMetricsIn):
+    id: int
+    collected_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class GenerationCostIn(BaseModel):
+    job_id: int
+    machine: str
+    job_type: str
+    duration_seconds: Optional[float] = None
+    estimated_cost_usd: float = 0.0
+    model_used: Optional[str] = None
+
+
+class GenerationCostOut(GenerationCostIn):
+    id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+

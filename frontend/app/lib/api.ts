@@ -79,6 +79,24 @@ export function imageUrl(filename: string, subfolder: string = "Empire"): string
   return `${API}/images/${encodeURIComponent(filename)}?subfolder=${encodeURIComponent(subfolder)}`;
 }
 
+export function downloadMp4Url(contentId: number): string {
+  return `${API}/download-mp4/${contentId}`;
+}
+
+export function isVideoFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith(".mp4") || lower.endsWith(".webm");
+}
+
+export function isVideoItem(item: { tags?: string | null; file_path?: string | null }): boolean {
+  if (item.tags && item.tags.split(",").some((t) => t.trim() === "video")) return true;
+  if (item.file_path) {
+    const lower = item.file_path.toLowerCase();
+    if (lower.includes("video_") || lower.endsWith(".mp4") || lower.endsWith(".webm")) return true;
+  }
+  return false;
+}
+
 export function referenceImageUrl(personaId: number): string {
   return `${API}/personas/${personaId}/reference-image`;
 }
@@ -818,5 +836,475 @@ export async function refinePrompt(
     const err = await res.json().catch(() => ({ detail: "Unknown error" }));
     throw new Error(err.detail || `Refine failed (${res.status})`);
   }
+  return res.json();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Phase 2-4: Jobs, Campaigns, Memory, Agents, Review
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── Jobs (Mission Control) ───────
+
+export interface Job {
+  id: number;
+  job_type: string;
+  persona_id: number | null;
+  content_id: number | null;
+  campaign_id: number | null;
+  status: string;
+  priority: number;
+  payload: Record<string, any> | null;
+  error: string | null;
+  attempts: number;
+  max_attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface JobStats {
+  queued: number;
+  running: number;
+  failed: number;
+  needs_review: number;
+  total: number;
+}
+
+export interface EventLogEntry {
+  id: number;
+  subject_type: string;
+  subject_id: number;
+  event: string;
+  actor: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export async function fetchJobs(opts?: {
+  status?: string;
+  job_type?: string;
+  persona_id?: number;
+  limit?: number;
+}): Promise<Job[]> {
+  const params = new URLSearchParams();
+  if (opts?.status) params.set("status", opts.status);
+  if (opts?.job_type) params.set("job_type", opts.job_type);
+  if (opts?.persona_id) params.set("persona_id", String(opts.persona_id));
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/jobs/?${params}`);
+  return res.json();
+}
+
+export async function fetchJobStats(): Promise<JobStats> {
+  const res = await fetch(`${API}/jobs/stats`);
+  return res.json();
+}
+
+export async function fetchJob(id: number): Promise<Job> {
+  const res = await fetch(`${API}/jobs/${id}`);
+  if (!res.ok) throw new Error("Job not found");
+  return res.json();
+}
+
+export async function cancelJob(id: number, reason?: string): Promise<Job> {
+  const res = await fetch(`${API}/jobs/${id}/cancel`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  if (!res.ok) throw new Error("Cancel failed");
+  return res.json();
+}
+
+export async function fetchJobEvents(id: number): Promise<EventLogEntry[]> {
+  const res = await fetch(`${API}/jobs/${id}/events`);
+  return res.json();
+}
+
+// ─── Campaigns ────────────────────
+
+export interface Campaign {
+  id: number;
+  persona_id: number;
+  name: string;
+  description: string | null;
+  status: string;
+  total_days: number;
+  current_day: number;
+  config: Record<string, any> | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+}
+
+export interface CampaignTask {
+  id: number;
+  campaign_id: number;
+  day: number;
+  task_type: string;
+  status: string;
+  config: Record<string, any> | null;
+  job_id: number | null;
+  depends_on: number[] | null;
+  scheduled_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error: string | null;
+}
+
+export async function fetchCampaigns(): Promise<Campaign[]> {
+  const res = await fetch(`${API}/campaigns/`);
+  return res.json();
+}
+
+export async function fetchCampaign(id: number): Promise<Campaign> {
+  const res = await fetch(`${API}/campaigns/${id}`);
+  if (!res.ok) throw new Error("Campaign not found");
+  return res.json();
+}
+
+export async function createCampaign(data: {
+  persona_id: number;
+  name: string;
+  description?: string;
+  total_days?: number;
+  config?: Record<string, any>;
+}): Promise<Campaign> {
+  const res = await fetch(`${API}/campaigns/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Create campaign failed");
+  return res.json();
+}
+
+export async function startCampaign(id: number): Promise<Campaign> {
+  const res = await fetch(`${API}/campaigns/${id}/start`, { method: "POST" });
+  if (!res.ok) throw new Error("Start campaign failed");
+  return res.json();
+}
+
+export async function cancelCampaign(id: number): Promise<Campaign> {
+  const res = await fetch(`${API}/campaigns/${id}/cancel`, { method: "POST" });
+  if (!res.ok) throw new Error("Cancel campaign failed");
+  return res.json();
+}
+
+export async function fetchCampaignTasks(id: number): Promise<CampaignTask[]> {
+  const res = await fetch(`${API}/campaigns/${id}/tasks`);
+  return res.json();
+}
+
+export async function generateCampaignPlan(id: number): Promise<{ tasks_created: number; plan: any }> {
+  const res = await fetch(`${API}/campaigns/${id}/plan`, { method: "POST" });
+  if (!res.ok) throw new Error("Plan generation failed");
+  return res.json();
+}
+
+// ─── Persona Memory ───────────────
+
+export interface PersonaMemoryEntry {
+  id: number;
+  persona_id: number;
+  partition: string;
+  key: string;
+  value: Record<string, any>;
+  source: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export async function fetchPersonaMemory(
+  personaId: number,
+  partition?: string
+): Promise<PersonaMemoryEntry[]> {
+  const params = partition ? `?partition=${partition}` : "";
+  const res = await fetch(`${API}/persona-memory/${personaId}${params}`);
+  return res.json();
+}
+
+export async function upsertPersonaMemory(data: {
+  persona_id: number;
+  partition: string;
+  key: string;
+  value: Record<string, any>;
+  source?: string;
+}): Promise<PersonaMemoryEntry> {
+  const res = await fetch(`${API}/persona-memory/`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Upsert memory failed");
+  return res.json();
+}
+
+export async function deletePersonaMemory(id: number): Promise<void> {
+  await fetch(`${API}/persona-memory/${id}`, { method: "DELETE" });
+}
+
+// ─── Agents ───────────────────────
+
+export interface AgentRun {
+  id: number;
+  agent_type: string;
+  persona_id: number | null;
+  campaign_id: number | null;
+  input_payload: Record<string, any> | null;
+  output_payload: Record<string, any> | null;
+  model_used: string | null;
+  duration_seconds: number | null;
+  status: string;
+  error: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export async function invokePlanner(data: {
+  persona_id: number;
+  total_days?: number;
+  slots_per_day?: number;
+  notes?: string;
+}): Promise<any> {
+  const res = await fetch(`${API}/agents/planner`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Planner failed");
+  return res.json();
+}
+
+export async function invokeCreative(data: {
+  persona_id?: number;
+  brief: string;
+  content_type?: string;
+}): Promise<any> {
+  const res = await fetch(`${API}/agents/creative`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Creative agent failed");
+  return res.json();
+}
+
+export async function invokeAnalyst(data: {
+  persona_id?: number;
+  metrics_summary: Record<string, any>;
+}): Promise<any> {
+  const res = await fetch(`${API}/agents/analyst`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error("Analyst failed");
+  return res.json();
+}
+
+export async function fetchAgentRuns(opts?: {
+  agent_type?: string;
+  persona_id?: number;
+  limit?: number;
+}): Promise<AgentRun[]> {
+  const params = new URLSearchParams();
+  if (opts?.agent_type) params.set("agent_type", opts.agent_type);
+  if (opts?.persona_id) params.set("persona_id", String(opts.persona_id));
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/agents/runs?${params}`);
+  return res.json();
+}
+
+// ─── Review Inbox ─────────────────
+
+export interface ReviewItem {
+  content: {
+    id: number;
+    persona_id: number | null;
+    file_path: string | null;
+    upscaled_path: string | null;
+    prompt_used: string | null;
+    tags: string | null;
+    created_at: string;
+  };
+  score: {
+    id: number;
+    aesthetic: number;
+    persona_consistency: number;
+    prompt_adherence: number;
+    artifact_penalty: number;
+    novelty: number;
+    overall: number;
+    verdict: string;
+    notes: string | null;
+  } | null;
+}
+
+export async function fetchReviewInbox(opts?: {
+  verdict?: string;
+  persona_id?: number;
+  limit?: number;
+}): Promise<ReviewItem[]> {
+  const params = new URLSearchParams();
+  if (opts?.verdict) params.set("verdict", opts.verdict);
+  if (opts?.persona_id) params.set("persona_id", String(opts.persona_id));
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/review/inbox?${params}`);
+  return res.json();
+}
+
+export async function scoreContent(contentId: number): Promise<any> {
+  const res = await fetch(`${API}/review/${contentId}/score`, { method: "POST" });
+  if (!res.ok) throw new Error("Scoring failed");
+  return res.json();
+}
+
+export async function reviewAction(
+  contentId: number,
+  action: "approve" | "reject" | "rerun",
+  notes?: string
+): Promise<any> {
+  const res = await fetch(`${API}/review/${contentId}/action`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, notes }),
+  });
+  if (!res.ok) throw new Error("Review action failed");
+  return res.json();
+}
+
+// ─── Metrics ──────────────────────
+
+export interface ContentMetrics {
+  id: number;
+  content_id: number;
+  platform: string;
+  views: number;
+  likes: number;
+  comments: number;
+  tips: number;
+  unlocks: number;
+  saves: number;
+  collected_at: string;
+}
+
+export interface ContentMetricsSummary {
+  total_views: number;
+  total_likes: number;
+  total_comments: number;
+  total_tips: number;
+  total_unlocks: number;
+  count: number;
+}
+
+export interface PersonaMetricsDaily {
+  id: number;
+  persona_id: number;
+  date: string;
+  platform: string;
+  new_subscribers: number;
+  churned_subscribers: number;
+  revenue: number;
+  tips: number;
+  messages_received: number;
+  messages_sent: number;
+  content_posted: number;
+  avg_engagement_rate: number;
+}
+
+export interface PersonaMetricsSummary {
+  total_revenue: number;
+  total_tips: number;
+  net_subscribers: number;
+  total_content_posted: number;
+  days_tracked: number;
+}
+
+export interface CampaignMetricsEntry {
+  id: number;
+  campaign_id: number;
+  day: number;
+  content_produced: number;
+  content_approved: number;
+  content_rejected: number;
+  content_posted: number;
+  revenue_attributed: number;
+  new_subscribers: number;
+  total_engagement: number;
+  collected_at: string;
+}
+
+export interface CampaignMetricsSummary {
+  total_produced: number;
+  total_approved: number;
+  total_posted: number;
+  total_revenue: number;
+  days_tracked: number;
+}
+
+export interface GenerationCost {
+  id: number;
+  job_id: number | null;
+  machine: string;
+  job_type: string;
+  duration_seconds: number;
+  estimated_cost_usd: number;
+  model_used: string | null;
+  created_at: string;
+}
+
+export interface CostSummary {
+  total_cost_usd: number;
+  total_jobs: number;
+  avg_duration_seconds: number;
+  by_machine: Record<string, { count: number; cost: number }>;
+  by_type: Record<string, { count: number; cost: number }>;
+}
+
+export async function fetchContentMetrics(contentId: number): Promise<ContentMetrics[]> {
+  const res = await fetch(`${API}/metrics/content/${contentId}`);
+  return res.json();
+}
+
+export async function fetchContentMetricsSummary(platform?: string): Promise<ContentMetricsSummary> {
+  const params = platform ? `?platform=${platform}` : "";
+  const res = await fetch(`${API}/metrics/content-summary${params}`);
+  return res.json();
+}
+
+export async function fetchPersonaMetrics(personaId: number, opts?: { platform?: string; limit?: number }): Promise<PersonaMetricsDaily[]> {
+  const params = new URLSearchParams();
+  if (opts?.platform) params.set("platform", opts.platform);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/metrics/persona/${personaId}?${params}`);
+  return res.json();
+}
+
+export async function fetchPersonaMetricsSummary(personaId: number): Promise<PersonaMetricsSummary> {
+  const res = await fetch(`${API}/metrics/persona-summary/${personaId}`);
+  return res.json();
+}
+
+export async function fetchCampaignMetrics(campaignId: number): Promise<CampaignMetricsEntry[]> {
+  const res = await fetch(`${API}/metrics/campaign/${campaignId}`);
+  return res.json();
+}
+
+export async function fetchCampaignMetricsSummary(campaignId: number): Promise<CampaignMetricsSummary> {
+  const res = await fetch(`${API}/metrics/campaign-summary/${campaignId}`);
+  return res.json();
+}
+
+export async function fetchCostMetrics(opts?: { machine?: string; job_type?: string; limit?: number }): Promise<GenerationCost[]> {
+  const params = new URLSearchParams();
+  if (opts?.machine) params.set("machine", opts.machine);
+  if (opts?.job_type) params.set("job_type", opts.job_type);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/metrics/cost?${params}`);
+  return res.json();
+}
+
+export async function fetchCostSummary(): Promise<CostSummary> {
+  const res = await fetch(`${API}/metrics/cost-summary`);
   return res.json();
 }

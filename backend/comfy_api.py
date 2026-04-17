@@ -528,10 +528,11 @@ def _wan_t2v_workflow(
     width: int = 832,
     height: int = 480,
     length: int = 81,
-    steps: int = 20,
-    cfg: float = 6.0,
+    steps: int = 30,
+    cfg: float = 4.5,
     seed: Optional[int] = None,
     lora_name: Optional[str] = None,
+    scheduler: str = "normal",
 ) -> dict:
     """
     Wan 2.1 Text-to-Video workflow (1.3B).
@@ -608,7 +609,7 @@ def _wan_t2v_workflow(
                 "steps": steps,
                 "cfg": cfg,
                 "sampler_name": "euler",
-                "scheduler": "normal",
+                "scheduler": scheduler,
                 "denoise": 1.0,
             },
         },
@@ -625,7 +626,7 @@ def _wan_t2v_workflow(
                 "filename_prefix": "Empire/video",
                 "fps": 16.0,
                 "lossless": False,
-                "quality": 85,
+                "quality": 95,
                 "method": "default",
                 "images": ["8", 0],
             },
@@ -659,10 +660,11 @@ def _wan_i2v_workflow(
     width: int = 832,
     height: int = 480,
     length: int = 81,
-    steps: int = 20,
-    cfg: float = 6.0,
+    steps: int = 30,
+    cfg: float = 4.5,
     seed: Optional[int] = None,
     lora_name: Optional[str] = None,
+    scheduler: str = "normal",
 ) -> dict:
     """
     Wan 2.1 Image-to-Video workflow (14B fp8).
@@ -760,7 +762,7 @@ def _wan_i2v_workflow(
                 "steps": steps,
                 "cfg": cfg,
                 "sampler_name": "euler",
-                "scheduler": "normal",
+                "scheduler": scheduler,
                 "denoise": 1.0,
             },
         },
@@ -777,7 +779,7 @@ def _wan_i2v_workflow(
                 "filename_prefix": "Empire/video",
                 "fps": 16.0,
                 "lossless": False,
-                "quality": 85,
+                "quality": 95,
                 "method": "default",
                 "images": ["8", 0],
             },
@@ -810,21 +812,43 @@ def queue_video(
     width: int = 832,
     height: int = 480,
     length: int = 81,
-    steps: int = 20,
-    cfg: float = 6.0,
+    steps: int = 30,
+    cfg: float = 4.5,
     seed: Optional[int] = None,
     lora_name: Optional[str] = None,
 ) -> dict:
     """Queue a Wan 2.1 video generation job. Uses I2V workflow if start_image is provided."""
+    # LoRA presets: speed/distillation LoRAs need low steps + cfg to work properly
+    _LORA_PRESETS = {
+        "Lightning": {"steps": 4, "cfg": 1.0, "scheduler": "sgm_uniform"},
+        "rCM": {"steps": 6, "cfg": 1.0},
+        "self_forcing_dmd": {"steps": 4, "cfg": 1.0},
+        "self_forcing_sid": {"steps": 6, "cfg": 1.0},
+    }
+    scheduler = "normal"
+    if lora_name:
+        for key, preset in _LORA_PRESETS.items():
+            if key in lora_name:
+                logger.info("Applying LoRA preset '%s': %s", key, preset)
+                steps = preset.get("steps", steps)
+                cfg = preset.get("cfg", cfg)
+                scheduler = preset.get("scheduler", scheduler)
+                break
+
+    _DEFAULT_VIDEO_NEG = "blurry face, distorted face, deformed features, extra fingers, bad anatomy, disfigured, low quality, blurry"
+    if not negative_prompt:
+        negative_prompt = _DEFAULT_VIDEO_NEG
     if start_image:
         workflow = _wan_i2v_workflow(
             positive_prompt, start_image, negative_prompt,
             width, height, length, steps, cfg, seed, lora_name,
+            scheduler,
         )
     else:
         workflow = _wan_t2v_workflow(
             positive_prompt, negative_prompt,
             width, height, length, steps, cfg, seed, lora_name,
+            scheduler,
         )
     payload = {
         "prompt": workflow,

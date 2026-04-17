@@ -41,10 +41,10 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const [selectedLora, setSelectedLora] = useState<string>("");
 
   // Video settings
-  const [width, setWidth] = useState(832);
-  const [height, setHeight] = useState(480);
-  const [length, setLength] = useState(241);
-  const [steps, setSteps] = useState(30);
+  const [width, setWidth] = useState(640);
+  const [height, setHeight] = useState(384);
+  const [length, setLength] = useState(49);
+  const [steps, setSteps] = useState(20);
   const [cfg, setCfg] = useState(6.0);
   const [showSettings, setShowSettings] = useState(false);
 

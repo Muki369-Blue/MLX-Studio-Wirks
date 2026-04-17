@@ -397,3 +397,83 @@ class AssetReviewAction(BaseModel):
     action: str  # approve | reject | rerun
     notes: Optional[str] = None
 
+
+# ─── Metrics ─────────────────────────────────────────────────────────
+
+class ContentMetricsIn(BaseModel):
+    content_id: int
+    platform: str
+    views: int = 0
+    likes: int = 0
+    comments: int = 0
+    tips: float = 0.0
+    unlocks: int = 0
+    saves: int = 0
+
+
+class ContentMetricsOut(ContentMetricsIn):
+    id: int
+    collected_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PersonaMetricsDailyIn(BaseModel):
+    persona_id: int
+    date: datetime
+    platform: str
+    new_subscribers: int = 0
+    churned_subscribers: int = 0
+    revenue: float = 0.0
+    tips: float = 0.0
+    messages_received: int = 0
+    messages_sent: int = 0
+    content_posted: int = 0
+    avg_engagement_rate: float = 0.0
+
+
+class PersonaMetricsDailyOut(PersonaMetricsDailyIn):
+    id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CampaignMetricsIn(BaseModel):
+    campaign_id: int
+    day: int
+    content_produced: int = 0
+    content_approved: int = 0
+    content_rejected: int = 0
+    content_posted: int = 0
+    revenue_attributed: float = 0.0
+    new_subscribers: int = 0
+    total_engagement: int = 0
+
+
+class CampaignMetricsOut(CampaignMetricsIn):
+    id: int
+    collected_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class GenerationCostIn(BaseModel):
+    job_id: int
+    machine: str
+    job_type: str
+    duration_seconds: Optional[float] = None
+    estimated_cost_usd: float = 0.0
+    model_used: Optional[str] = None
+
+
+class GenerationCostOut(GenerationCostIn):
+    id: int
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+

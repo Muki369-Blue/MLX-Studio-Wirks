@@ -34,6 +34,7 @@ try:
     from .api.memory import router as memory_router
     from .api.agents import router as agents_router
     from .api.review import router as review_router
+    from .api.metrics import router as metrics_router
 except ImportError:
     from database import init_db
     import comfy_api
@@ -56,6 +57,7 @@ except ImportError:
     from api.memory import router as memory_router
     from api.agents import router as agents_router
     from api.review import router as review_router
+    from api.metrics import router as metrics_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -124,3 +126,4 @@ app.include_router(campaigns_router)
 app.include_router(memory_router)
 app.include_router(agents_router)
 app.include_router(review_router)
+app.include_router(metrics_router)

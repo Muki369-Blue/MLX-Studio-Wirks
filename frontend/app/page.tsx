@@ -11,6 +11,8 @@ import AnalyticsPanel from "./components/AnalyticsPanel";
 import ContentSetPanel from "./components/ContentSetPanel";
 import ShadowVidPanel from "./components/ShadowVidPanel";
 import AnimatedPreview from "./components/AnimatedPreview";
+import MissionControlPanel from "./components/MissionControlPanel";
+import ReviewInboxPanel from "./components/ReviewInboxPanel";
 import {
   API,
   fetchPersonas,
@@ -41,6 +43,8 @@ const TABS = [
   { id: "schedule", label: "Calendar", icon: "📅" },
   { id: "chat", label: "Fan Chat", icon: "💬" },
   { id: "analytics", label: "Analytics", icon: "📊" },
+  { id: "mission", label: "Mission", icon: "🎯" },
+  { id: "review", label: "Review", icon: "✅" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -553,6 +557,12 @@ export default function Dashboard() {
         {/* ─── Analytics Tab ─── */}
         <div className={tab === "analytics" ? "" : "hidden"}>
           <AnalyticsPanel personas={personas} />
+        </div>
+        <div className={tab === "mission" ? "" : "hidden"}>
+          <MissionControlPanel personas={personas} />
+        </div>
+        <div className={tab === "review" ? "" : "hidden"}>
+          <ReviewInboxPanel personas={personas} />
         </div>
     </div>
   );

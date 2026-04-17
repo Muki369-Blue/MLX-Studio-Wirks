@@ -259,6 +259,177 @@ class EventLog(Base):
 Index("ix_event_log_subject", EventLog.subject_type, EventLog.subject_id)
 
 
+# ── Phase 2: Campaign + Orchestration ───────────────────────────────
+
+class Campaign(Base):
+    """Multi-day content campaign spanning multiple tasks."""
+    __tablename__ = "campaigns"
+
+    id = Column(Integer, primary_key=True, index=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    status = Column(String, default="draft")  # draft | active | paused | completed | cancelled
+    total_days = Column(Integer, default=4)
+    current_day = Column(Integer, default=0)
+    config = Column(JSON, nullable=True)  # campaign-level settings (slots/day, escalation, etc)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    persona = relationship("Persona")
+    tasks = relationship("CampaignTask", back_populates="campaign", cascade="all, delete-orphan")
+
+
+class CampaignTask(Base):
+    """One task within a campaign (e.g. generate image, generate video, post)."""
+    __tablename__ = "campaign_tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    day = Column(Integer, nullable=False)  # which campaign day (1-based)
+    task_type = Column(String, nullable=False)  # image | video | caption | post | score | plan
+    status = Column(String, default="pending")  # pending | queued | running | completed | failed | skipped
+    config = Column(JSON, nullable=True)  # task-specific params (prompt, platform, etc)
+    job_id = Column(Integer, ForeignKey("generation_jobs.id"), nullable=True)
+    depends_on = Column(JSON, nullable=True)  # list of task IDs that must complete first
+    scheduled_at = Column(DateTime, nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    campaign = relationship("Campaign", back_populates="tasks")
+    job = relationship("GenerationJob")
+
+
+# ── Phase 3: Persona Memory + Agents ────────────────────────────────
+
+class PersonaMemory(Base):
+    """Structured memory for a persona — canonical, operational, learned."""
+    __tablename__ = "persona_memory"
+
+    id = Column(Integer, primary_key=True, index=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=False, index=True)
+    partition = Column(String, nullable=False)  # canonical | operational | learned
+    key = Column(String, nullable=False)  # memory key (e.g. "top_scenes", "audience_prefs")
+    value = Column(JSON, nullable=False)
+    source = Column(String, nullable=True)  # agent:analyst | user | system
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    persona = relationship("Persona")
+
+
+Index("ix_persona_memory_lookup", PersonaMemory.persona_id, PersonaMemory.partition, PersonaMemory.key, unique=True)
+
+
+class AgentRun(Base):
+    """Audit trail for every agent invocation."""
+    __tablename__ = "agent_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agent_type = Column(String, nullable=False, index=True)  # planner | creative | analyst | scorer
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=True)
+    input_payload = Column(JSON, nullable=True)
+    output_payload = Column(JSON, nullable=True)
+    model_used = Column(String, nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    status = Column(String, default="running")  # running | completed | failed
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    finished_at = Column(DateTime, nullable=True)
+
+
+# ── Phase 4: Extended Analytics ──────────────────────────────────────
+
+class ContentMetrics(Base):
+    """Per-content performance metrics (post-level analytics)."""
+    __tablename__ = "content_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content_id = Column(Integer, ForeignKey("contents.id"), nullable=False, index=True)
+    platform = Column(String, nullable=False)
+    views = Column(Integer, default=0)
+    likes = Column(Integer, default=0)
+    comments = Column(Integer, default=0)
+    tips = Column(Float, default=0.0)
+    unlocks = Column(Integer, default=0)
+    saves = Column(Integer, default=0)
+    collected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class PersonaMetricsDaily(Base):
+    """Daily aggregated metrics per persona."""
+    __tablename__ = "persona_metrics_daily"
+
+    id = Column(Integer, primary_key=True, index=True)
+    persona_id = Column(Integer, ForeignKey("personas.id"), nullable=False)
+    date = Column(DateTime, nullable=False)
+    platform = Column(String, nullable=False)
+    new_subscribers = Column(Integer, default=0)
+    churned_subscribers = Column(Integer, default=0)
+    revenue = Column(Float, default=0.0)
+    tips = Column(Float, default=0.0)
+    messages_received = Column(Integer, default=0)
+    messages_sent = Column(Integer, default=0)
+    content_posted = Column(Integer, default=0)
+    avg_engagement_rate = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+Index("ix_persona_metrics_daily_lookup", PersonaMetricsDaily.persona_id, PersonaMetricsDaily.date, PersonaMetricsDaily.platform, unique=True)
+
+
+class CampaignMetrics(Base):
+    """Aggregated metrics per campaign."""
+    __tablename__ = "campaign_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    day = Column(Integer, nullable=False)
+    content_produced = Column(Integer, default=0)
+    content_approved = Column(Integer, default=0)
+    content_rejected = Column(Integer, default=0)
+    content_posted = Column(Integer, default=0)
+    revenue_attributed = Column(Float, default=0.0)
+    new_subscribers = Column(Integer, default=0)
+    total_engagement = Column(Integer, default=0)
+    collected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class CaptionMetrics(Base):
+    """A/B test and performance tracking for captions."""
+    __tablename__ = "caption_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content_id = Column(Integer, ForeignKey("contents.id"), nullable=False, index=True)
+    platform = Column(String, nullable=False)
+    caption_text = Column(Text, nullable=False)
+    hashtags = Column(Text, nullable=True)
+    variant = Column(String, default="A")  # A | B for A/B testing
+    impressions = Column(Integer, default=0)
+    clicks = Column(Integer, default=0)
+    engagement_rate = Column(Float, default=0.0)
+    collected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class GenerationCostMetrics(Base):
+    """Track compute cost per generation for budgeting."""
+    __tablename__ = "generation_cost_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("generation_jobs.id"), nullable=False, index=True)
+    machine = Column(String, nullable=False)  # mac | shadowwirk
+    job_type = Column(String, nullable=False)  # image | video
+    duration_seconds = Column(Float, nullable=True)
+    estimated_cost_usd = Column(Float, default=0.0)
+    model_used = Column(String, nullable=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 def _migrate_persona_id_nullable():
     """SQLite: recreate contents table to make persona_id nullable if needed."""
     import sqlite3

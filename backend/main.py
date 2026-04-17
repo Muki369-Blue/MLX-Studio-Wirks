@@ -68,6 +68,26 @@ except ImportError:
     from postprocess import process_completed_image, check_upscale_status
     from services import jobs as jobs_service
 
+# ─── New routers (Phase 2+) ──────────────────────────────────────────
+try:
+    from .api.jobs import router as jobs_router
+    from .api.campaigns import router as campaigns_router
+    from .api.memory import router as memory_router
+    from .api.agents import router as agents_router
+    from .api.review import router as review_router
+    from .services import shadowwirk as sw_service
+    from .services import llm as llm_service
+    from .workers.queue import start_worker, stop_worker
+except ImportError:
+    from api.jobs import router as jobs_router
+    from api.campaigns import router as campaigns_router
+    from api.memory import router as memory_router
+    from api.agents import router as agents_router
+    from api.review import router as review_router
+    from services import shadowwirk as sw_service
+    from services import llm as llm_service
+    from workers.queue import start_worker, stop_worker
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -159,11 +179,13 @@ async def lifespan(app: FastAPI):
     logger.info("ComfyUI status: %s", "ready" if comfy_ok else "NOT available")
     if comfy_ok:
         comfy_api.start_progress_listener()
-    _start_shadow_ping()
+    sw_service.start_ping()
     start_scheduler()
-    logger.info("Content scheduler started.")
+    start_worker()
+    logger.info("Content scheduler + job worker started.")
     yield
     stop_scheduler()
+    stop_worker()
     comfy_api._shutdown_comfyui()
 
 
@@ -176,6 +198,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Mount Phase 2+ routers ─────────────────────────────────────────
+app.include_router(jobs_router)
+app.include_router(campaigns_router)
+app.include_router(memory_router)
+app.include_router(agents_router)
+app.include_router(review_router)
 
 
 # ─── Shadow-Wirk status cache (background ping) ─────────────────────
@@ -208,12 +237,11 @@ def _start_shadow_ping():
 
 @app.get("/health")
 def health(skip_shadow: bool = False):
-    with _shadow_lock:
-        shadow_wirks = _shadow_status["online"] if not skip_shadow else False
+    shadow_online = sw_service.is_online() if not skip_shadow else False
     return {
         "api": "ok",
         "comfyui": comfy_api.is_comfy_running(),
-        "shadow_wirks": shadow_wirks,
+        "shadow_wirks": shadow_online,
     }
 
 

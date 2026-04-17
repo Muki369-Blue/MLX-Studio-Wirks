@@ -30,10 +30,12 @@ def _next_run(cron_expr: str, base: datetime | None = None) -> datetime:
 def _scheduler_loop():
     """Main scheduler loop — runs in background thread."""
     try:
-        from .database import SessionLocal, Schedule, Persona, Content
+        from .database import SessionLocal, Schedule, Persona, Content, Campaign, CampaignTask
+        from .services import orchestrator
         from . import comfy_api
     except ImportError:
-        from database import SessionLocal, Schedule, Persona, Content
+        from database import SessionLocal, Schedule, Persona, Content, Campaign, CampaignTask
+        from services import orchestrator
         import comfy_api
 
     logger.info("Scheduler started")
@@ -86,6 +88,36 @@ def _scheduler_loop():
             db.close()
         except Exception as e:
             logger.error("Scheduler error: %s", e)
+
+        # ── Campaign advancement ────────────────────────────────────
+        try:
+            db = SessionLocal()
+            active_campaigns = (
+                db.query(Campaign).filter(Campaign.status == "active").all()
+            )
+            for campaign in active_campaigns:
+                # Check if all tasks for current day are completed
+                day_tasks = (
+                    db.query(CampaignTask)
+                    .filter(
+                        CampaignTask.campaign_id == campaign.id,
+                        CampaignTask.day == campaign.current_day,
+                    )
+                    .all()
+                )
+                if day_tasks and all(
+                    t.status in ("completed", "skipped") for t in day_tasks
+                ):
+                    orchestrator._advance_day(db, campaign)
+                    db.commit()
+                    logger.info(
+                        "Campaign %s advanced to day %d",
+                        campaign.name,
+                        campaign.current_day,
+                    )
+            db.close()
+        except Exception as e:
+            logger.error("Campaign scheduler error: %s", e)
 
         _stop_event.wait(30)  # Check every 30 seconds
 

@@ -1172,3 +1172,139 @@ export async function reviewAction(
   if (!res.ok) throw new Error("Review action failed");
   return res.json();
 }
+
+// ─── Metrics ──────────────────────
+
+export interface ContentMetrics {
+  id: number;
+  content_id: number;
+  platform: string;
+  views: number;
+  likes: number;
+  comments: number;
+  tips: number;
+  unlocks: number;
+  saves: number;
+  collected_at: string;
+}
+
+export interface ContentMetricsSummary {
+  total_views: number;
+  total_likes: number;
+  total_comments: number;
+  total_tips: number;
+  total_unlocks: number;
+  count: number;
+}
+
+export interface PersonaMetricsDaily {
+  id: number;
+  persona_id: number;
+  date: string;
+  platform: string;
+  new_subscribers: number;
+  churned_subscribers: number;
+  revenue: number;
+  tips: number;
+  messages_received: number;
+  messages_sent: number;
+  content_posted: number;
+  avg_engagement_rate: number;
+}
+
+export interface PersonaMetricsSummary {
+  total_revenue: number;
+  total_tips: number;
+  net_subscribers: number;
+  total_content_posted: number;
+  days_tracked: number;
+}
+
+export interface CampaignMetricsEntry {
+  id: number;
+  campaign_id: number;
+  day: number;
+  content_produced: number;
+  content_approved: number;
+  content_rejected: number;
+  content_posted: number;
+  revenue_attributed: number;
+  new_subscribers: number;
+  total_engagement: number;
+  collected_at: string;
+}
+
+export interface CampaignMetricsSummary {
+  total_produced: number;
+  total_approved: number;
+  total_posted: number;
+  total_revenue: number;
+  days_tracked: number;
+}
+
+export interface GenerationCost {
+  id: number;
+  job_id: number | null;
+  machine: string;
+  job_type: string;
+  duration_seconds: number;
+  estimated_cost_usd: number;
+  model_used: string | null;
+  created_at: string;
+}
+
+export interface CostSummary {
+  total_cost_usd: number;
+  total_jobs: number;
+  avg_duration_seconds: number;
+  by_machine: Record<string, { count: number; cost: number }>;
+  by_type: Record<string, { count: number; cost: number }>;
+}
+
+export async function fetchContentMetrics(contentId: number): Promise<ContentMetrics[]> {
+  const res = await fetch(`${API}/metrics/content/${contentId}`);
+  return res.json();
+}
+
+export async function fetchContentMetricsSummary(platform?: string): Promise<ContentMetricsSummary> {
+  const params = platform ? `?platform=${platform}` : "";
+  const res = await fetch(`${API}/metrics/content-summary${params}`);
+  return res.json();
+}
+
+export async function fetchPersonaMetrics(personaId: number, opts?: { platform?: string; limit?: number }): Promise<PersonaMetricsDaily[]> {
+  const params = new URLSearchParams();
+  if (opts?.platform) params.set("platform", opts.platform);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/metrics/persona/${personaId}?${params}`);
+  return res.json();
+}
+
+export async function fetchPersonaMetricsSummary(personaId: number): Promise<PersonaMetricsSummary> {
+  const res = await fetch(`${API}/metrics/persona-summary/${personaId}`);
+  return res.json();
+}
+
+export async function fetchCampaignMetrics(campaignId: number): Promise<CampaignMetricsEntry[]> {
+  const res = await fetch(`${API}/metrics/campaign/${campaignId}`);
+  return res.json();
+}
+
+export async function fetchCampaignMetricsSummary(campaignId: number): Promise<CampaignMetricsSummary> {
+  const res = await fetch(`${API}/metrics/campaign-summary/${campaignId}`);
+  return res.json();
+}
+
+export async function fetchCostMetrics(opts?: { machine?: string; job_type?: string; limit?: number }): Promise<GenerationCost[]> {
+  const params = new URLSearchParams();
+  if (opts?.machine) params.set("machine", opts.machine);
+  if (opts?.job_type) params.set("job_type", opts.job_type);
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const res = await fetch(`${API}/metrics/cost?${params}`);
+  return res.json();
+}
+
+export async function fetchCostSummary(): Promise<CostSummary> {
+  const res = await fetch(`${API}/metrics/cost-summary`);
+  return res.json();
+}

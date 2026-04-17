@@ -24,6 +24,7 @@ try:
         get_db, init_db, SessionLocal,
         Persona, Content, ContentSet, Link,
         Schedule, PostQueue, ChatMessage, Analytics,
+        JobState, GenerationJob, GenerationRun,
     )
     from .schemas import (
         PersonaCreate, PersonaOut,
@@ -41,11 +42,13 @@ try:
     from . import comfy_api
     from .scheduler import start_scheduler, stop_scheduler
     from .postprocess import process_completed_image, check_upscale_status
+    from .services import jobs as jobs_service
 except ImportError:
     from database import (
         get_db, init_db, SessionLocal,
         Persona, Content, ContentSet, Link,
         Schedule, PostQueue, ChatMessage, Analytics,
+        JobState, GenerationJob, GenerationRun,
     )
     from schemas import (
         PersonaCreate, PersonaOut,
@@ -63,6 +66,7 @@ except ImportError:
     import comfy_api
     from scheduler import start_scheduler, stop_scheduler
     from postprocess import process_completed_image, check_upscale_status
+    from services import jobs as jobs_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -428,6 +432,20 @@ def generate_images(
             db.add(content)
             db.commit()
             db.refresh(content)
+            try:
+                job = jobs_service.create_job(
+                    db,
+                    job_type="image",
+                    persona_id=persona.id,
+                    content_id=content.id,
+                    payload={"prompt": full_prompt, "lora": lora, "negative_prompt": body.negative_prompt},
+                    machine="mac",
+                )
+                jobs_service.transition(db, job, JobState.FAILED, error=comfy_resp.get("error"))
+                db.commit()
+            except Exception as exc:
+                logger.warning("job mirror (image failed) skipped: %s", exc)
+                db.rollback()
             results.append(content)
             continue
 
@@ -440,6 +458,35 @@ def generate_images(
         db.add(content)
         db.commit()
         db.refresh(content)
+        try:
+            job = jobs_service.create_job(
+                db,
+                job_type="image",
+                persona_id=persona.id,
+                content_id=content.id,
+                payload={
+                    "prompt": full_prompt,
+                    "lora": lora,
+                    "negative_prompt": body.negative_prompt,
+                    "reference_image": ref_comfy_name,
+                    "comfy_prompt_id": comfy_resp.get("prompt_id"),
+                },
+                machine="mac",
+            )
+            jobs_service.transition(db, job, JobState.DISPATCHING)
+            jobs_service.transition(db, job, JobState.RUNNING)
+            jobs_service.record_run(
+                db, job,
+                prompt=full_prompt,
+                negative_prompt=body.negative_prompt,
+                loras=[{"name": lora, "strength": 1.0}] if lora else None,
+                backend="comfy",
+                machine="mac",
+            )
+            db.commit()
+        except Exception as exc:
+            logger.warning("job mirror (image queue) skipped: %s", exc)
+            db.rollback()
         results.append(content)
 
     return results
@@ -459,6 +506,15 @@ def list_generations(db: Session = Depends(get_db)):
                     content.file_path = job["outputs"][0].get("filename")
                 db.commit()
                 db.refresh(content)
+                try:
+                    gjob = jobs_service.job_for_content(db, content.id)
+                    if gjob:
+                        jobs_service.transition(db, gjob, JobState.POSTPROCESSING)
+                        jobs_service.transition(db, gjob, JobState.NEEDS_REVIEW)
+                        db.commit()
+                except Exception as exc:
+                    logger.warning("job mirror (image complete) skipped: %s", exc)
+                    db.rollback()
                 any_just_completed = True
                 # Auto post-process (upscale + watermark) in background
                 threading.Thread(
@@ -470,6 +526,14 @@ def list_generations(db: Session = Depends(get_db)):
                 content.status = "failed"
                 db.commit()
                 db.refresh(content)
+                try:
+                    gjob = jobs_service.job_for_content(db, content.id)
+                    if gjob:
+                        jobs_service.transition(db, gjob, JobState.FAILED, error="comfy reported error")
+                        db.commit()
+                except Exception as exc:
+                    logger.warning("job mirror (image failed) skipped: %s", exc)
+                    db.rollback()
                 any_just_completed = True
         elif content.status == "upscaling":
             check_upscale_status(content.id)
@@ -501,6 +565,15 @@ def check_generation(content_id: int, db: Session = Depends(get_db)):
             _save_output_locally(content, job["outputs"][0], db)
         db.commit()
         db.refresh(content)
+        try:
+            gjob = jobs_service.job_for_content(db, content.id)
+            if gjob:
+                jobs_service.transition(db, gjob, JobState.POSTPROCESSING)
+                jobs_service.transition(db, gjob, JobState.NEEDS_REVIEW)
+                db.commit()
+        except Exception as exc:
+            logger.warning("job mirror (image status) skipped: %s", exc)
+            db.rollback()
 
     return {"status": content.status, "outputs": job.get("outputs", [])}
 
@@ -2375,6 +2448,44 @@ def generate_video(
     db.commit()
     db.refresh(content)
 
+    try:
+        vjob = jobs_service.create_job(
+            db,
+            job_type="video",
+            persona_id=persona_id if persona_id else None,
+            content_id=content.id,
+            payload={
+                "prompt": full_prompt,
+                "negative_prompt": body.negative_prompt,
+                "start_image": body.start_image,
+                "width": body.width,
+                "height": body.height,
+                "length": body.length,
+                "steps": body.steps,
+                "cfg": body.cfg,
+                "lora_name": body.lora_name,
+                "comfy_prompt_id": prompt_id,
+                "mode": "i2v" if body.start_image else "t2v",
+            },
+            machine="mac",
+        )
+        jobs_service.transition(db, vjob, JobState.DISPATCHING)
+        jobs_service.transition(db, vjob, JobState.RUNNING)
+        jobs_service.record_run(
+            db, vjob,
+            prompt=full_prompt,
+            negative_prompt=body.negative_prompt,
+            loras=[{"name": body.lora_name, "strength": 1.0}] if body.lora_name else None,
+            backend="comfy",
+            width=body.width,
+            height=body.height,
+            machine="mac",
+        )
+        db.commit()
+    except Exception as exc:
+        logger.warning("job mirror (video queue) skipped: %s", exc)
+        db.rollback()
+
     return {
         "id": content.id,
         "prompt_id": prompt_id,
@@ -2433,10 +2544,27 @@ def get_video_status(content_id: int, db: Session = Depends(get_db)):
         _save_output_locally(content, first_output, db)
         _save_video_to_vault(content, first_output, db)
         result["progress"] = 100
+        try:
+            vjob = jobs_service.job_for_content(db, content.id)
+            if vjob:
+                jobs_service.transition(db, vjob, JobState.POSTPROCESSING)
+                jobs_service.transition(db, vjob, JobState.NEEDS_REVIEW)
+                db.commit()
+        except Exception as exc:
+            logger.warning("job mirror (video complete) skipped: %s", exc)
+            db.rollback()
     elif result["status"] == "error":
         content.status = "failed"
         db.commit()
         result["progress"] = 0
+        try:
+            vjob = jobs_service.job_for_content(db, content.id)
+            if vjob:
+                jobs_service.transition(db, vjob, JobState.FAILED, error="comfy reported error")
+                db.commit()
+        except Exception as exc:
+            logger.warning("job mirror (video failed) skipped: %s", exc)
+            db.rollback()
     else:
         # Use WebSocket progress if available, otherwise estimate from elapsed time
         if progress_pct > 0:

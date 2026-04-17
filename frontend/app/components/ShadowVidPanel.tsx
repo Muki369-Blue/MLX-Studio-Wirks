@@ -66,12 +66,15 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     fetchVideoLoras(SHADOW_WIRKS_URL).then(setVideoLoras);
   }, []);
 
-  // Poll for video completion
+  // Poll for video completion (with error circuit-breaker)
   useEffect(() => {
     if (!contentId || videoStatus === "completed" || videoStatus === "error" || videoStatus === "failed") return;
+    let errorCount = 0;
+    const MAX_ERRORS = 10; // ~20s of consecutive failures → give up
     const interval = setInterval(async () => {
       try {
         const result = await checkVideoStatusRemote(SHADOW_WIRKS_URL, contentId);
+        errorCount = 0; // reset on success
         setVideoStatus(result.status);
         if (result.progress !== undefined) setVideoProgress(result.progress);
         if (result.status === "completed" && result.outputs?.length) {
@@ -95,11 +98,30 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
           clearInterval(interval);
         }
       } catch {
-        // keep polling
+        errorCount++;
+        if (errorCount >= MAX_ERRORS) {
+          setGeneratingVideo(false);
+          setVideoProgress(0);
+          setVideoStatus(null);
+          setContentId(null);
+          setVideoResult("Shadow-Wirk unreachable — generation status unknown. Ready for next gen.");
+          clearInterval(interval);
+        }
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [contentId, videoStatus, useShadow]);
+  }, [contentId, videoStatus]);
+
+  // Reset generation state when Shadow-Wirk goes offline
+  useEffect(() => {
+    if (!shadowOnline && generatingVideo) {
+      setGeneratingVideo(false);
+      setVideoProgress(0);
+      setVideoStatus(null);
+      setContentId(null);
+      setVideoResult("Shadow-Wirk went offline — generation interrupted. Ready for next gen.");
+    }
+  }, [shadowOnline]);
 
   const handleSelectVideoPreset = (presetId: string) => {
     const preset = videoPresets.find((item) => item.id === presetId);

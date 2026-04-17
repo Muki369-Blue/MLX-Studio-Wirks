@@ -239,6 +239,40 @@ def retry_generation(content_id: int, db: Session = Depends(get_db)):
     return {"status": "generating", "comfy_job_id": content.comfy_job_id}
 
 
+# ── Cancel / Stop ───────────────────────────────────────────────────
+
+@router.post("/generations/cancel-active")
+def cancel_active_generations(db: Session = Depends(get_db)):
+    """Interrupt ComfyUI, clear its queue, mark active DB rows failed, and free memory."""
+    interrupted = comfy_api.interrupt()
+    cleared = comfy_api.clear_queue()
+
+    active = db.query(Content).filter(Content.status.in_(["generating", "pending"])).all()
+    cancelled_ids = []
+    for content in active:
+        content.status = "failed"
+        cancelled_ids.append(content.id)
+        try:
+            gjob = jobs_service.job_for_content(db, content.id)
+            if gjob and not jobs_service.is_terminal(gjob):
+                jobs_service.transition(db, gjob, JobState.CANCELLED, actor="user", note="stopped by user")
+        except Exception:
+            pass
+    db.commit()
+
+    # Free GPU memory and unload models after cancel
+    freed = comfy_api.free_memory(unload_models=True)
+    threading.Thread(target=_deferred_memory_cleanup, args=(2.0,), daemon=True).start()
+
+    logger.info("Cancel-active: interrupted=%s cleared=%s cancelled=%s freed=%s", interrupted, cleared, cancelled_ids, freed)
+    return {
+        "interrupted": interrupted,
+        "queue_cleared": cleared,
+        "cancelled_content_ids": cancelled_ids,
+        "memory_freed": freed,
+    }
+
+
 # ── Image Proxy / Download ──────────────────────────────────────────
 
 @router.get("/images/{filename:path}")

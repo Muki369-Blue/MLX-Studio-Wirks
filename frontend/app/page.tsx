@@ -18,6 +18,7 @@ import PersonaMemoryPanel from "./components/PersonaMemoryPanel";
 import MetricsPanel from "./components/MetricsPanel";
 import {
   API,
+  SHADOW_WIRKS_URL,
   fetchPersonas,
   fetchLinks,
   fetchHealth,
@@ -67,6 +68,28 @@ export default function Dashboard() {
   const [playingPreview, setPlayingPreview] = useState<number | null>(null);
   const [voiceMoods, setVoiceMoods] = useState<Record<number, VoiceMood>>({});
   const [lightbox, setLightbox] = useState<{ src: string; prompt: string } | null>(null);
+  const [shadowPing, setShadowPing] = useState<{ latency: number; comfyui: boolean } | null>(null);
+  const [shadowPinging, setShadowPinging] = useState(false);
+  const [showShadowPanel, setShowShadowPanel] = useState(false);
+
+  const pingShadow = useCallback(async () => {
+    setShadowPinging(true);
+    try {
+      const t0 = performance.now();
+      const res = await fetch(`${SHADOW_WIRKS_URL}/health`, { signal: AbortSignal.timeout(8000) });
+      const latency = Math.round(performance.now() - t0);
+      if (res.ok) {
+        const data = await res.json();
+        setShadowPing({ latency, comfyui: data.comfyui ?? false });
+      } else {
+        setShadowPing(null);
+      }
+    } catch {
+      setShadowPing(null);
+    } finally {
+      setShadowPinging(false);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -160,13 +183,71 @@ export default function Dashboard() {
             />
             <span className="text-zinc-400">ComfyUI</span>
           </div>
-          <div className="flex items-center gap-1.5 text-xs">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                health?.shadow_wirks ? "bg-emerald-400" : "bg-zinc-600"
-              }`}
-            />
-            <span className="text-zinc-400">Shadow-Wirk</span>
+          <div className="flex items-center gap-1.5 text-xs relative">
+            <button
+              onClick={() => { setShowShadowPanel((v) => !v); if (!shadowPing && !shadowPinging) pingShadow(); }}
+              className="flex items-center gap-1.5 hover:opacity-80 transition-opacity"
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  health?.shadow_wirks ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.5)]" : "bg-zinc-600"
+                }`}
+              />
+              <span className="text-zinc-400">Shadow-Wirk</span>
+            </button>
+            {showShadowPanel && (
+              <div className="absolute top-7 right-0 z-50 bg-zinc-900 border border-zinc-700 rounded-lg p-3 shadow-xl min-w-[240px]">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-semibold text-zinc-200">Shadow-Wirk GPU</span>
+                  <button onClick={() => setShowShadowPanel(false)} className="text-zinc-500 hover:text-zinc-300 text-xs">✕</button>
+                </div>
+                <div className="text-[11px] space-y-1.5">
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Status</span>
+                    <span className={health?.shadow_wirks ? "text-emerald-400" : "text-red-400"}>
+                      {health?.shadow_wirks ? "● Connected" : "● Offline"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">Host</span>
+                    <span className="text-zinc-300 font-mono">100.119.54.18</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">GPU</span>
+                    <span className="text-zinc-300">RTX A4500 20GB</span>
+                  </div>
+                  {shadowPing && (
+                    <>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">Latency</span>
+                        <span className={shadowPing.latency < 200 ? "text-emerald-400" : shadowPing.latency < 500 ? "text-yellow-400" : "text-red-400"}>
+                          {shadowPing.latency}ms
+                        </span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-zinc-500">ComfyUI</span>
+                        <span className={shadowPing.comfyui ? "text-emerald-400" : "text-red-400"}>
+                          {shadowPing.comfyui ? "● Running" : "● Down"}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                  {shadowPinging && (
+                    <div className="text-center text-zinc-500 animate-pulse">Pinging...</div>
+                  )}
+                  {!shadowPing && !shadowPinging && !health?.shadow_wirks && (
+                    <div className="text-center text-zinc-500">Unreachable via Tailscale</div>
+                  )}
+                </div>
+                <button
+                  onClick={pingShadow}
+                  disabled={shadowPinging}
+                  className="mt-2 w-full text-[10px] py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50 transition-colors"
+                >
+                  {shadowPinging ? "Pinging..." : "🔄 Ping Again"}
+                </button>
+              </div>
+            )}
           </div>
           <button
             className="text-[10px] text-zinc-500 hover:text-orange-300 bg-zinc-800/50 hover:bg-orange-900/30 px-2 py-1 rounded transition-colors"

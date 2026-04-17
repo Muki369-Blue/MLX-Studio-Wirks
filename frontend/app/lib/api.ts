@@ -915,6 +915,12 @@ export async function cancelJob(id: number, reason?: string): Promise<Job> {
   return res.json();
 }
 
+export async function cancelActiveGenerations(): Promise<{ interrupted: boolean; queue_cleared: boolean; cancelled_content_ids: number[] }> {
+  const res = await fetch(`${API}/generations/cancel-active`, { method: "POST" });
+  if (!res.ok) throw new Error("Cancel active failed");
+  return res.json();
+}
+
 export async function fetchJobEvents(id: number): Promise<EventLogEntry[]> {
   const res = await fetch(`${API}/jobs/${id}/events`);
   return res.json();

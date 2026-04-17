@@ -6,18 +6,15 @@ import {
   composeVideoPrompt,
   fetchVideoPresets,
   fetchVideoLoras,
-  generateVideo,
   generateVideoRemote,
   refineVideoPrompt,
-  uploadVideoStartImage,
   uploadVideoStartImageRemote,
-  checkVideoStatus,
   checkVideoStatusRemote,
   syncRemoteVideo,
+  cancelActiveGenerations,
   SHADOW_WIRKS_URL,
   type Persona,
   type VideoPreset,
-  API,
 } from "../lib/api";
 
 export default function ShadowVidPanel({ personas, shadowOnline }: { personas: Persona[]; shadowOnline: boolean }) {
@@ -26,7 +23,8 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const [videoPresets, setVideoPresets] = useState<VideoPreset[]>([]);
   const [generatingVideo, setGeneratingVideo] = useState(false);
   const [videoResult, setVideoResult] = useState<string | null>(null);
-  const [useShadow, setUseShadow] = useState(shadowOnline);
+  // Video generation is Shadow-Wirk only (Mac has no compatible Wan models)
+  const useShadow = true;
   const [refiningVideo, setRefiningVideo] = useState(false);
   const [videoIntensity, setVideoIntensity] = useState<"light" | "medium" | "heavy">("medium");
 
@@ -55,34 +53,25 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
   const [videoStatus, setVideoStatus] = useState<string | null>(null);
   const [videoProgress, setVideoProgress] = useState(0);
   const [videoOutputs, setVideoOutputs] = useState<any[]>([]);
+  const [stopping, setStopping] = useState(false);
 
   useEffect(() => {
     fetchVideoPresets().then(setVideoPresets);
   }, []);
 
-  // Auto-enable Shadow-Wirk on initial mount only (Mac has no Wan models)
-  const shadowInitRef = useRef(false);
-  useEffect(() => {
-    if (shadowOnline && !shadowInitRef.current) {
-      shadowInitRef.current = true;
-      setUseShadow(true);
-    }
-  }, [shadowOnline]);
 
-  // Fetch LoRAs from the active ComfyUI target
+
+  // Fetch LoRAs from Shadow-Wirk
   useEffect(() => {
-    const base = useShadow ? SHADOW_WIRKS_URL : API;
-    fetchVideoLoras(base).then(setVideoLoras);
-  }, [useShadow]);
+    fetchVideoLoras(SHADOW_WIRKS_URL).then(setVideoLoras);
+  }, []);
 
   // Poll for video completion
   useEffect(() => {
     if (!contentId || videoStatus === "completed" || videoStatus === "error" || videoStatus === "failed") return;
     const interval = setInterval(async () => {
       try {
-        const result = useShadow
-          ? await checkVideoStatusRemote(SHADOW_WIRKS_URL, contentId)
-          : await checkVideoStatus(contentId);
+        const result = await checkVideoStatusRemote(SHADOW_WIRKS_URL, contentId);
         setVideoStatus(result.status);
         if (result.progress !== undefined) setVideoProgress(result.progress);
         if (result.status === "completed" && result.outputs?.length) {
@@ -92,14 +81,12 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
           setVideoResult("Video generation complete!");
           clearInterval(interval);
           // Auto-sync Shadow-Wirk video to Mac vault
-          if (useShadow) {
-            try {
-              const sync = await syncRemoteVideo(contentId);
-              setVideoResult(`Video synced to Mac vault! (local #${sync.id})`);
-            } catch (e: any) {
-              console.warn("Auto-sync failed:", e.message);
-              setVideoResult("Video complete on Shadow-Wirk (sync to Mac failed — retry from vault)");
-            }
+          try {
+            const sync = await syncRemoteVideo(contentId);
+            setVideoResult(`Video synced to Mac vault! (local #${sync.id})`);
+          } catch (e: any) {
+            console.warn("Auto-sync failed:", e.message);
+            setVideoResult("Video complete on Shadow-Wirk (sync to Mac failed — retry from vault)");
           }
         } else if (result.status === "failed") {
           setGeneratingVideo(false);
@@ -148,9 +135,7 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
     // Upload to ComfyUI immediately
     setUploadingImage(true);
     try {
-      const result = useShadow
-        ? await uploadVideoStartImageRemote(SHADOW_WIRKS_URL, file)
-        : await uploadVideoStartImage(file);
+      const result = await uploadVideoStartImageRemote(SHADOW_WIRKS_URL, file);
       setComfyImageName(result.comfy_image_name);
     } catch (error) {
       setVideoResult(error instanceof Error ? error.message : "Failed to upload image");
@@ -192,16 +177,39 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
         start_image: mode === "i2v" ? comfyImageName ?? undefined : undefined,
         lora_name: selectedLora || undefined,
       };
-      const res = useShadow
-        ? await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, videoPrompt, videoOpts)
-        : await generateVideo(videoPersona, videoPrompt, videoOpts);
+      const res = await generateVideoRemote(SHADOW_WIRKS_URL, videoPersona, videoPrompt, videoOpts);
       setContentId(res.id);
       setVideoStatus("processing");
-      const target = useShadow ? " on Shadow-Wirk" : "";
-      setVideoResult(`Video queued${target} (${res.mode === "i2v" ? "Image→Video" : "Text→Video"}) — polling...`);
+      setVideoResult(`Video queued on Shadow-Wirk (${res.mode === "i2v" ? "Image→Video" : "Text→Video"}) — polling...`);
     } catch (error) {
       setVideoResult(error instanceof Error ? error.message : "Failed to generate video.");
       setGeneratingVideo(false);
+    }
+  };
+
+  const handleStopVideo = async () => {
+    setStopping(true);
+    setVideoResult(null);
+    try {
+      // Cancel on Shadow-Wirk + local DB
+      const res = await fetch(`${SHADOW_WIRKS_URL}/generations/cancel-active`, { method: "POST" });
+      if (!res.ok) throw new Error("Cancel failed");
+      const data = await res.json();
+      try { await cancelActiveGenerations(); } catch {}
+      const n = data.cancelled_content_ids?.length ?? 0;
+      setVideoResult(
+        n > 0
+          ? `Stopped ${n} generation(s) — GPU interrupted & memory freed`
+          : "GPU interrupted & queue cleared — no active DB rows"
+      );
+      setGeneratingVideo(false);
+      setVideoProgress(0);
+      setVideoStatus(null);
+      setContentId(null);
+    } catch {
+      setVideoResult("Error: Could not stop video generation");
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -219,22 +227,12 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
         </h2>
         <div className="flex items-center justify-between mb-3">
           <p className="text-xs text-zinc-500">
-            Video generation powered by Wan 2.1 via {useShadow ? "Shadow-Wirk GPU" : "local ComfyUI"}.
+            Video generation powered by Wan 2.1 via Shadow-Wirk GPU.
           </p>
-          <button
-            onClick={() => setUseShadow(!useShadow)}
-            title={useShadow ? "Switch to local ComfyUI" : "Switch to Shadow-Wirk GPU"}
-            className={`flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
-              useShadow
-                ? "bg-emerald-600/20 text-emerald-300 border-emerald-500"
-                : "bg-zinc-800 text-zinc-400 border-zinc-700 hover:border-zinc-500"
-            }`}
-          >
-            <span className={`w-1.5 h-1.5 rounded-full ${
-              useShadow ? "bg-emerald-400" : shadowOnline ? "bg-zinc-500" : "bg-zinc-700"
-            }`} />
-            Shadow-Wirk
-          </button>
+          <span className="flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full border bg-emerald-600/20 text-emerald-300 border-emerald-500">
+            <span className={`w-1.5 h-1.5 rounded-full ${shadowOnline ? "bg-emerald-400" : "bg-red-400"}`} />
+            Shadow-Wirk {shadowOnline ? "" : "(offline)"}
+          </span>
         </div>
 
         <div className="space-y-3">
@@ -431,16 +429,30 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
             </div>
           )}
 
-          {/* Generate button */}
-          <button
-            onClick={handleGenerateVideo}
-            disabled={generatingVideo || !videoPrompt.trim() || (mode === "t2v" && !videoPersona) || (mode === "i2v" && !comfyImageName)}
-            className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
-          >
-            {generatingVideo
-              ? `Generating ${mode === "i2v" ? "I2V" : "T2V"}...`
-              : `Generate ${mode === "i2v" ? "Image→Video" : "Text→Video"}`}
-          </button>
+          {/* Generate + Stop buttons */}
+          <div className="flex gap-2">
+            <button
+              onClick={handleGenerateVideo}
+              disabled={generatingVideo || stopping || !videoPrompt.trim() || (mode === "t2v" && !videoPersona) || (mode === "i2v" && !comfyImageName)}
+              className="flex-1 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-700 hover:to-violet-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
+            >
+              {generatingVideo
+                ? `Generating ${mode === "i2v" ? "I2V" : "T2V"}...`
+                : `Generate ${mode === "i2v" ? "Image→Video" : "Text→Video"}`}
+            </button>
+            <button
+              onClick={handleStopVideo}
+              disabled={stopping}
+              className="bg-red-600 hover:bg-red-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all flex items-center gap-1.5"
+            >
+              {stopping ? (
+                <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <span>◼</span>
+              )}
+              Stop
+            </button>
+          </div>
 
           {/* Progress bar */}
           {generatingVideo && (
@@ -480,10 +492,10 @@ export default function ShadowVidPanel({ personas, shadowOnline }: { personas: P
 
           {/* Video output display */}
           {videoOutputs.length > 0 && (() => {
-            const videoBase = useShadow ? SHADOW_WIRKS_URL : API;
+            const videoBase = SHADOW_WIRKS_URL;
             return (
             <div className="border border-zinc-700 rounded-lg p-3">
-              <label className="text-xs text-zinc-500 block mb-2">Output{useShadow ? " (from Shadow-Wirk)" : ""}</label>
+              <label className="text-xs text-zinc-500 block mb-2">Output (from Shadow-Wirk)</label>
               {videoOutputs.map((out, i) => {
                 const src = `${videoBase}/images/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`;
                 const downloadUrl = `${videoBase}/download/${encodeURIComponent(out.filename)}?subfolder=${encodeURIComponent(out.subfolder || "")}`;

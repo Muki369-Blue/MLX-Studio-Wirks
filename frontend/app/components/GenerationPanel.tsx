@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import {
   triggerGeneration,
+  cancelActiveGenerations,
   fetchScenePresets,
   fetchNegativePromptPresets,
   fetchLoras,
@@ -42,6 +43,7 @@ export default function GenerationPanel({ personas, onGenerated }: Props) {
   const [showLoras, setShowLoras] = useState(false);
   const [showPresets, setShowPresets] = useState(false);
   const [showRefiner, setShowRefiner] = useState(false);
+  const [stopping, setStopping] = useState(false);
 
   useEffect(() => {
     fetchScenePresets().then(setPresets);
@@ -100,6 +102,26 @@ export default function GenerationPanel({ personas, onGenerated }: Props) {
       setResult("Error: Could not reach backend");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleStop = async () => {
+    setStopping(true);
+    setResult(null);
+    try {
+      const res = await cancelActiveGenerations();
+      const n = res.cancelled_content_ids.length;
+      setResult(
+        n > 0
+          ? `Stopped ${n} generation(s) — ComfyUI interrupted`
+          : "ComfyUI interrupted — no active DB generations found"
+      );
+      setLoading(false);
+      onGenerated();
+    } catch {
+      setResult("Error: Could not stop generations");
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -390,13 +412,27 @@ export default function GenerationPanel({ personas, onGenerated }: Props) {
             <span className="text-xs text-zinc-500">images</span>
           </div>
 
-          <button
-            onClick={handleGenerate}
-            disabled={loading || !selectedId || !promptExtra.trim()}
-            className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
-          >
-            {loading ? "Sending to Flux..." : "Generate"}
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={handleGenerate}
+              disabled={loading || stopping || !selectedId || !promptExtra.trim()}
+              className="flex-1 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all"
+            >
+              {loading ? "Sending to Flux..." : "Generate"}
+            </button>
+            <button
+              onClick={handleStop}
+              disabled={stopping}
+              className="bg-red-600 hover:bg-red-700 disabled:opacity-40 px-4 py-2.5 rounded-lg font-semibold text-sm transition-all flex items-center gap-1.5"
+            >
+              {stopping ? (
+                <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <span>◼</span>
+              )}
+              Stop
+            </button>
+          </div>
 
           {result && (
             <p className="text-sm text-emerald-400 bg-emerald-900/20 p-2 rounded">

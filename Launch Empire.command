@@ -46,9 +46,9 @@ EOF
 echo "⏳ Waiting for services to warm up..."
 
 # Poll the backend until it responds so we don't open the browser before the
-# API can serve /scene-presets, /video-presets, etc.
+# API is ready to serve requests.
 for i in {1..30}; do
-    if curl -s "http://localhost:${BACKEND_PORT}/video-presets" >/dev/null 2>&1; then
+    if curl -s "http://localhost:${BACKEND_PORT}/health" >/dev/null 2>&1; then
         echo "✓ Backend responding on :${BACKEND_PORT}"
         break
     fi

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "MLX-Moxy-Wirks Page Assist",
-  "version": "0.6.0",
-  "description": "Send page selections from Chromium into the local MLX-Moxy-Wirks inbox (Moxy).",
+  "name": "MoxyTalks",
+  "version": "0.7.0",
+  "description": "MoxyTalks — send page selections into Moxy running locally in MLX-Moxy-Wirks.",
   "permissions": [
     "activeTab",
     "contextMenus",
@@ -23,7 +23,7 @@
     "default_path": "sidepanel.html"
   },
   "action": {
-    "default_title": "Open MLX-Moxy-Wirks Side Panel"
+    "default_title": "Open MoxyTalks"
   },
   "content_scripts": [
     {

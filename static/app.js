@@ -3237,7 +3237,7 @@ function renderPageAssistList() {
     dom.pageAssistCount.textContent = `${state.pageClips.length} clip${state.pageClips.length === 1 ? '' : 's'}`;
     dom.pageAssistList.innerHTML = '';
     if (!state.pageClips.length) {
-        dom.pageAssistList.innerHTML = '<div class="page-assist-empty">No captured pages yet. Load the standalone Chromium helper folder (for example: mlx-moxy-wirks-chromium-page-assist) via chrome://extensions -> Load unpacked, then send selected page text into this inbox.</div>';
+        dom.pageAssistList.innerHTML = '<div class="page-assist-empty">No captured pages yet. Load the MoxyTalks extension folder (for example: moxytalks-extension) via chrome://extensions → Load unpacked, then send selected page text into this inbox.</div>';
         return;
     }
     state.pageClips.forEach(clip => {

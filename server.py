@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-MLX Studio — Local LLM Server for Apple Silicon
+MLX-Moxy-Wirks — Local LLM Server for Apple Silicon
+Moxy is the resident identity; she inhabits this server and the UI.
 v3: Flow improvements ported from AI-ArtWirks runtime.
 
 Architecture patterns borrowed:
@@ -72,8 +73,11 @@ MODEL_DIRS = [
 
 HOST = "0.0.0.0"
 PORT = 8899
-APP_STATE_DIR = Path.home() / ".mlx_studio"
+APP_NAME = "MLX-Moxy-Wirks"
+APP_SLUG = "mlx_moxy_wirks"
+APP_STATE_DIR = Path.home() / f".{APP_SLUG}"
 APP_STATE_FILE = APP_STATE_DIR / "app_state.json"
+LEGACY_APP_STATE_DIRS = [Path.home() / ".mlx_studio"]
 MAX_PAGE_CLIPS = 20
 MAX_ATTACHMENT_EXCERPT_CHARS = 12000
 MAX_ATTACHMENT_TEXT_BYTES = 1024 * 1024 * 2
@@ -105,7 +109,7 @@ MIN_FREE_GB_FOR_GENERATION = 2 # Minimum free GB before blocking
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
-app = FastAPI(title="MLX Studio", version="3.0.0")
+app = FastAPI(title=APP_NAME, version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -185,6 +189,11 @@ def _default_app_state() -> dict:
             "transport_preference": "auto",
             "last_transport": "idle",
         },
+        "persona": {
+            "active": "moxy",
+            "custom_overrides": "",
+            "first_boot_at": _utc_now(),
+        },
         "updated_at": _utc_now(),
     }
 
@@ -225,7 +234,30 @@ def _normalize_app_state(raw: dict | None) -> dict:
     return state
 
 
+_legacy_migration_done = False
+
+
+def _migrate_legacy_state_dirs() -> None:
+    """One-shot move of any pre-rename state dir (~/.mlx_studio) into the new
+    APP_STATE_DIR (~/.mlx_moxy_wirks). Preserves all user data."""
+    global _legacy_migration_done
+    if _legacy_migration_done:
+        return
+    _legacy_migration_done = True
+    if APP_STATE_DIR.exists():
+        return
+    for legacy in LEGACY_APP_STATE_DIRS:
+        try:
+            if legacy.exists() and legacy.is_dir():
+                legacy.rename(APP_STATE_DIR)
+                print(f"📦 Migrated legacy state dir {legacy} → {APP_STATE_DIR}")
+                break
+        except Exception as exc:
+            print(f"⚠️  Legacy state migration from {legacy} failed: {exc}")
+
+
 def _load_app_state() -> dict:
+    _migrate_legacy_state_dirs()
     return _normalize_app_state(_read_json_file(APP_STATE_FILE, _default_app_state()))
 
 
@@ -2556,6 +2588,46 @@ async def save_app_state(request: dict):
     return {"status": "saved", "state": state}
 
 
+@app.get("/api/persona")
+async def get_persona():
+    """Return Moxy's identity and composed system prompt (base + Creator overrides)."""
+    from persona.moxy import MOXY_IDENTITY, compose_moxy_prompt
+
+    state = _load_app_state()
+    persona_state = state.get("persona") or {}
+    overrides = persona_state.get("custom_overrides") or ""
+    return {
+        "identity": MOXY_IDENTITY,
+        "active": persona_state.get("active", "moxy"),
+        "custom_overrides": overrides,
+        "system_prompt": compose_moxy_prompt(overrides),
+    }
+
+
+@app.post("/api/persona")
+async def save_persona(request: dict):
+    """Update the persona overrides / active selection. The base identity is
+    source-controlled and not editable from the UI."""
+    request = request or {}
+    state = _load_app_state()
+    persona_state = dict(state.get("persona") or {})
+    if "active" in request and isinstance(request["active"], str):
+        persona_state["active"] = request["active"].strip() or "moxy"
+    if "custom_overrides" in request and isinstance(request["custom_overrides"], str):
+        persona_state["custom_overrides"] = request["custom_overrides"]
+    state["persona"] = persona_state
+    saved = _save_app_state(state)
+    from persona.moxy import MOXY_IDENTITY, compose_moxy_prompt
+    overrides = (saved.get("persona") or {}).get("custom_overrides") or ""
+    return {
+        "status": "saved",
+        "identity": MOXY_IDENTITY,
+        "active": (saved.get("persona") or {}).get("active", "moxy"),
+        "custom_overrides": overrides,
+        "system_prompt": compose_moxy_prompt(overrides),
+    }
+
+
 @app.get("/api/models")
 async def list_models():
     models = _scan_models()
@@ -3463,14 +3535,14 @@ async def root():
     index = static_dir / "index.html"
     if index.exists():
         return FileResponse(str(index))
-    return {"message": "MLX Studio API is running. No frontend found."}
+    return {"message": f"{APP_NAME} API is running. No frontend found."}
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    print(f"\n🧠 MLX Studio v3 starting on http://localhost:{PORT}")
+    print(f"\n🧠 {APP_NAME} (Moxy) starting on http://localhost:{PORT}")
     print(f"   ⚡ Memory guard: warn@{MEMORY_PRESSURE_WARN}% · block@{MEMORY_PRESSURE_BLOCK}%")
     print(f"   📡 SSE events: /api/events")
     print(f"   🧪 Prompt enrichment: /api/prompts/enrich")

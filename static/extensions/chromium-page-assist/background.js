@@ -1,4 +1,4 @@
-const MENU_ID = 'mlx-studio-send-selection';
+const MENU_ID = 'mlx-moxy-wirks-send-selection';
 const TARGETS = ['http://127.0.0.1:8899/api/page-assist/capture', 'http://localhost:8899/api/page-assist/capture'];
 
 async function postClip(payload) {
@@ -18,7 +18,7 @@ async function postClip(payload) {
       lastError = error;
     }
   }
-  throw lastError || new Error('MLX Studio is not reachable');
+  throw lastError || new Error('MLX-Moxy-Wirks is not reachable');
 }
 
 async function captureFromTab(tabId, fallbackSelection = '') {
@@ -47,7 +47,7 @@ chrome.runtime.onInstalled.addListener(() => {
   }
   chrome.contextMenus.create({
     id: MENU_ID,
-    title: 'Send selection to MLX Studio',
+    title: 'Send selection to MLX-Moxy-Wirks',
     contexts: ['selection', 'page'],
   });
 });
@@ -58,7 +58,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const payload = await captureFromTab(tab.id, info.selectionText || '');
     await postClip(payload);
   } catch (error) {
-    console.error('Failed to send clip to MLX Studio', error);
+    console.error('Failed to send clip to MLX-Moxy-Wirks', error);
   }
 });
 

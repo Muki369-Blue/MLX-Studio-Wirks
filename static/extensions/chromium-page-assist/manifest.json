@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "MLX Studio Page Assist",
-  "version": "0.5.0",
-  "description": "Send page selections from Chromium into the local MLX Studio inbox.",
+  "name": "MLX-Moxy-Wirks Page Assist",
+  "version": "0.6.0",
+  "description": "Send page selections from Chromium into the local MLX-Moxy-Wirks inbox (Moxy).",
   "permissions": [
     "activeTab",
     "contextMenus",
@@ -23,7 +23,7 @@
     "default_path": "sidepanel.html"
   },
   "action": {
-    "default_title": "Open MLX Studio Side Panel"
+    "default_title": "Open MLX-Moxy-Wirks Side Panel"
   },
   "content_scripts": [
     {

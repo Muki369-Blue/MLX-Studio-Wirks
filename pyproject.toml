@@ -3,9 +3,9 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mlx-studio"
+name = "mlx-moxy-wirks"
 version = "0.1.0"
-description = "Local MLX Studio with app-owned connectors and browser tooling."
+description = "MLX-Moxy-Wirks — sovereign local LLM studio on Apple Silicon, inhabited by Moxy."
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "fastapi>=0.135.3,<0.136",
@@ -18,7 +18,8 @@ dependencies = [
 ]
 
 [project.scripts]
-mlx-studio = "server:main"
+mlx-moxy-wirks = "server:main"
 
 [tool.setuptools]
 py-modules = ["server"]
+packages = ["persona"]

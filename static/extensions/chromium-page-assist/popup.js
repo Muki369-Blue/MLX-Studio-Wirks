@@ -10,7 +10,7 @@ const agentModeEl = document.getElementById('agent-mode');
 const TARGETS = ['http://127.0.0.1:8899', 'http://localhost:8899'];
 const SYSTEM_PROMPT_KEY = 'mlx_page_assist_system_prompt';
 const DEFAULT_SYSTEM_PROMPT = [
-  'You are MLX Studio Page Assist.',
+  'You are Moxy, answering through the MLX-Moxy-Wirks Page Assist channel.',
   'Answer strictly from the provided page context when possible.',
   'If context is weak or incomplete, say what is missing before guessing.',
   'Use concise markdown with short sections and bullets when useful.',
@@ -70,7 +70,7 @@ async function requestStudio(method, path, body) {
       lastError = error;
     }
   }
-  throw lastError || new Error('MLX Studio is not reachable');
+  throw lastError || new Error('MLX-Moxy-Wirks is not reachable');
 }
 
 async function postToStudio(path, body) {
@@ -260,9 +260,9 @@ sendBtn.addEventListener('click', async () => {
       payload,
     });
     if (!response?.ok) {
-      throw new Error(response?.error || 'MLX Studio did not accept the clip');
+      throw new Error(response?.error || 'MLX-Moxy-Wirks did not accept the clip');
     }
-    statusEl.textContent = 'Sent to MLX Studio.';
+    statusEl.textContent = 'Sent to MLX-Moxy-Wirks.';
   } catch (error) {
     statusEl.textContent = `Failed: ${error.message}`;
   } finally {
@@ -284,7 +284,7 @@ async function runAsk({ forceAct = false } = {}) {
 
     const health = await getFromStudio('/api/health');
     if (!health?.loaded_model) {
-      throw new Error('No model loaded in MLX Studio. Load a model in the app first.');
+      throw new Error('No model loaded in MLX-Moxy-Wirks. Load a model in the app first.');
     }
 
     let useAgentMode = forceAct || Boolean(agentModeEl?.checked);
@@ -356,7 +356,7 @@ async function runAsk({ forceAct = false } = {}) {
     });
 
     if (!result?.response) {
-      throw new Error(result?.error || 'No response from MLX Studio');
+      throw new Error(result?.error || 'No response from MLX-Moxy-Wirks');
     }
 
     const toolRuns = Array.isArray(result.agent_tools) ? result.agent_tools : [];

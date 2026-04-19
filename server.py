@@ -182,7 +182,9 @@ def _default_app_state() -> dict:
                     "You are a helpful, intelligent assistant. "
                     "Be concise and accurate."
                 ),
+                "workspace_enabled": False,
                 "workspace_root": None,
+                "workspace_label": "",
                 "workspace_pending_batch": [],
                 "workflow_mode": "chat",
             }
@@ -244,7 +246,9 @@ def _normalize_app_state(raw: dict | None) -> dict:
     state["page_clips"] = state["page_clips"][:MAX_PAGE_CLIPS]
     # Inject workspace defaults into existing projects that predate this field
     for project in state.get("projects", []):
+        project.setdefault("workspace_enabled", False)
         project.setdefault("workspace_root", None)
+        project.setdefault("workspace_label", "")
         project.setdefault("workspace_pending_batch", [])
         project.setdefault("workflow_mode", "chat")
     return state
@@ -2775,53 +2779,102 @@ def _scan_workspace_tree(root: Path, max_depth: int = WORKSPACE_MAX_DEPTH) -> li
 
 @app.post("/api/workspace/select")
 async def workspace_select(request: dict):
-    """Open a macOS folder picker and set the workspace root for the active project.
-    If request contains a 'path' key, use that directly (for programmatic callers)."""
-    raw_path = (request or {}).get("path", "").strip()
+    """Select or clear a workspace folder for a project.
 
+    Body options:
+      { "project_id": "...", "suggested_label": "..." }  — open folder picker
+      { "project_id": "...", "path": "/abs/path" }        — set directly
+      { "project_id": "...", "clear": true }               — disconnect workspace
+    """
+    request = request or {}
+    clear = bool(request.get("clear"))
+    raw_path = (request.get("path") or "").strip()
+    suggested_label = (request.get("suggested_label") or "").strip()
+
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    # ── Clear workspace ───────────────────────────────────────
+    if clear:
+        _update_active_project(state, {
+            "workspace_enabled": False,
+            "workspace_root": None,
+            "workspace_label": "",
+            "workspace_pending_batch": [],
+        })
+        saved = _save_app_state(state)
+        updated_project = _get_active_project(saved)
+        return {"project": updated_project, "workspace": None}
+
+    # ── Pick folder ───────────────────────────────────────────
     if not raw_path:
-        # Use osascript folder picker (macOS only)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e",
-                'POSIX path of (choose folder with prompt "Select workspace folder for Moxy")',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            raw_path = filedialog.askdirectory(
+                title="Select workspace folder for Moxy",
+                mustexist=True,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-            raw_path = stdout.decode().strip()
-        except asyncio.TimeoutError:
-            return JSONResponse({"error": "Folder picker timed out"}, status_code=408)
-        except Exception as exc:
-            return JSONResponse({"error": f"Folder picker failed: {exc}"}, status_code=500)
+            root.destroy()
+        except Exception:
+            # Fallback to osascript if tkinter unavailable
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e",
+                    'POSIX path of (choose folder with prompt "Select workspace folder for Moxy")',
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+                raw_path = stdout.decode().strip()
+            except asyncio.TimeoutError:
+                return JSONResponse({"error": "Folder picker timed out"}, status_code=408)
+            except Exception as exc:
+                return JSONResponse({"error": f"Folder picker failed: {exc}"}, status_code=500)
 
     if not raw_path:
-        return JSONResponse({"error": "No folder selected"}, status_code=400)
+        return JSONResponse({"error": "No folder selected — cancelled"}, status_code=400)
 
     try:
         workspace_root = _validate_workspace_path(raw_path)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    state = _load_app_state()
-    _update_active_project(state, {"workspace_root": str(workspace_root)})
-    _save_app_state(state)
+    label = suggested_label or workspace_root.name
+    _update_active_project(state, {
+        "workspace_enabled": True,
+        "workspace_root": str(workspace_root),
+        "workspace_label": label,
+    })
+    saved = _save_app_state(state)
+    updated_project = _get_active_project(saved)
 
     _push_event("workspace_selected", {
         "workspace_root": str(workspace_root),
-        "project_id": state.get("active_project_id"),
+        "project_id": saved.get("active_project_id"),
     })
 
-    return {"workspace_root": str(workspace_root)}
+    return {
+        "project": updated_project,
+        "workspace": {"label": label, "root": str(workspace_root)},
+    }
 
 
 @app.get("/api/workspace/tree")
-async def workspace_tree():
+async def workspace_tree(project_id: str = ""):
     """Return the file tree for the active project's workspace root."""
     state = _load_app_state()
     project = _get_active_project(state)
     if not project:
         return JSONResponse({"error": "No active project"}, status_code=400)
+
+    if not project.get("workspace_enabled"):
+        return JSONResponse({"error": "Workspace not enabled for this project"}, status_code=400)
 
     raw_root = project.get("workspace_root") or ""
     if not raw_root:

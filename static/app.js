@@ -347,6 +347,7 @@ const dom = {
 async function init() {
     setupSliders();
     setupProMode();
+    setupSidebarResize();
     setupEventListeners();
     await fetchPresets();
     await fetchPersona();           // Moxy identity — must run before fetchAppState so SP_PRESETS.moxy is populated
@@ -3338,6 +3339,64 @@ async function requestTokenInspection() {
             // Best-effort only
         }
     }, 180);
+}
+
+// ===========================================================================
+// Sidebar Resize
+// ===========================================================================
+function setupSidebarResize() {
+    const sidebar = dom.sidebar;
+    if (!sidebar) return;
+
+    // Restore saved width
+    const saved = localStorage.getItem(`${LS_PREFIX}sidebar_width`);
+    if (saved) {
+        const px = parseInt(saved, 10);
+        if (px >= 260 && px <= 560) {
+            sidebar.style.width = px + 'px';
+            sidebar.style.minWidth = px + 'px';
+        }
+    }
+
+    // Create resize handle
+    const handle = document.createElement('div');
+    handle.className = 'sidebar-resize-handle';
+    sidebar.style.position = 'relative';
+    sidebar.appendChild(handle);
+
+    let dragging = false;
+    let startX = 0;
+    let startW = 0;
+
+    handle.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        dragging = true;
+        startX = e.clientX;
+        startW = sidebar.getBoundingClientRect().width;
+        handle.classList.add('dragging');
+        sidebar.classList.add('resizing');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+    });
+
+    document.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - startX;
+        const newW = Math.min(560, Math.max(260, startW + dx));
+        sidebar.style.width = newW + 'px';
+        sidebar.style.minWidth = newW + 'px';
+    });
+
+    document.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        handle.classList.remove('dragging');
+        sidebar.classList.remove('resizing');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        const finalW = Math.round(sidebar.getBoundingClientRect().width);
+        localStorage.setItem(`${LS_PREFIX}sidebar_width`, String(finalW));
+    });
 }
 
 // ===========================================================================

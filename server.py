@@ -3019,6 +3019,43 @@ def _inject_workspace_context(messages: list[dict], project_id: str | None = Non
     return messages
 
 
+def _inject_runtime_capabilities(messages: list[dict], agent_mode: bool = False) -> list[dict]:
+    """Inject runtime capability notes so model behavior reflects this standalone app.
+
+    This prevents generic IDE/sandbox disclaimers when workspace features are available.
+    """
+    state = _load_app_state()
+    project = _get_active_project(state) or {}
+    workspace_enabled = bool(project.get("workspace_enabled") and project.get("workspace_root"))
+    workspace_root = str(project.get("workspace_root") or "")
+
+    lines = [
+        "Runtime context:",
+        "- You are running inside the standalone MLX-Moxy-Wirks app (not VS Code/Copilot).",
+        "- Do not claim generic IDE filesystem restrictions.",
+    ]
+
+    if workspace_enabled:
+        lines.append(f"- Workspace is connected at: {workspace_root}")
+        lines.append("- You can inspect repo context and local files in this app.")
+        if agent_mode:
+            lines.append("- Agent tools are enabled: use workspace tools to read files and stage edits for approval.")
+        else:
+            lines.append("- Direct tool calls are currently off; provide analysis from available context or ask to enable Agent/Build mode for file edits.")
+    else:
+        lines.append("- Workspace is not connected; ask the user to connect a workspace folder for local code edits.")
+
+    block = "\n".join(lines)
+    updated = list(messages)
+    for i, msg in enumerate(updated):
+        if msg.get("role") == "system":
+            updated[i] = {"role": "system", "content": str(msg.get("content") or "") + "\n\n" + block}
+            return updated
+
+    updated.insert(0, {"role": "system", "content": block})
+    return updated
+
+
 # ---------------------------------------------------------------------------
 # Workspace endpoints
 # ---------------------------------------------------------------------------
@@ -4180,6 +4217,7 @@ async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
 
     messages = data.get("messages") or []
     if isinstance(messages, list) and messages:
+        messages = _inject_runtime_capabilities(messages, agent_mode=False)
         messages = _inject_workspace_context(messages)
 
     max_tokens = data.get("max_tokens", 512)
@@ -4327,6 +4365,7 @@ async def ws_generate(websocket: WebSocket):
             messages = data.get("messages")
             # Inject workspace repo context into system prompt if workspace is active
             if isinstance(messages, list) and messages:
+                messages = _inject_runtime_capabilities(messages, agent_mode=agent_mode)
                 messages = _inject_workspace_context(messages)
 
             try:

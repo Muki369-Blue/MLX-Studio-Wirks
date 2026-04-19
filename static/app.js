@@ -736,47 +736,104 @@ function getGenerationParams() {
     };
 }
 
-function getRecommendedWorkflowModel() {
-    const preferred = state.models.find(model => (
-        model.name === 'Qwen--Qwen2-VL-2B-Instruct'
-        && isModelChatCapable(model)
-        && (model.context_length || 0) >= 8192
-    ));
-    if (preferred) return preferred;
+function getModelParamBillions(model) {
+    const raw = String(model?.params || model?.name || '');
+    const match = raw.match(/(\d+(?:\.\d+)?)\s*B/i);
+    return match ? parseFloat(match[1]) : 0;
+}
 
-    const longContext = state.models
-        .filter(model => isModelChatCapable(model) && (model.context_length || 0) >= 8192)
-        .sort((a, b) => (b.context_length || 0) - (a.context_length || 0));
-    if (longContext.length) return longContext[0];
+function scoreWorkflowModel(model, workflow = 'chat') {
+    if (!isModelChatCapable(model)) return -Infinity;
 
-    return state.models.find(model => isModelChatCapable(model)) || null;
+    const memGb = Number(state.systemInfo?.memory_gb || 0);
+    const sizeGb = Number(model?.size_gb || 0);
+    const context = Number(model?.context_length || 0);
+    const paramsB = getModelParamBillions(model);
+
+    let score = 0;
+
+    // Prefer text-first models for coding/planning/research unless we have no alternatives.
+    if (model.modality === 'text') score += 45;
+    if (model.modality === 'vision') score -= 18;
+
+    // Reward usable context, especially for plan/research flows.
+    score += Math.min(context / 4096, 32);
+
+    // Favor higher-capacity models, but avoid overshooting RAM headroom.
+    score += Math.min(paramsB * 1.8, 40);
+
+    if (memGb > 0 && sizeGb > 0) {
+        const ratio = sizeGb / memGb;
+        if (ratio <= 0.7) score += 16;
+        else if (ratio <= 0.85) score += 8;
+        else if (ratio > 0.95) score -= 18;
+    }
+
+    // Workflow tuning.
+    if (workflow === 'chat') {
+        score += 6;
+    } else if (workflow === 'plan') {
+        score += Math.min(context / 2048, 28);
+        score += paramsB >= 20 ? 10 : 0;
+    } else if (workflow === 'build') {
+        score += model.modality === 'text' ? 12 : -8;
+        score += paramsB >= 20 ? 12 : 0;
+    } else if (workflow === 'research') {
+        score += Math.min(context / 1536, 34);
+        score += paramsB >= 20 ? 10 : 0;
+    }
+
+    // Keep diffusion and non-chat artifacts from bubbling up by accident.
+    if (model.engine_hint === 'diffusers' || model.modality === 'diffusion') score = -Infinity;
+
+    return score;
+}
+
+function getRecommendedWorkflowModel(workflow = 'chat') {
+    const candidates = state.models
+        .filter(model => isModelChatCapable(model))
+        .map(model => ({ model, score: scoreWorkflowModel(model, workflow) }))
+        .filter(item => Number.isFinite(item.score))
+        .sort((a, b) => b.score - a.score);
+
+    return candidates.length ? candidates[0].model : null;
 }
 
 function renderWorkflowRecommendations() {
     if (!dom.workflowModelRecommendations) return;
-    const model = getRecommendedWorkflowModel();
-    if (!model) {
+    const recommendations = {
+        chat: getRecommendedWorkflowModel('chat'),
+        plan: getRecommendedWorkflowModel('plan'),
+        build: getRecommendedWorkflowModel('build'),
+        research: getRecommendedWorkflowModel('research'),
+    };
+    const fallback = recommendations.chat || recommendations.plan || recommendations.build || recommendations.research;
+    if (!fallback) {
         dom.workflowModelRecommendations.innerHTML = '<div class="workflow-model-card"><strong>Recommended model</strong><span>No chat-capable model detected yet.</span></div>';
         return;
     }
-    const suffix = state.loadedModelPath === model.path ? ' · loaded' : '';
-    const contextLabel = model.context_length ? `${Math.round(model.context_length / 1000)}k ctx` : 'context unknown';
+    const cardLabel = (model) => {
+        if (!model) return 'No suitable model found';
+        const suffix = state.loadedModelPath === model.path ? ' · loaded' : '';
+        const contextLabel = model.context_length ? `${Math.round(model.context_length / 1000)}k ctx` : 'context unknown';
+        return `${escapeHtml(model.name)} · ${contextLabel}${suffix}`;
+    };
     dom.workflowModelRecommendations.innerHTML = `
         <div class="workflow-model-card">
             <strong>Chat</strong>
-            <span>${escapeHtml(model.name)} · ${contextLabel}${suffix}</span>
+            <span>${cardLabel(recommendations.chat || fallback)}</span>
         </div>
         <div class="workflow-model-card">
             <strong>Plan</strong>
-            <span>${escapeHtml(model.name)} · best current long-context fit</span>
+            <span>${cardLabel(recommendations.plan || fallback)}</span>
         </div>
         <div class="workflow-model-card">
             <strong>Build</strong>
-            <span>${escapeHtml(model.name)} · use with workspace mode</span>
+            <span>${cardLabel(recommendations.build || fallback)}</span>
         </div>
         <div class="workflow-model-card">
             <strong>Research</strong>
-            <span>${escapeHtml(model.name)} · preferred for extended research</span>
+            <span>${cardLabel(recommendations.research || fallback)}</span>
         </div>
     `;
 }

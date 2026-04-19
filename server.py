@@ -2501,6 +2501,14 @@ def _detect_model_profile(p: Path, name: str) -> dict:
             if approx_b > 0.1:
                 meta["params"] = f"~{approx_b}B"
 
+    # ── Gemma 4 VLM-but-loads-as-text handling ──
+    # Gemma 4 models have VLM tokens but mlx_lm loads them as text via gemma4.py
+    # For practical text-chat usage, treat as text model even if config has vision tokens
+    if model_type in ("gemma4", "gemma4_text") and meta["engine_hint"] == "mlx-vlm":
+        meta["modality"] = "text"
+        meta["family"] = "gemma"
+        meta["engine_hint"] = "mlx"
+
     # ── Family fallback: detect from model_type ──
     if meta["family"] == "unknown" and meta["modality"] == "text":
         family_map = {
@@ -3344,7 +3352,18 @@ async def load_model(request: dict):
                     quantization_overrides = _scan_mixed_quantization_overrides(local_model_path)
                     if quantization_overrides is not None:
                         load_kwargs["model_config"] = {"quantization": quantization_overrides}
-                _model, _tokenizer = load(model_path, **load_kwargs)
+                        print(f"↳ Detected mixed quantization with {len(quantization_overrides)-3} per-module overrides" if len(quantization_overrides) > 3 else f"↳ Using quantization config from {local_model_path.name}")
+                
+                try:
+                    _model, _tokenizer = load(model_path, **load_kwargs)
+                except ValueError as e:
+                    if "not supported" in str(e).lower():
+                        # Better error message for unsupported model types
+                        _model_loading = False
+                        err_msg = f"Model type not supported by mlx_lm. {str(e)}"
+                        _push_event("model_load_failed", {"error": err_msg})
+                        return JSONResponse({"error": err_msg}, status_code=400)
+                    raise
             _active_engine = "mlx"
 
         _model_name = request.get("name") or (Path(model_path).stem if is_gguf else model_path)

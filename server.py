@@ -2774,6 +2774,112 @@ def _scan_workspace_tree(root: Path, max_depth: int = WORKSPACE_MAX_DEPTH) -> li
 
 
 # ---------------------------------------------------------------------------
+# Workspace context injection — gives the model awareness of the selected repo
+# ---------------------------------------------------------------------------
+
+# Key files to auto-read for repo grounding (tried in order, first N found win)
+_WORKSPACE_CONTEXT_FILES: list[str] = [
+    "README.md", "readme.md", "README.rst",
+    "pyproject.toml", "package.json", "Cargo.toml", "go.mod",
+    "setup.py", "setup.cfg",
+    "Makefile", "Dockerfile",
+    "CLAUDE.md",
+]
+_WORKSPACE_CONTEXT_MAX_FILES = 5
+_WORKSPACE_CONTEXT_MAX_CHARS_PER_FILE = 4000
+_WORKSPACE_CONTEXT_MAX_TOTAL_CHARS = 12000
+
+
+def _build_workspace_context(workspace_root: str | None) -> str:
+    """Read key files from the workspace and build a grounding context string.
+
+    Returns empty string if workspace is not set or has no readable files.
+    """
+    if not workspace_root:
+        return ""
+    root = Path(workspace_root)
+    if not root.is_dir():
+        return ""
+
+    parts: list[str] = []
+    total_chars = 0
+
+    # 1. File tree summary (top-level only)
+    try:
+        entries = sorted(root.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+        tree_lines = []
+        for entry in entries[:40]:
+            if entry.name in WORKSPACE_SKIP_DIRS or entry.name.startswith("."):
+                continue
+            kind = "dir" if entry.is_dir() else "file"
+            tree_lines.append(f"  {entry.name}/ " if entry.is_dir() else f"  {entry.name}")
+        if tree_lines:
+            parts.append(f"[Workspace: {root.name}]\nRoot: {root}\n" + "\n".join(tree_lines))
+            total_chars += len(parts[-1])
+    except OSError:
+        pass
+
+    # 2. Key files content
+    found = 0
+    for filename in _WORKSPACE_CONTEXT_FILES:
+        if found >= _WORKSPACE_CONTEXT_MAX_FILES:
+            break
+        if total_chars >= _WORKSPACE_CONTEXT_MAX_TOTAL_CHARS:
+            break
+        target = root / filename
+        if not target.is_file():
+            continue
+        try:
+            size = target.stat().st_size
+            if size > _WORKSPACE_CONTEXT_MAX_CHARS_PER_FILE * 2:
+                continue  # skip very large files
+            content = target.read_text(encoding="utf-8", errors="replace")
+            content = content[:_WORKSPACE_CONTEXT_MAX_CHARS_PER_FILE]
+            block = f"[{filename}]\n{content}"
+            parts.append(block)
+            total_chars += len(block)
+            found += 1
+        except OSError:
+            continue
+
+    if not parts:
+        return ""
+
+    return (
+        "\n\n--- Workspace context (auto-injected from selected repo) ---\n\n"
+        + "\n\n".join(parts)
+        + "\n\n--- End workspace context ---"
+    )
+
+
+def _inject_workspace_context(messages: list[dict], project_id: str | None = None) -> list[dict]:
+    """If the active project has a workspace, inject repo context into the system message."""
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project or not project.get("workspace_enabled"):
+        return messages
+
+    workspace_root = project.get("workspace_root")
+    context = _build_workspace_context(workspace_root)
+    if not context:
+        return messages
+
+    # Find the first system message and append context
+    messages = list(messages)  # shallow copy
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system":
+            messages[i] = {
+                "role": "system",
+                "content": msg["content"] + context,
+            }
+            return messages
+
+    # No system message found — prepend one
+    messages.insert(0, {"role": "system", "content": context.strip()})
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # Workspace endpoints
 # ---------------------------------------------------------------------------
 
@@ -3170,6 +3276,9 @@ async def generate_sync(request: dict):
     try:
         _clear_generation_cancel(generation_id)
         messages = request.get("messages")
+        # Inject workspace repo context into system prompt if workspace is active
+        if isinstance(messages, list) and messages:
+            messages = _inject_workspace_context(messages)
         if agent_mode:
             messages, tool_runs = await _resolve_agent_tools(
                 messages=list(messages) if isinstance(messages, list) else [],
@@ -3827,6 +3936,9 @@ async def ws_generate(websocket: WebSocket):
             generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
 
             messages = data.get("messages")
+            # Inject workspace repo context into system prompt if workspace is active
+            if isinstance(messages, list) and messages:
+                messages = _inject_workspace_context(messages)
 
             try:
                 _clear_generation_cancel(generation_id)

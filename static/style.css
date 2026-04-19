@@ -711,6 +711,10 @@ body {
     background: rgba(192, 132, 252, 0.12);
     color: var(--accent-end);
 }
+.model-badge.engine-gguf {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
+}
 
 .model-item-meta {
     font-size: 0.68rem;
@@ -1649,6 +1653,46 @@ body {
 }
 
 .btn-stop:hover { background: #ef4444; }
+
+/* Voice buttons */
+.btn-voice, .btn-speak-toggle {
+    width: 36px; height: 36px;
+    border-radius: var(--radius-md);
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s var(--ease-out);
+    flex-shrink: 0;
+}
+.btn-voice:hover, .btn-speak-toggle:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+}
+.btn-voice.listening {
+    color: #ef4444;
+    animation: voice-pulse 1.2s ease-in-out infinite;
+}
+@keyframes voice-pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+    50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+.btn-speak-toggle.active {
+    color: var(--color-accent, #6366f1);
+    background: rgba(99, 102, 241, 0.12);
+}
+.btn-msg-speak {
+    cursor: pointer;
+    background: transparent;
+    border: none;
+    color: var(--text-tertiary);
+    padding: 2px 6px;
+    border-radius: var(--radius-sm);
+    transition: color 0.15s;
+}
+.btn-msg-speak:hover { color: var(--text-primary); }
+.btn-msg-speak.playing { color: var(--color-accent, #6366f1); }
 
 /* Slash Commands Menu (Upgrade #7) */
 .slash-menu {

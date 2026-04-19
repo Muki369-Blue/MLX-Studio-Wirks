@@ -134,12 +134,20 @@ _model_name: Optional[str] = None
 _model_path: Optional[str] = None
 _model_loading = False
 _model_load_start: Optional[float] = None
+_active_engine: str = "mlx"  # "mlx" or "gguf"
 _generation_stats = {
     "last_tps": 0,
     "last_latency": 0,
     "last_tokens": 0,
     "total_generated": 0,
 }
+
+# llama-server subprocess management (GGUF models)
+LLAMA_SERVER_BIN = "/opt/homebrew/bin/llama-server"
+LLAMA_SERVER_PORT = 8089
+_llama_server_process: Optional[subprocess.Popen] = None
+_llama_server_model_path: Optional[str] = None
+_llama_server_model_name: Optional[str] = None
 
 # SSE event bus (ported from AI-ArtWirks server.py)
 _event_queue: queue.Queue = queue.Queue(maxsize=256)
@@ -167,6 +175,87 @@ def _is_generation_cancelled(generation_id: str) -> bool:
 def _clear_generation_cancel(generation_id: str) -> None:
     if generation_id:
         _cancelled_generations.discard(generation_id)
+
+
+# ---------------------------------------------------------------------------
+# llama-server lifecycle (GGUF models)
+# ---------------------------------------------------------------------------
+def _start_llama_server(model_path: str, port: int = LLAMA_SERVER_PORT) -> None:
+    """Spawn llama-server for a GGUF model and wait until healthy."""
+    global _llama_server_process, _llama_server_model_path, _llama_server_model_name
+    _stop_llama_server()
+
+    cmd = [
+        LLAMA_SERVER_BIN,
+        "-m", model_path,
+        "--port", str(port),
+        "--n-gpu-layers", "99",
+        "--ctx-size", "8192",
+        "--host", "127.0.0.1",
+    ]
+    print(f"🦙 Starting llama-server: {' '.join(cmd)}")
+    _llama_server_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _llama_server_model_path = model_path
+    _llama_server_model_name = Path(model_path).stem
+
+    # Poll health until ready (max 120s for large models)
+    import urllib.request
+    health_url = f"http://127.0.0.1:{port}/health"
+    for attempt in range(240):
+        time.sleep(0.5)
+        if _llama_server_process.poll() is not None:
+            stderr = _llama_server_process.stderr.read().decode() if _llama_server_process.stderr else ""
+            _llama_server_process = None
+            _llama_server_model_path = None
+            _llama_server_model_name = None
+            raise RuntimeError(f"llama-server exited early: {stderr[-500:]}")
+        try:
+            resp = urllib.request.urlopen(health_url, timeout=2)
+            if resp.status == 200:
+                print(f"🦙 llama-server healthy after {(attempt + 1) * 0.5:.1f}s")
+                return
+        except Exception:
+            pass
+
+    # Timeout
+    _stop_llama_server()
+    raise RuntimeError("llama-server failed to become healthy within 120s")
+
+
+def _stop_llama_server() -> None:
+    """Stop the running llama-server subprocess if any."""
+    global _llama_server_process, _llama_server_model_path, _llama_server_model_name
+    if _llama_server_process is not None:
+        print("🦙 Stopping llama-server…")
+        try:
+            _llama_server_process.terminate()
+            _llama_server_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _llama_server_process.kill()
+            _llama_server_process.wait(timeout=5)
+        except Exception:
+            pass
+        _llama_server_process = None
+    _llama_server_model_path = None
+    _llama_server_model_name = None
+
+
+def _llama_server_healthy() -> bool:
+    """Quick health check on the running llama-server."""
+    if _llama_server_process is None:
+        return False
+    try:
+        import urllib.request
+        resp = urllib.request.urlopen(
+            f"http://127.0.0.1:{LLAMA_SERVER_PORT}/health", timeout=2
+        )
+        return resp.status == 200
+    except Exception:
+        return False
 
 
 def _default_app_state() -> dict:
@@ -2428,6 +2517,25 @@ def _detect_model_profile(p: Path, name: str) -> dict:
     return meta
 
 
+def _detect_gguf_quant(name: str) -> str:
+    """Extract quantization from GGUF filename (e.g. Q4_K_M, Q5_K_S)."""
+    m = re.search(r'(Q\d+_K_[A-Z]+|Q\d+_[A-Z]+|F16|F32|BF16)', name, re.IGNORECASE)
+    return m.group(1).upper() if m else "unknown"
+
+
+def _detect_gguf_family(name: str) -> str:
+    """Extract model family from GGUF filename."""
+    name_lower = name.lower()
+    for key, fam in [
+        ("qwen", "qwen"), ("llama", "llama"), ("gemma", "gemma"),
+        ("mistral", "mistral"), ("phi", "phi"), ("deepseek", "deepseek"),
+        ("command", "command-r"), ("starcoder", "starcoder"),
+    ]:
+        if key in name_lower:
+            return fam
+    return "unknown"
+
+
 def _scan_models() -> list[dict]:
     """Scan all model directories for available models."""
     with PerfTimer("model_scan"):
@@ -2466,6 +2574,7 @@ def _scan_models() -> list[dict]:
                                         "path": real_path,
                                         "size_gb": size,
                                         "source": "huggingface_cache",
+                                        "engine": "mlx",
                                         **meta,
                                     })
                     continue
@@ -2481,8 +2590,31 @@ def _scan_models() -> list[dict]:
                             "path": str(child),
                             "size_gb": size,
                             "source": str(base),
+                            "engine": "mlx",
                             **meta,
                         })
+
+        # Also scan for standalone GGUF files
+        for model_dir in MODEL_DIRS:
+            base = Path(model_dir)
+            if not base.exists():
+                continue
+            for gguf_file in sorted(base.glob("*.gguf")):
+                name = gguf_file.stem
+                if name in seen or name.startswith("."):
+                    continue
+                seen.add(name)
+                size_gb = round(gguf_file.stat().st_size / (1024 ** 3), 2)
+                models.append({
+                    "name": name,
+                    "path": str(gguf_file),
+                    "size_gb": size_gb,
+                    "source": str(gguf_file.parent),
+                    "engine": "gguf",
+                    "quantization": _detect_gguf_quant(name),
+                    "family": _detect_gguf_family(name),
+                    "modality": "text",
+                })
 
     return models
 
@@ -3157,12 +3289,13 @@ async def list_models():
         "loaded_model": _model_name,
         "loaded_model_path": _model_path,
         "is_loading": _model_loading,
+        "active_engine": _active_engine,
     }
 
 
 @app.post("/api/models/load")
 async def load_model(request: dict):
-    global _model, _tokenizer, _model_name, _model_path, _model_loading, _model_load_start
+    global _model, _tokenizer, _model_name, _model_path, _model_loading, _model_load_start, _active_engine
 
     model_path = request.get("path") or request.get("name")
     if not model_path:
@@ -3170,6 +3303,8 @@ async def load_model(request: dict):
 
     if _model_path == model_path:
         return {"status": "already_loaded", "model": _model_name}
+
+    is_gguf = str(model_path).endswith(".gguf")
 
     _model_loading = True
     _model_load_start = time.time()
@@ -3179,9 +3314,12 @@ async def load_model(request: dict):
         # ── Smart cleanup before loading (from AI-ArtWirks _prepare_for_engine) ──
         with PerfTimer("model_cleanup"):
             _smart_cleanup(reason=f"swapping to {request.get('name', model_path)}")
+        _stop_llama_server()
 
         _model_name = None
         _model_path = None
+        _model = None
+        _tokenizer = None
 
         # ── Memory headroom check before load ──
         try:
@@ -3191,18 +3329,25 @@ async def load_model(request: dict):
             _push_event("model_load_failed", {"error": str(mem_err)})
             return JSONResponse({"error": str(mem_err)}, status_code=503)
 
-        # ── Load new model with PerfTimer ──
-        with PerfTimer(f"model_load:{model_path}"):
-            from mlx_lm import load
-            load_kwargs: dict[str, Any] = {}
-            local_model_path = Path(model_path).expanduser()
-            if local_model_path.exists():
-                quantization_overrides = _scan_mixed_quantization_overrides(local_model_path)
-                if quantization_overrides is not None:
-                    load_kwargs["model_config"] = {"quantization": quantization_overrides}
-            _model, _tokenizer = load(model_path, **load_kwargs)
+        if is_gguf:
+            # ── GGUF: start llama-server ──
+            with PerfTimer(f"llama_server_start:{model_path}"):
+                _start_llama_server(model_path)
+            _active_engine = "gguf"
+        else:
+            # ── MLX: load with mlx_lm ──
+            with PerfTimer(f"model_load:{model_path}"):
+                from mlx_lm import load
+                load_kwargs: dict[str, Any] = {}
+                local_model_path = Path(model_path).expanduser()
+                if local_model_path.exists():
+                    quantization_overrides = _scan_mixed_quantization_overrides(local_model_path)
+                    if quantization_overrides is not None:
+                        load_kwargs["model_config"] = {"quantization": quantization_overrides}
+                _model, _tokenizer = load(model_path, **load_kwargs)
+            _active_engine = "mlx"
 
-        _model_name = request.get("name") or model_path
+        _model_name = request.get("name") or (Path(model_path).stem if is_gguf else model_path)
         _model_path = model_path
         load_time = round(time.time() - _model_load_start, 2)
         _model_loading = False
@@ -3210,6 +3355,7 @@ async def load_model(request: dict):
         _push_event("model_loaded", {
             "model": _model_name,
             "load_time_seconds": load_time,
+            "engine": _active_engine,
         })
 
         app_state = _load_app_state()
@@ -3221,6 +3367,7 @@ async def load_model(request: dict):
             "status": "loaded",
             "model": _model_name,
             "load_time_seconds": load_time,
+            "engine": _active_engine,
         }
     except Exception as e:
         _model_loading = False
@@ -3230,13 +3377,19 @@ async def load_model(request: dict):
 
 @app.post("/api/models/unload")
 async def unload_model():
-    global _model, _tokenizer, _model_name, _model_path
+    global _model, _tokenizer, _model_name, _model_path, _active_engine
 
     old_name = _model_name
-    with PerfTimer("model_unload"):
-        _smart_cleanup(reason=f"unloading {_model_name or 'model'}")
+    if _active_engine == "gguf":
+        _stop_llama_server()
+    else:
+        with PerfTimer("model_unload"):
+            _smart_cleanup(reason=f"unloading {_model_name or 'model'}")
+    _model = None
+    _tokenizer = None
     _model_name = None
     _model_path = None
+    _active_engine = "mlx"
 
     app_state = _load_app_state()
     app_state.setdefault("settings", {})
@@ -3789,6 +3942,105 @@ async def web_search(query: str):
 
 
 # ---------------------------------------------------------------------------
+# Voice — TTS (macOS say) and STT (MLX Whisper)
+# ---------------------------------------------------------------------------
+import tempfile
+
+@app.post("/api/audio/speak")
+async def audio_speak(request: dict):
+    """TTS via macOS `say` command.  Returns audio/aac stream."""
+    text = (request.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "No text provided"}, status_code=400)
+    voice = (request.get("voice") or "Samantha").strip()
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
+    tmp.close()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", voice, "-o", tmp.name, text,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            os.unlink(tmp.name)
+            return JSONResponse(
+                {"error": f"say failed: {stderr.decode()}"}, status_code=500,
+            )
+
+        def _stream():
+            try:
+                with open(tmp.name, "rb") as f:
+                    while chunk := f.read(8192):
+                        yield chunk
+            finally:
+                os.unlink(tmp.name)
+
+        return StreamingResponse(_stream(), media_type="audio/aiff")
+    except Exception as e:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/audio/voices")
+async def audio_voices():
+    """List macOS voices available for say."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", "?",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc.communicate()
+        voices = []
+        for line in stdout.decode().splitlines():
+            parts = line.split()
+            if parts:
+                voices.append(parts[0])
+        return {"voices": voices}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/audio/transcribe")
+async def audio_transcribe(request: Request):
+    """STT via mlx-whisper. Accepts audio blob (multipart/form-data)."""
+    form = await request.form()
+    audio_file = form.get("audio")
+    if not audio_file:
+        return JSONResponse({"error": "No audio file provided"}, status_code=400)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    try:
+        contents = await audio_file.read()
+        tmp.write(contents)
+        tmp.close()
+
+        try:
+            import mlx_whisper
+        except ImportError:
+            os.unlink(tmp.name)
+            return JSONResponse(
+                {"error": "mlx-whisper not installed. Run: pip install mlx-whisper"},
+                status_code=501,
+            )
+
+        result = mlx_whisper.transcribe(
+            tmp.name,
+            path_or_hf_repo="mlx-community/whisper-tiny",
+        )
+        text = (result.get("text") or "").strip()
+        return {"text": text}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+
+
+# ---------------------------------------------------------------------------
 # Preset Profiles
 # ---------------------------------------------------------------------------
 BUILTIN_PRESETS = {
@@ -3901,6 +4153,115 @@ async def get_presets():
 
 
 # ---------------------------------------------------------------------------
+# GGUF generation proxy — streams llama-server /v1/chat/completions to WebSocket
+# ---------------------------------------------------------------------------
+async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
+    """Proxy generation through llama-server's OpenAI-compatible endpoint."""
+    global _generation_stats
+
+    messages = data.get("messages") or []
+    if isinstance(messages, list) and messages:
+        messages = _inject_workspace_context(messages)
+
+    max_tokens = data.get("max_tokens", 512)
+    temperature = data.get("temperature", 0.7)
+    top_p = data.get("top_p", 0.9)
+    generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
+
+    _clear_generation_cancel(generation_id)
+
+    url = f"http://127.0.0.1:{LLAMA_SERVER_PORT}/v1/chat/completions"
+    payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stream": True,
+    }
+
+    token_count = 0
+    full_response = ""
+    start_time = time.time()
+    first_token_time = None
+    cancelled = False
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        async with client.stream("POST", url, json=payload) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                raise RuntimeError(f"llama-server returned {response.status_code}: {body.decode()[:300]}")
+
+            async for line in response.aiter_lines():
+                if _is_generation_cancelled(generation_id):
+                    cancelled = True
+                    break
+
+                if not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:].strip()
+                if chunk_data == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(chunk_data)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                text = delta.get("content", "")
+                if not text:
+                    continue
+
+                full_response += text
+                token_count += 1
+                elapsed = time.time() - start_time
+                tps = token_count / elapsed if elapsed > 0 else 0
+
+                if first_token_time is None:
+                    first_token_time = elapsed
+
+                await websocket.send_json({
+                    "type": "token",
+                    "text": text,
+                    "tokens": token_count,
+                    "tps": round(tps, 1),
+                    "latency_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+                })
+                await asyncio.sleep(0)
+
+    elapsed = time.time() - start_time
+    final_tps = round(token_count / elapsed if elapsed > 0 else 0, 1)
+
+    _generation_stats = {
+        "last_tps": final_tps,
+        "last_latency": round(first_token_time * 1000, 0) if first_token_time else 0,
+        "last_tokens": token_count,
+        "total_generated": _generation_stats["total_generated"] + token_count,
+    }
+
+    if cancelled:
+        await websocket.send_json({"type": "cancelled", "total_tokens": token_count})
+    else:
+        await websocket.send_json({
+            "type": "done",
+            "total_tokens": token_count,
+            "elapsed_seconds": round(elapsed, 2),
+            "tokens_per_second": final_tps,
+            "first_token_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+        })
+        _push_event("generation_done", {
+            "tokens": token_count,
+            "tps": final_tps,
+            "model": _model_name,
+        })
+
+    _clear_generation_cancel(generation_id)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket for streaming generation — with memory guard
 # ---------------------------------------------------------------------------
 @app.websocket("/ws/generate")
@@ -3910,6 +4271,15 @@ async def ws_generate(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_json()
+
+            # ── GGUF engine: proxy to llama-server ──
+            if _active_engine == "gguf" and _llama_server_process is not None:
+                try:
+                    await _ws_generate_gguf(websocket, data)
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "error": str(e)})
+                continue
+
             if _model is None or _tokenizer is None:
                 await websocket.send_json({"error": "No model loaded"})
                 continue
@@ -4083,7 +4453,8 @@ def main() -> None:
     print(f"   ⚡ Memory guard: warn@{MEMORY_PRESSURE_WARN}% · block@{MEMORY_PRESSURE_BLOCK}%")
     print(f"   📡 SSE events: /api/events")
     print(f"   🧪 Prompt enrichment: /api/prompts/enrich")
-    print(f"   📦 Model pull: POST /api/models/pull\n")
+    print(f"   📦 Model pull: POST /api/models/pull")
+    print(f"   🦙 GGUF engine: llama-server → port {LLAMA_SERVER_PORT}\n")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")
 
 

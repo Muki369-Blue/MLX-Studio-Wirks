@@ -17,6 +17,13 @@ dependencies = [
   "uvicorn[standard]>=0.44.0,<0.45",
 ]
 
+[project.optional-dependencies]
+voice = [
+  "mlx-whisper>=0.4",
+  "sounddevice>=0.5",
+  "numpy>=1.26",
+]
+
 [project.scripts]
 mlx-moxy-wirks = "server:main"
 

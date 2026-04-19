@@ -339,7 +339,154 @@ const dom = {
     btnCompareLast: $('#btn-compare-last'),
     btnClearGrounding: $('#btn-clear-grounding'),
     btnExportLastMd: $('#btn-export-last-md'),
+    btnVoice: $('#btn-voice'),
+    btnSpeakToggle: $('#btn-speak-toggle'),
 };
+
+// ===========================================================================
+// Voice Engine — STT (mic → transcribe) + TTS (say → speaker)
+// ===========================================================================
+const voice = {
+    mediaRecorder: null,
+    audioChunks: [],
+    isRecording: false,
+    autoSpeak: localStorage.getItem('moxy_autoSpeak') === 'true',
+    currentAudio: null,
+};
+
+function setupVoice() {
+    // Auto-speak toggle
+    if (voice.autoSpeak) dom.btnSpeakToggle?.classList.add('active');
+    dom.btnSpeakToggle?.addEventListener('click', () => {
+        voice.autoSpeak = !voice.autoSpeak;
+        localStorage.setItem('moxy_autoSpeak', voice.autoSpeak);
+        dom.btnSpeakToggle.classList.toggle('active', voice.autoSpeak);
+        showToast(voice.autoSpeak ? 'Auto-speak on' : 'Auto-speak off', 'info');
+    });
+
+    // Mic button — push-to-talk
+    if (!navigator.mediaDevices?.getUserMedia) {
+        if (dom.btnVoice) dom.btnVoice.style.display = 'none';
+        return;
+    }
+
+    dom.btnVoice?.addEventListener('click', async () => {
+        if (voice.isRecording) {
+            stopRecording();
+        } else {
+            await startRecording();
+        }
+    });
+}
+
+async function startRecording() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        voice.audioChunks = [];
+        voice.mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+        voice.mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) voice.audioChunks.push(e.data);
+        };
+        voice.mediaRecorder.onstop = async () => {
+            stream.getTracks().forEach(t => t.stop());
+            const blob = new Blob(voice.audioChunks, { type: 'audio/webm' });
+            await transcribeAudio(blob);
+        };
+        voice.mediaRecorder.start();
+        voice.isRecording = true;
+        dom.btnVoice?.classList.add('listening');
+    } catch (e) {
+        showToast('Mic access denied', 'error');
+    }
+}
+
+function stopRecording() {
+    if (voice.mediaRecorder && voice.isRecording) {
+        voice.mediaRecorder.stop();
+        voice.isRecording = false;
+        dom.btnVoice?.classList.remove('listening');
+    }
+}
+
+async function transcribeAudio(blob) {
+    showToast('Transcribing…', 'info');
+    const form = new FormData();
+    form.append('audio', blob, 'recording.webm');
+    try {
+        const res = await fetch('/api/audio/transcribe', { method: 'POST', body: form });
+        const data = await res.json();
+        if (data.error) { showToast(data.error, 'error'); return; }
+        if (data.text) {
+            dom.chatInput.value = data.text;
+            dom.chatInput.dispatchEvent(new Event('input'));
+            // Auto-send
+            dom.chatInput.form?.requestSubmit?.() || document.getElementById('btn-send')?.click();
+        }
+    } catch (e) {
+        showToast('Transcription failed', 'error');
+    }
+}
+
+async function speakText(text) {
+    // Cancel any current playback
+    if (voice.currentAudio) {
+        voice.currentAudio.pause();
+        voice.currentAudio = null;
+    }
+    // Strip markdown for cleaner speech
+    const clean = text.replace(/```[\s\S]*?```/g, ' code block ')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        .replace(/\*(.*?)\*/g, '$1')
+        .replace(/#{1,6}\s/g, '')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .trim();
+    if (!clean) return;
+
+    try {
+        const res = await fetch('/api/audio/speak', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: clean }),
+        });
+        if (!res.ok) throw new Error('TTS failed');
+        const audioBlob = await res.blob();
+        const url = URL.createObjectURL(audioBlob);
+        const audio = new Audio(url);
+        voice.currentAudio = audio;
+        audio.onended = () => { URL.revokeObjectURL(url); voice.currentAudio = null; };
+        audio.play();
+        return audio;
+    } catch (e) {
+        // Fallback: browser SpeechSynthesis
+        if (window.speechSynthesis) {
+            const utter = new SpeechSynthesisUtterance(clean);
+            speechSynthesis.speak(utter);
+        }
+    }
+}
+
+function addSpeakButton(messageEl, content) {
+    const actions = messageEl.querySelector('.message-actions');
+    if (!actions) return;
+    const btn = document.createElement('button');
+    btn.className = 'btn-msg-action btn-msg-speak';
+    btn.title = 'Read aloud';
+    btn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg> Speak';
+    btn.addEventListener('click', async () => {
+        if (btn.classList.contains('playing')) {
+            voice.currentAudio?.pause();
+            voice.currentAudio = null;
+            btn.classList.remove('playing');
+            return;
+        }
+        btn.classList.add('playing');
+        const audio = await speakText(content);
+        if (audio) audio.onended = () => { btn.classList.remove('playing'); voice.currentAudio = null; };
+        else btn.classList.remove('playing');
+    });
+    actions.appendChild(btn);
+}
 
 // ===========================================================================
 // Initialization
@@ -363,6 +510,7 @@ async function init() {
     startMetricsPolling();  // Keep as fallback if SSE disconnects
     requestTokenInspection();
     setupWebSearch();
+    setupVoice();
 }
 // ===========================================================================
 // Web Search Integration
@@ -483,6 +631,8 @@ async function fetchAppState() {
             ? data.projects
             : [{ id: 'default', name: 'Inbox', color: '#818cf8', ...WORKFLOW_DEFAULTS }];
         state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        // Normalize: ensure every session has a projectId
+        state.sessions.forEach(s => { if (!s.projectId) s.projectId = 'default'; });
         state.activeSessionId = data.active_session_id || null;
         state.activeProjectId = data.active_project_id || state.projects[0]?.id || 'default';
         state.selectedPreset = data.selected_preset || state.selectedPreset;
@@ -1986,7 +2136,18 @@ function appendMessage(role, content, tokens) {
         });
     }
 
+    // Voice: add speak button to assistant messages
+    if (role === 'assistant' && content) {
+        addSpeakButton(div, content);
+    }
+
     dom.chatMessages.appendChild(div);
+
+    // Auto-speak new assistant messages
+    if (role === 'assistant' && content && voice.autoSpeak) {
+        speakText(content);
+    }
+
     scrollToBottom();
     return div;
 }
@@ -2132,6 +2293,9 @@ function renderModelList(models) {
         }
         if (model.params) {
             badges += `<span class="model-badge quant">${model.params}</span>`;
+        }
+        if (model.engine === 'gguf') {
+            badges += `<span class="model-badge engine-gguf">GGUF</span>`;
         }
 
         item.innerHTML = `

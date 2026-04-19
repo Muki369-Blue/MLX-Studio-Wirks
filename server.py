@@ -106,6 +106,14 @@ MEMORY_PRESSURE_WARN = 85      # Start warning at 85%
 MEMORY_PRESSURE_BLOCK = 93     # Block generation at 93%
 MIN_FREE_GB_FOR_GENERATION = 2 # Minimum free GB before blocking
 
+# Workspace mode constants
+WORKSPACE_SKIP_DIRS: frozenset[str] = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv",
+    ".DS_Store", "dist", "build", ".next", ".nuxt",
+})
+WORKSPACE_MAX_DEPTH = 4
+WORKSPACE_MAX_FILE_READ_BYTES = 1024 * 512  # 512 KB
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
@@ -174,6 +182,9 @@ def _default_app_state() -> dict:
                     "You are a helpful, intelligent assistant. "
                     "Be concise and accurate."
                 ),
+                "workspace_root": None,
+                "workspace_pending_batch": [],
+                "workflow_mode": "chat",
             }
         ],
         "sessions": [],
@@ -231,6 +242,11 @@ def _normalize_app_state(raw: dict | None) -> dict:
     if not isinstance(state.get("page_clips"), list):
         state["page_clips"] = []
     state["page_clips"] = state["page_clips"][:MAX_PAGE_CLIPS]
+    # Inject workspace defaults into existing projects that predate this field
+    for project in state.get("projects", []):
+        project.setdefault("workspace_root", None)
+        project.setdefault("workspace_pending_batch", [])
+        project.setdefault("workflow_mode", "chat")
     return state
 
 
@@ -1624,11 +1640,17 @@ def _agent_tool_prompt() -> str:
         '  browser_click:    {"action":"tool","tool":"browser_click","args":{"selector":"CSS_SELECTOR"}}\n'
         '  browser_type:     {"action":"tool","tool":"browser_type","args":{"selector":"CSS_SELECTOR","text":"TEXT","submit":true}}\n'
         '  browser_wait:     {"action":"tool","tool":"browser_wait","args":{"text":"TEXT","seconds":2}}\n'
+        '  workspace_read:   {"action":"tool","tool":"workspace_read","args":{"path":"RELATIVE_PATH"}}\n'
+        '  workspace_write:  {"action":"tool","tool":"workspace_write","args":{"path":"RELATIVE_PATH","content":"FILE_CONTENT"}}\n'
+        '  workspace_scaffold: {"action":"tool","tool":"workspace_scaffold","args":{"files":[{"path":"RELATIVE_PATH","content":"CONTENT"}]}}\n'
         '  done:             {"action":"respond"}\n'
         "\n"
         "Rules:\n"
         "- For browser tasks: navigate first, snapshot to inspect the page, then click or type.\n"
         "- Use selector (CSS) for click/type. Do not use element_id.\n"
+        "- For workspace tasks: use workspace_read to inspect a file, workspace_write for single-file edits,\n"
+        "  workspace_scaffold to create multiple files. All paths are relative to the workspace root.\n"
+        "  workspace_write and workspace_scaffold stage files — they do NOT write until the user approves.\n"
         "- One action per response. Nothing outside the JSON object."
     )
 
@@ -1778,6 +1800,66 @@ async def _resolve_agent_tools(
                 result = await _browser_wait(text=text_value, seconds=float(seconds))
                 tool_runs.append({"tool": tool_name, "text": text_value, "seconds": seconds})
                 tool_feedback = _summarize_browser_action("wait", result)
+            elif tool_name == "workspace_read":
+                rel_path = str(args.get("path") or "").strip()
+                if not rel_path:
+                    raise RuntimeError("workspace_read requires path")
+                ws_state = _load_app_state()
+                ws_project = _get_active_project(ws_state)
+                raw_root = (ws_project or {}).get("workspace_root") or ""
+                if not raw_root:
+                    raise RuntimeError("No workspace root set for this project")
+                workspace_root = _validate_workspace_path(raw_root)
+                target = (workspace_root / rel_path).resolve()
+                target.relative_to(workspace_root)  # path traversal guard
+                if not target.exists() or not target.is_file():
+                    raise RuntimeError(f"File not found: {rel_path}")
+                size = target.stat().st_size
+                if size > WORKSPACE_MAX_FILE_READ_BYTES:
+                    raise RuntimeError(f"File too large to read ({size} bytes)")
+                content = target.read_text(encoding="utf-8", errors="replace")
+                tool_runs.append({"tool": tool_name, "path": rel_path})
+                tool_feedback = f"File: {rel_path}\n\n{content}"
+            elif tool_name in ("workspace_write", "workspace_scaffold"):
+                ws_state = _load_app_state()
+                ws_project = _get_active_project(ws_state)
+                raw_root = (ws_project or {}).get("workspace_root") or ""
+                if not raw_root:
+                    raise RuntimeError("No workspace root set for this project")
+                if tool_name == "workspace_write":
+                    rel_path = str(args.get("path") or "").strip()
+                    content = args.get("content") or ""
+                    if not rel_path:
+                        raise RuntimeError("workspace_write requires path")
+                    files = [{"path": rel_path, "content": content, "op": "write"}]
+                else:
+                    raw_files = args.get("files")
+                    if not isinstance(raw_files, list) or not raw_files:
+                        raise RuntimeError("workspace_scaffold requires a files list")
+                    files = [
+                        {"path": str(f.get("path") or "").strip(), "content": f.get("content") or "", "op": "write"}
+                        for f in raw_files
+                        if f.get("path")
+                    ]
+                # Stage the files (don't write yet — user must approve via /api/workspace/apply)
+                pending = list((ws_project or {}).get("workspace_pending_batch") or [])
+                by_path = {item["path"]: item for item in pending if item.get("path")}
+                for f in files:
+                    if f.get("path"):
+                        by_path[f["path"]] = f
+                merged = list(by_path.values())
+                _update_active_project(ws_state, {"workspace_pending_batch": merged})
+                _save_app_state(ws_state)
+                _push_event("workspace_pending", {
+                    "project_id": ws_state.get("active_project_id"),
+                    "pending_count": len(merged),
+                })
+                paths = [f["path"] for f in files]
+                tool_runs.append({"tool": tool_name, "staged": paths})
+                tool_feedback = (
+                    f"Staged {len(files)} file(s) for review: {', '.join(paths)}.\n"
+                    "The user must approve these changes via the workspace panel before they are written to disk."
+                )
             else:
                 raise RuntimeError(f"Unknown tool: {tool_name}")
         except Exception as exc:
@@ -2628,6 +2710,286 @@ async def save_persona(request: dict):
     }
 
 
+# ---------------------------------------------------------------------------
+# Workspace helpers
+# ---------------------------------------------------------------------------
+
+def _get_active_project(state: dict) -> dict | None:
+    active_id = state.get("active_project_id") or "default"
+    for p in state.get("projects", []):
+        if p.get("id") == active_id:
+            return p
+    return None
+
+
+def _update_active_project(state: dict, updates: dict) -> dict:
+    active_id = state.get("active_project_id") or "default"
+    for p in state.get("projects", []):
+        if p.get("id") == active_id:
+            p.update(updates)
+            break
+    return state
+
+
+def _validate_workspace_path(raw: str) -> Path:
+    """Resolve and validate a workspace root. Must be an existing directory."""
+    p = Path(raw).expanduser().resolve()
+    if not p.exists():
+        raise ValueError(f"Path does not exist: {p}")
+    if not p.is_dir():
+        raise ValueError(f"Path is not a directory: {p}")
+    return p
+
+
+def _scan_workspace_tree(root: Path, max_depth: int = WORKSPACE_MAX_DEPTH) -> list[dict]:
+    """Return a flat list of {path, kind, size_bytes} under root up to max_depth."""
+    items: list[dict] = []
+
+    def _walk(current: Path, depth: int) -> None:
+        if depth > max_depth:
+            return
+        try:
+            for entry in sorted(current.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
+                if entry.name in WORKSPACE_SKIP_DIRS or entry.name.startswith("."):
+                    continue
+                rel = str(entry.relative_to(root))
+                if entry.is_dir():
+                    items.append({"path": rel, "kind": "dir", "size_bytes": 0})
+                    _walk(entry, depth + 1)
+                elif entry.is_file():
+                    try:
+                        size = entry.stat().st_size
+                    except OSError:
+                        size = 0
+                    items.append({"path": rel, "kind": "file", "size_bytes": size})
+        except PermissionError:
+            pass
+
+    _walk(root, 1)
+    return items
+
+
+# ---------------------------------------------------------------------------
+# Workspace endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/workspace/select")
+async def workspace_select(request: dict):
+    """Open a macOS folder picker and set the workspace root for the active project.
+    If request contains a 'path' key, use that directly (for programmatic callers)."""
+    raw_path = (request or {}).get("path", "").strip()
+
+    if not raw_path:
+        # Use osascript folder picker (macOS only)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e",
+                'POSIX path of (choose folder with prompt "Select workspace folder for Moxy")',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            raw_path = stdout.decode().strip()
+        except asyncio.TimeoutError:
+            return JSONResponse({"error": "Folder picker timed out"}, status_code=408)
+        except Exception as exc:
+            return JSONResponse({"error": f"Folder picker failed: {exc}"}, status_code=500)
+
+    if not raw_path:
+        return JSONResponse({"error": "No folder selected"}, status_code=400)
+
+    try:
+        workspace_root = _validate_workspace_path(raw_path)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    state = _load_app_state()
+    _update_active_project(state, {"workspace_root": str(workspace_root)})
+    _save_app_state(state)
+
+    _push_event("workspace_selected", {
+        "workspace_root": str(workspace_root),
+        "project_id": state.get("active_project_id"),
+    })
+
+    return {"workspace_root": str(workspace_root)}
+
+
+@app.get("/api/workspace/tree")
+async def workspace_tree():
+    """Return the file tree for the active project's workspace root."""
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    raw_root = project.get("workspace_root") or ""
+    if not raw_root:
+        return JSONResponse({"error": "No workspace root set for this project"}, status_code=400)
+
+    try:
+        workspace_root = _validate_workspace_path(raw_root)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    items = _scan_workspace_tree(workspace_root)
+    return {"workspace_root": str(workspace_root), "items": items}
+
+
+@app.post("/api/workspace/apply")
+async def workspace_apply(request: dict):
+    """Apply or discard the pending workspace batch for the active project.
+
+    Body: {"action": "apply" | "discard"}
+
+    The pending batch is a list of {path, content, op} objects stored on the project.
+    On apply: write files atomically, clear the batch, push workspace_applied event.
+    On discard: clear the batch, push workspace_discarded event.
+    """
+    action = ((request or {}).get("action") or "").strip().lower()
+    if action not in ("apply", "discard"):
+        return JSONResponse({"error": "action must be 'apply' or 'discard'"}, status_code=400)
+
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    raw_root = project.get("workspace_root") or ""
+    pending_batch: list[dict] = list(project.get("workspace_pending_batch") or [])
+
+    if action == "discard":
+        _update_active_project(state, {"workspace_pending_batch": []})
+        _save_app_state(state)
+        _push_event("workspace_discarded", {
+            "project_id": state.get("active_project_id"),
+            "discarded": len(pending_batch),
+        })
+        return {"status": "discarded", "count": len(pending_batch)}
+
+    # action == "apply"
+    if not raw_root:
+        return JSONResponse({"error": "No workspace root set"}, status_code=400)
+
+    try:
+        workspace_root = _validate_workspace_path(raw_root)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    applied: list[str] = []
+    errors: list[dict] = []
+    for item in pending_batch:
+        rel_path = (item.get("path") or "").strip()
+        content = item.get("content") or ""
+        op = (item.get("op") or "write").lower()
+        if not rel_path:
+            continue
+        # Security: prevent path traversal
+        try:
+            target = (workspace_root / rel_path).resolve()
+            target.relative_to(workspace_root)  # raises ValueError if outside
+        except (ValueError, Exception) as exc:
+            errors.append({"path": rel_path, "error": f"Unsafe path: {exc}"})
+            continue
+        try:
+            if op == "delete":
+                if target.exists():
+                    target.unlink()
+                applied.append(rel_path)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                applied.append(rel_path)
+        except Exception as exc:
+            errors.append({"path": rel_path, "error": str(exc)})
+
+    _update_active_project(state, {"workspace_pending_batch": []})
+    _save_app_state(state)
+
+    _push_event("workspace_applied", {
+        "project_id": state.get("active_project_id"),
+        "applied": applied,
+        "errors": errors,
+    })
+
+    return {
+        "status": "applied",
+        "applied": applied,
+        "errors": errors,
+    }
+
+
+@app.post("/api/workspace/stage")
+async def workspace_stage(request: dict):
+    """Add file edits to the pending batch without writing them yet.
+
+    Body: {"files": [{"path": "...", "content": "...", "op": "write|delete"}]}
+    """
+    files = (request or {}).get("files") or []
+    if not isinstance(files, list) or not files:
+        return JSONResponse({"error": "files must be a non-empty list"}, status_code=400)
+
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    pending_batch = list(project.get("workspace_pending_batch") or [])
+    # Merge by path (last write wins)
+    by_path = {item["path"]: item for item in pending_batch if item.get("path")}
+    for f in files:
+        if f.get("path"):
+            by_path[f["path"]] = f
+
+    merged_batch = list(by_path.values())
+    _update_active_project(state, {"workspace_pending_batch": merged_batch})
+    _save_app_state(state)
+
+    _push_event("workspace_pending", {
+        "project_id": state.get("active_project_id"),
+        "pending_count": len(merged_batch),
+    })
+
+    return {"status": "staged", "pending_count": len(merged_batch)}
+
+
+@app.get("/api/workspace/read")
+async def workspace_read(path: str):
+    """Read a single file from the active project workspace."""
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    raw_root = project.get("workspace_root") or ""
+    if not raw_root:
+        return JSONResponse({"error": "No workspace root set"}, status_code=400)
+
+    try:
+        workspace_root = _validate_workspace_path(raw_root)
+        target = (workspace_root / path).resolve()
+        target.relative_to(workspace_root)  # path traversal guard
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    if not target.exists() or not target.is_file():
+        return JSONResponse({"error": "File not found"}, status_code=404)
+
+    size = target.stat().st_size
+    if size > WORKSPACE_MAX_FILE_READ_BYTES:
+        return JSONResponse(
+            {"error": f"File too large ({size} bytes). Max is {WORKSPACE_MAX_FILE_READ_BYTES}."},
+            status_code=413,
+        )
+
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+    return {"path": path, "content": content, "size_bytes": size}
+
+
 @app.get("/api/models")
 async def list_models():
     models = _scan_models()
@@ -2744,6 +3106,11 @@ async def generate_sync(request: dict):
     top_p = request.get("top_p", 0.9)
     repetition_penalty = request.get("repetition_penalty", 1.1)
     agent_mode = bool(request.get("agent_mode"))
+    workflow_mode = str(request.get("workflow_mode") or "chat").strip().lower()
+    # Build mode implies agent_mode so Moxy can use workspace tools
+    if workflow_mode == "build":
+        agent_mode = True
+        max_tokens = max(max_tokens, 2048)
     request_context_length = request.get("context_length")
     generation_id = (request.get("generation_id") or "").strip() or uuid.uuid4().hex
 
@@ -3398,6 +3765,11 @@ async def ws_generate(websocket: WebSocket):
             top_p = data.get("top_p", 0.9)
             repetition_penalty = data.get("repetition_penalty", 1.1)
             agent_mode = bool(data.get("agent_mode"))
+            workflow_mode = str(data.get("workflow_mode") or "chat").strip().lower()
+            # Build mode implies agent_mode so Moxy can use workspace tools
+            if workflow_mode == "build":
+                agent_mode = True
+                max_tokens = max(max_tokens, 2048)
             request_context_length = data.get("context_length")
             generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
 

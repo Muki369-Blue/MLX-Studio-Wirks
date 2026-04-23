@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="/static/style.css?v=2">
 </head>
 <body>
     <!-- Ambient background -->
@@ -129,6 +129,9 @@
                         </div>
                     </div>
                 </div>
+                <button class="btn-memory-flush" id="btn-memory-flush" title="Unload model, purge caches, free memory">
+                    🧹 Flush Memory
+                </button>
             </div>
 
             <!-- Model Selector (Upgrade #2) -->
@@ -274,17 +277,11 @@
                     <span id="topbar-model-name">No model loaded</span>
                 </div>
                 <div class="capability-strip" id="capability-strip"></div>
-                <!-- Web Search Bar -->
-                <div class="web-search-bar">
-                    <input type="text" id="web-search-input" placeholder="Web search…" />
-                    <button id="web-search-btn">🔍</button>
-                </div>
+
                 <div class="topbar-stats" id="topbar-stats">
                     <div class="stat-group">
                         <span class="stat-label">Speed</span>
                         <span class="stat" id="stat-tps">—</span>
-                                <!-- Web Search Results -->
-                                <div class="web-search-results" id="web-search-results" style="display:none;"></div>
                     </div>
                     <div class="stat-group">
                         <span class="stat-label">Tokens</span>
@@ -574,6 +571,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=2"></script>
 </body>
 </html>

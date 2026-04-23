@@ -419,8 +419,8 @@ async function transcribeAudio(blob) {
         if (data.text) {
             dom.chatInput.value = data.text;
             dom.chatInput.dispatchEvent(new Event('input'));
-            // Auto-send
-            dom.chatInput.form?.requestSubmit?.() || document.getElementById('btn-send')?.click();
+            // Auto-send — call sendMessage directly (textarea is not in a <form>)
+            sendMessage();
         }
     } catch (e) {
         showToast('Transcription failed', 'error');
@@ -511,52 +511,49 @@ async function init() {
     requestTokenInspection();
     setupWebSearch();
     setupVoice();
+    setupMemoryFlush();
 }
 // ===========================================================================
 // Web Search Integration
 // ===========================================================================
 function setupWebSearch() {
-    const input = document.getElementById('web-search-input');
-    const btn = document.getElementById('web-search-btn');
-    const resultsDiv = document.getElementById('web-search-results');
-    if (!input || !btn || !resultsDiv) return;
+    // Web search bar removed from UI — this is now a no-op.
+    // Search functionality is still available via /web slash command and agent tools.
+}
 
-    async function doSearch() {
-        const query = input.value.trim();
-        if (!query) return;
-        resultsDiv.style.display = 'block';
-        resultsDiv.innerHTML = '<div class="search-loading">Searching…</div>';
+// ===========================================================================
+// Memory Flush
+// ===========================================================================
+function setupMemoryFlush() {
+    const btn = document.getElementById('btn-memory-flush');
+    if (!btn) return;
+
+    btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = '\u23F3 Flushing…';
         try {
-            const res = await fetch(`/api/search?query=${encodeURIComponent(query)}`);
+            const res = await fetch('/api/memory/flush', { method: 'POST' });
             const data = await res.json();
             if (data.error) {
-                resultsDiv.innerHTML = `<div class="search-error">${data.error}</div>`;
-                return;
+                showToast(data.error, 'error');
+            } else {
+                const freedText = data.freed_gb > 0 ? `Freed ~${data.freed_gb} GB` : 'Caches purged';
+                const pressure = data.memory?.pressure_percent ?? '—';
+                showToast(`${freedText} — memory now at ${pressure}%`, 'success');
+                // Update UI to reflect unloaded model
+                state.loadedModel = null;
+                state.loadedModelPath = null;
+                state.loadedModelMeta = null;
+                updateModelStatus();
+                fetchModels();
+                fetchHealth();
             }
-            if (!data.results || !data.results.length) {
-                resultsDiv.innerHTML = '<div class="search-empty">No results found.</div>';
-                return;
-            }
-            resultsDiv.innerHTML = data.results.map(r =>
-                `<div class="search-result">
-                    <a href="${r.url}" target="_blank" rel="noopener">${r.name}</a>
-                    <div class="search-snippet">${r.snippet || ''}</div>
-                </div>`
-            ).join('');
         } catch (e) {
-            resultsDiv.innerHTML = `<div class="search-error">${e}</div>`;
+            showToast('Memory flush failed', 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '\uD83E\uDDF9 Flush Memory';
         }
-    }
-
-    btn.addEventListener('click', doSearch);
-    input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') doSearch();
-    });
-    input.addEventListener('focus', () => {
-        if (resultsDiv.innerHTML) resultsDiv.style.display = 'block';
-    });
-    input.addEventListener('blur', () => {
-        setTimeout(() => { resultsDiv.style.display = 'none'; }, 200);
     });
 }
 
@@ -2355,6 +2352,13 @@ function renderModelList(models) {
             badges += `<span class="model-badge engine-gguf">GGUF</span>`;
         }
 
+        // Build description line
+        const descParts = [];
+        if (model.family && model.family !== 'unknown') descParts.push(model.family);
+        if (model.context_length) descParts.push(`${(model.context_length / 1024).toFixed(0)}K ctx`);
+        if (model.engine_hint && model.engine_hint !== 'mlx') descParts.push(model.engine_hint);
+        const descLine = descParts.length ? descParts.join(' · ') : '';
+
         item.innerHTML = `
             <div class="model-item-header">
                 <div class="model-item-name" title="${model.path}">${isFav ? '⭐ ' : ''}${model.name}</div>
@@ -2364,6 +2368,7 @@ function renderModelList(models) {
                 <span>${model.size_gb} GB</span>
                 <span>·</span>
                 <span>${model.source === 'huggingface_cache' ? 'HF Cache' : 'Local'}</span>
+                ${descLine ? `<span>·</span><span>${descLine}</span>` : ''}
             </div>
             <div class="model-item-actions">
                 <button class="btn-model-fav ${isFav ? 'active' : ''}" title="Favorite">⭐</button>
@@ -2571,16 +2576,55 @@ function toggleModelDropdown() {
 }
 
 function openModelDropdown() {
-    dom.modelDropdown.classList.add('open');
-    dom.modelCurrent.classList.add('open');
+    const dd = dom.modelDropdown;
+    const trigger = dom.modelCurrent;
+
+    // Portal the dropdown to body so it escapes sidebar overflow clipping
+    if (dd.parentElement !== document.body) {
+        dd._originalParent = dd.parentElement;
+        dd._originalNext = dd.nextElementSibling;
+        document.body.appendChild(dd);
+    }
+
+    // Position relative to the trigger
+    const rect = trigger.getBoundingClientRect();
+    dd.style.top = `${rect.bottom + 6}px`;
+    dd.style.left = `${rect.left}px`;
+
+    dd.classList.add('open');
+    trigger.classList.add('open');
+
+    // Adjust if it would overflow the viewport
+    requestAnimationFrame(() => {
+        const ddRect = dd.getBoundingClientRect();
+        if (ddRect.right > window.innerWidth - 12) {
+            dd.style.left = `${Math.max(8, window.innerWidth - ddRect.width - 12)}px`;
+        }
+        if (ddRect.bottom > window.innerHeight - 12) {
+            dd.style.maxHeight = `${window.innerHeight - rect.bottom - 18}px`;
+        }
+    });
+
     dom.modelSearch.focus();
 }
 
 function closeModelDropdown() {
-    dom.modelDropdown.classList.remove('open');
+    const dd = dom.modelDropdown;
+    dd.classList.remove('open');
     dom.modelCurrent.classList.remove('open');
     dom.modelSearch.value = '';
     renderModelList(state.models);
+
+    // Return dropdown to its original position in the DOM
+    if (dd._originalParent) {
+        if (dd._originalNext) {
+            dd._originalParent.insertBefore(dd, dd._originalNext);
+        } else {
+            dd._originalParent.appendChild(dd);
+        }
+        dd._originalParent = null;
+        dd._originalNext = null;
+    }
 }
 
 function filterModels(query) {
@@ -3463,13 +3507,23 @@ function renderPageAssistList() {
         return;
     }
     state.pageClips.forEach(clip => {
-        const item = document.createElement('button');
+        const item = document.createElement('div');
         item.className = `page-assist-item ${state.selectedPageClipIds.includes(clip.id) ? 'active' : ''}`;
-        item.innerHTML = `
+        
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'page-assist-content';
+        contentDiv.innerHTML = `
             <strong>${clip.title || 'Page Clip'}</strong>
             <span>${clip.url || 'Selection only'}</span>
         `;
-        item.addEventListener('click', () => {
+        
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'btn-delete-clip';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.title = 'Delete clip';
+        
+        // Handle selection toggle
+        contentDiv.addEventListener('click', () => {
             if (state.selectedPageClipIds.includes(clip.id)) {
                 state.selectedPageClipIds = state.selectedPageClipIds.filter(id => id !== clip.id);
             } else {
@@ -3479,6 +3533,28 @@ function renderPageAssistList() {
             renderDraftAttachments();
             requestTokenInspection();
         });
+        
+        // Handle deletion
+        deleteBtn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            try {
+                const res = await fetch(`/api/page-assist/clips/${clip.id}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.status === 'deleted') {
+                    state.pageClips = state.pageClips.filter(c => c.id !== clip.id);
+                    state.selectedPageClipIds = state.selectedPageClipIds.filter(id => id !== clip.id);
+                    renderPageAssistList();
+                    renderDraftAttachments();
+                    requestTokenInspection();
+                }
+            } catch (err) {
+                console.error('Failed to delete clip:', err);
+                showToast('Failed to delete clip', 'error');
+            }
+        });
+
+        item.appendChild(contentDiv);
+        item.appendChild(deleteBtn);
         dom.pageAssistList.appendChild(item);
     });
 }
@@ -3625,7 +3701,7 @@ function setupSidebarResize() {
 // ===========================================================================
 function setupEventListeners() {
     // Send message
-    dom.btnSend.addEventListener('click', sendMessage);
+    dom.btnSend.addEventListener('click', () => sendMessage());
     dom.chatInput.addEventListener('keydown', (e) => {
         // Cmd+Enter to send
         if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {

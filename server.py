@@ -3431,6 +3431,64 @@ async def load_model(request: dict):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/memory/flush")
+async def memory_flush():
+    """Full memory dump, flush, and clean — unload model + purge all caches."""
+    global _model, _tokenizer, _model_name, _model_path, _active_engine
+
+    mem_before = _get_memory_usage()
+    old_name = _model_name
+
+    # Unload any running engine
+    if _active_engine == "gguf":
+        try:
+            _stop_llama_server()
+        except Exception:
+            pass
+
+    # Force-cleanup everything
+    freed = _smart_cleanup(reason="memory_flush")
+
+    _model = None
+    _tokenizer = None
+    _model_name = None
+    _model_path = None
+    _active_engine = "mlx"
+
+    # Extra aggressive: run gc twice
+    gc.collect()
+    gc.collect()
+
+    # Clear MLX cache again
+    try:
+        import mlx.core as mx
+        mx.metal.clear_cache()
+    except (ImportError, AttributeError):
+        pass
+
+    mem_after = _get_memory_usage()
+    total_freed = mem_before.get("used_gb", 0) - mem_after.get("used_gb", 0)
+
+    app_state = _load_app_state()
+    app_state.setdefault("settings", {})
+    app_state["settings"]["last_loaded_model_path"] = None
+    _save_app_state(app_state)
+
+    if old_name:
+        _push_event("model_unloaded", {"model": old_name})
+    _push_event("memory_flushed", {
+        "freed_gb": round(total_freed, 2),
+        "pressure_before": mem_before.get("pressure_percent", 0),
+        "pressure_after": mem_after.get("pressure_percent", 0),
+    })
+
+    return {
+        "status": "flushed",
+        "freed_gb": round(total_freed, 2),
+        "memory": mem_after,
+    }
+
+
 @app.post("/api/models/unload")
 async def unload_model():
     global _model, _tokenizer, _model_name, _model_path, _active_engine
@@ -3736,6 +3794,22 @@ async def capture_page_assist(request: dict):
 async def get_page_assist_clips():
     state = _load_app_state()
     return {"clips": state.get("page_clips", [])}
+
+
+@app.delete("/api/page-assist/clips/{clip_id}")
+async def delete_page_assist_clip(clip_id: str):
+    app_state = _load_app_state()
+    clips = list(app_state.get("page_clips", []))
+    original_len = len(clips)
+    clips = [c for c in clips if c.get("id") != clip_id]
+    
+    if len(clips) < original_len:
+        app_state["page_clips"] = clips
+        _save_app_state(app_state)
+        return {"status": "deleted", "clip_id": clip_id}
+    else:
+        return JSONResponse({"error": "Clip not found"}, status_code=404)
+
 
 
 # ---------------------------------------------------------------------------

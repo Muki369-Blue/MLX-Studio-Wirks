@@ -406,6 +406,7 @@ const dom = {
     btnExportLastMd: $('#btn-export-last-md'),
     btnVoice: $('#btn-voice'),
     btnSpeakToggle: $('#btn-speak-toggle'),
+    btnStopSpeaking: $('#btn-stop-speaking'),
     // Context stat
     statContext: $('#stat-context'),
     // Agent steps slider
@@ -451,6 +452,11 @@ function setupVoice() {
         } else {
             await startRecording();
         }
+    });
+
+    // Stop-speaking button — cancels active audio playback (auto-speak or manual).
+    dom.btnStopSpeaking?.addEventListener('click', () => {
+        stopSpeaking();
     });
 }
 
@@ -511,14 +517,40 @@ async function transcribeAudio(blob) {
     }
 }
 
-async function speakText(text) {
-    // Cancel any current playback
-    if (voice.currentAudio) {
-        voice.currentAudio.pause();
-        voice.currentAudio = null;
+// Return the FINAL answer only, with all thinking/reasoning stripped.
+// Handles three sources of "thinking" content:
+//   1. The \x00THOUGHTS\x00...\x00FINAL\x00... sentinel produced by sanitizeAssistantOutput
+//   2. Raw <|channel>thought ... <|channel>final / <channel|> markers
+//   3. <think>...</think> blocks (some models)
+function extractFinalAnswer(text) {
+    let out = String(text || '');
+    if (out.startsWith('\x00THOUGHTS\x00')) {
+        const parts = out.split('\x00FINAL\x00');
+        out = (parts[1] || '').trim();
     }
+    out = out.replace(/<think>[\s\S]*?<\/think>/gi, '');
+    out = out.replace(/<think>[\s\S]*$/i, '');
+    // If the model has a thought channel but no final yet, drop the thought entirely
+    // so we don't speak it. Otherwise keep everything after <|channel>final / <channel|>.
+    const finalSplit = out.split(/<\|channel\>final|<channel\|\>/i);
+    if (finalSplit.length > 1) {
+        out = finalSplit[finalSplit.length - 1];
+    } else if (/<\|channel\>thought/i.test(out)) {
+        out = '';
+    }
+    return out.replace(CHANNEL_TAG_RE, '').trim();
+}
+
+async function speakText(text) {
+    // Cancel any current playback first
+    stopSpeaking();
+
+    // Strip any thinking content before doing anything else
+    const finalOnly = extractFinalAnswer(text);
+    if (!finalOnly) return;
+
     // Strip markdown for cleaner speech
-    const clean = text.replace(/```[\s\S]*?```/g, ' code block ')
+    const clean = finalOnly.replace(/```[\s\S]*?```/g, ' code block ')
         .replace(/`([^`]+)`/g, '$1')
         .replace(/\*\*(.*?)\*\*/g, '$1')
         .replace(/\*(.*?)\*/g, '$1')
@@ -552,15 +584,41 @@ async function speakText(text) {
         const url = URL.createObjectURL(audioBlob);
         const audio = new Audio(url);
         voice.currentAudio = audio;
-        audio.onended = () => { URL.revokeObjectURL(url); voice.currentAudio = null; };
+        showStopSpeakingButton(true);
+        audio.onended = () => {
+            URL.revokeObjectURL(url);
+            voice.currentAudio = null;
+            showStopSpeakingButton(false);
+        };
         audio.play();
         return audio;
     } catch (e) {
+        showStopSpeakingButton(false);
         // Fallback: browser SpeechSynthesis
         if (window.speechSynthesis) {
             const utter = new SpeechSynthesisUtterance(clean);
+            utter.onend = () => showStopSpeakingButton(false);
             speechSynthesis.speak(utter);
+            showStopSpeakingButton(true);
         }
+    }
+}
+
+function stopSpeaking() {
+    if (voice.currentAudio) {
+        try { voice.currentAudio.pause(); } catch {}
+        voice.currentAudio = null;
+    }
+    if (window.speechSynthesis && speechSynthesis.speaking) {
+        try { speechSynthesis.cancel(); } catch {}
+    }
+    document.querySelectorAll('.btn-msg-speak.playing').forEach(b => b.classList.remove('playing'));
+    showStopSpeakingButton(false);
+}
+
+function showStopSpeakingButton(visible) {
+    if (dom.btnStopSpeaking) {
+        dom.btnStopSpeaking.classList.toggle('hidden', !visible);
     }
 }
 

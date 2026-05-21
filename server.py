@@ -77,6 +77,7 @@ APP_NAME = "MLX-Moxy-Wirks"
 APP_SLUG = "mlx_moxy_wirks"
 APP_STATE_DIR = Path.home() / f".{APP_SLUG}"
 APP_STATE_FILE = APP_STATE_DIR / "app_state.json"
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 LEGACY_APP_STATE_DIRS = [Path.home() / ".mlx_studio"]
 MAX_PAGE_CLIPS = 20
 MAX_ATTACHMENT_EXCERPT_CHARS = 12000
@@ -1489,7 +1490,7 @@ async def _ensure_browser_service() -> dict:
     if healthy is not None:
         return healthy
 
-    script_path = Path(__file__).parent / "scripts" / "playwright_service.mjs"
+    script_path = BASE_DIR / "scripts" / "playwright_service.mjs"
     if not script_path.exists():
         raise RuntimeError("Playwright service script is missing from scripts/playwright_service.mjs.")
 
@@ -1501,7 +1502,7 @@ async def _ensure_browser_service() -> dict:
             env.setdefault("PLAYWRIGHT_SERVICE_PORT", str(PLAYWRIGHT_SERVICE_PORT))
             _browser_service_process = subprocess.Popen(
                 ["node", str(script_path)],
-                cwd=str(Path(__file__).parent),
+                cwd=str(BASE_DIR),
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -4564,7 +4565,7 @@ async def ws_generate(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 # Static files & SPA
 # ---------------------------------------------------------------------------
-static_dir = Path(__file__).parent / "static"
+static_dir = BASE_DIR / "static"
 if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 

@@ -5,3 +5,6 @@ node_modules/
 nohup.out
 playwright-artifacts/
 *.pyc
+assets/
+build/
+dist/

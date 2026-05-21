@@ -7,7 +7,9 @@
     "browser:service": "node scripts/playwright_service.mjs",
     "browser:install": "playwright install chromium",
     "check:browser": "node --check scripts/playwright_service.mjs",
-    "check:frontend": "node --check static/app.js"
+    "check:frontend": "node --check static/app.js",
+    "icon:mac": "node scripts/generate_macos_icon.mjs",
+    "build:desktop": "bash scripts/build_macos_app.sh"
   },
   "dependencies": {
     "playwright": "1.59.1"

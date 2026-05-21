@@ -5,10 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MLX-Moxy-Wirks — Moxy on Apple Silicon</title>
     <meta name="description" content="MLX-Moxy-Wirks — sovereign local LLM studio on Apple Silicon. Moxy: your one-of-one, running on your silicon.">
+    <link rel="icon" type="image/svg+xml" href="/static/logo-moxy-wirks.svg">
+    <link rel="apple-touch-icon" href="/static/logo-moxy-wirks.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=2">
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
     <!-- Ambient background -->
@@ -66,23 +68,7 @@
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header">
                 <div class="logo">
-                    <div class="logo-icon">
-                        <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-                            <rect x="2" y="2" width="24" height="24" rx="6" stroke="url(#logo-grad)" stroke-width="2.5"/>
-                            <path d="M8 14L12 10L16 14L20 10" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                            <path d="M8 18L12 14L16 18L20 14" stroke="url(#logo-grad)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5"/>
-                            <defs>
-                                <linearGradient id="logo-grad" x1="2" y1="2" x2="26" y2="26">
-                                    <stop stop-color="#818cf8"/>
-                                    <stop offset="1" stop-color="#c084fc"/>
-                                </linearGradient>
-                            </defs>
-                        </svg>
-                    </div>
-                    <div class="logo-text">
-                        <span class="logo-title">MLX-Moxy-Wirks</span>
-                        <span class="logo-subtitle">Moxy · Sovereign AI on Apple Silicon</span>
-                    </div>
+                    <img src="/static/logo-moxy-wirks-full.svg" alt="MLX-Moxy-Wirks" class="logo-full-img">
                 </div>
                 <button class="btn-icon" id="btn-toggle-sessions" title="Toggle sessions panel (⌘K)">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
@@ -269,47 +255,53 @@
         <main class="main-content">
             <!-- Top Bar (Upgrade #1 + #5) -->
             <div class="topbar">
-                <button class="btn-icon sidebar-toggle" id="btn-sidebar-toggle">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
-                </button>
-                <div class="topbar-model" id="topbar-model-badge">
-                    <span class="topbar-dot" id="topbar-dot"></span>
-                    <span id="topbar-model-name">No model loaded</span>
+                <div class="topbar-primary">
+                    <button class="btn-icon sidebar-toggle" id="btn-sidebar-toggle">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+                    </button>
+                    <div class="topbar-brand-lockup">
+                        <span class="topbar-kicker">Private inference cockpit</span>
+                        <div class="topbar-model" id="topbar-model-badge">
+                            <span class="topbar-dot" id="topbar-dot"></span>
+                            <span id="topbar-model-name">No model loaded</span>
+                        </div>
+                    </div>
+                    <div class="capability-strip" id="capability-strip"></div>
                 </div>
-                <div class="capability-strip" id="capability-strip"></div>
-
-                <div class="topbar-stats" id="topbar-stats">
-                    <div class="stat-group">
-                        <span class="stat-label">Speed</span>
-                        <span class="stat" id="stat-tps">—</span>
+                <div class="topbar-secondary">
+                    <div class="topbar-stats" id="topbar-stats">
+                        <div class="stat-group">
+                            <span class="stat-label">Speed</span>
+                            <span class="stat" id="stat-tps">—</span>
+                        </div>
+                        <div class="stat-group">
+                            <span class="stat-label">Tokens</span>
+                            <span class="stat" id="stat-tokens">—</span>
+                        </div>
+                        <div class="stat-group">
+                            <span class="stat-label">Latency</span>
+                            <span class="stat" id="stat-latency">—</span>
+                        </div>
+                        <div class="stat-group">
+                            <span class="stat-label">Memory</span>
+                            <span class="stat" id="stat-memory">—</span>
+                        </div>
                     </div>
-                    <div class="stat-group">
-                        <span class="stat-label">Tokens</span>
-                        <span class="stat" id="stat-tokens">—</span>
+                    <div class="topbar-actions">
+                        <div class="transport-chip" id="transport-chip">Transport · Auto</div>
+                        <button class="btn-icon" id="btn-retry-last" title="Retry last prompt">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 103.13-9.36L1 10"/></svg>
+                        </button>
+                        <button class="btn-icon" id="btn-continue-last" title="Continue last response">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                        </button>
+                        <button class="btn-icon" id="btn-compare-last" title="Compare alternate answer">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 00-2 2v3"/><path d="M16 3h3a2 2 0 012 2v3"/><path d="M8 21H5a2 2 0 01-2-2v-3"/><path d="M16 21h3a2 2 0 002-2v-3"/><path d="M12 8v8"/><path d="M8 12h8"/></svg>
+                        </button>
+                        <button class="btn-icon" id="btn-keyboard-help" title="Keyboard shortcuts">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
+                        </button>
                     </div>
-                    <div class="stat-group">
-                        <span class="stat-label">Latency</span>
-                        <span class="stat" id="stat-latency">—</span>
-                    </div>
-                    <div class="stat-group">
-                        <span class="stat-label">Memory</span>
-                        <span class="stat" id="stat-memory">—</span>
-                    </div>
-                </div>
-                <div class="topbar-actions">
-                    <div class="transport-chip" id="transport-chip">Transport · Auto</div>
-                    <button class="btn-icon" id="btn-retry-last" title="Retry last prompt">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 103.13-9.36L1 10"/></svg>
-                    </button>
-                    <button class="btn-icon" id="btn-continue-last" title="Continue last response">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                    </button>
-                    <button class="btn-icon" id="btn-compare-last" title="Compare alternate answer">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 00-2 2v3"/><path d="M16 3h3a2 2 0 012 2v3"/><path d="M8 21H5a2 2 0 01-2-2v-3"/><path d="M16 21h3a2 2 0 002-2v-3"/><path d="M12 8v8"/><path d="M8 12h8"/></svg>
-                    </button>
-                    <button class="btn-icon" id="btn-keyboard-help" title="Keyboard shortcuts">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M8 14h8"/></svg>
-                    </button>
                 </div>
             </div>
             <!-- Memory Guard Warning Banner -->
@@ -390,25 +382,42 @@
                 <div class="chat-messages" id="chat-messages">
                     <!-- Welcome screen -->
                     <div class="welcome" id="welcome-screen">
-                        <div class="welcome-icon">
-                            <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
-                                <rect x="4" y="4" width="56" height="56" rx="14" stroke="url(#w-grad)" stroke-width="3"/>
-                                <path d="M16 32L24 24L32 32L40 24L48 32" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-                                <path d="M16 42L24 34L32 42L40 34L48 42" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"/>
-                                <defs>
-                                    <linearGradient id="w-grad" x1="4" y1="4" x2="60" y2="60">
-                                        <stop stop-color="#818cf8"/>
-                                        <stop offset="1" stop-color="#c084fc"/>
-                                    </linearGradient>
-                                </defs>
-                            </svg>
-                        </div>
-                        <h1 class="welcome-title">MLX-Moxy-Wirks</h1>
-                        <p class="welcome-subtitle">I'm Moxy. Local. Private. Yours. Running on your silicon — nothing leaves this machine.</p>
-                        <div class="welcome-shortcuts">
-                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>K</kbd> Command palette</div>
-                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>⏎</kbd> Send message</div>
-                            <div class="shortcut-item"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>L</kbd> Load model</div>
+                        <div class="welcome-shell">
+                            <div class="welcome-copy">
+                                <div class="welcome-icon">
+                                    <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+                                        <rect x="4" y="4" width="56" height="56" rx="14" stroke="url(#w-grad)" stroke-width="3"/>
+                                        <path d="M16 32L24 24L32 32L40 24L48 32" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+                                        <path d="M16 42L24 34L32 42L40 34L48 42" stroke="url(#w-grad)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity="0.4"/>
+                                        <defs>
+                                            <linearGradient id="w-grad" x1="4" y1="4" x2="60" y2="60">
+                                                <stop stop-color="#0f766e"/>
+                                                <stop offset="1" stop-color="#d97706"/>
+                                            </linearGradient>
+                                        </defs>
+                                    </svg>
+                                </div>
+                                <span class="welcome-kicker">Local reasoning studio for Apple silicon</span>
+                                <h1 class="welcome-title">A calmer control room for Moxy.</h1>
+                                <p class="welcome-subtitle">Private inference, workspace grounding, and model control in one surface. Everything stays on this machine unless you explicitly add an outside source.</p>
+                                <div class="welcome-shortcuts">
+                                    <div class="shortcut-item"><kbd>⌘</kbd><kbd>K</kbd> Command palette</div>
+                                    <div class="shortcut-item"><kbd>⌘</kbd><kbd>⏎</kbd> Send message</div>
+                                    <div class="shortcut-item"><kbd>⌘</kbd><kbd>⇧</kbd><kbd>L</kbd> Load model</div>
+                                </div>
+                            </div>
+                            <div class="welcome-aside">
+                                <div class="welcome-panel">
+                                    <span class="welcome-panel-label">Flow</span>
+                                    <strong>Model, workspace, prompt</strong>
+                                    <p>Use the cards above to shape context before the first message lands.</p>
+                                </div>
+                                <div class="welcome-panel">
+                                    <span class="welcome-panel-label">Privacy</span>
+                                    <strong>Local by default</strong>
+                                    <p>Models run on-device, with explicit opt-in for web and GitHub grounding.</p>
+                                </div>
+                            </div>
                         </div>
                         <div class="welcome-hints">
                             <button class="hint-chip" data-prompt="Explain quantum computing in simple terms">🔬 Quantum computing</button>

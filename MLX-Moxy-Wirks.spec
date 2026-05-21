@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_all
 
 ROOT = Path(SPECPATH)
 ICON_PATH = ROOT / 'assets' / 'MLX-Moxy-Wirks.icns'
+MLX_LM_DATA, MLX_LM_BINARIES, MLX_LM_HIDDENIMPORTS = collect_all('mlx_lm')
 MLX_DATA, MLX_BINARIES, MLX_HIDDENIMPORTS = collect_all('mlx')
 MLX_WHISPER_DATA, MLX_WHISPER_BINARIES, MLX_WHISPER_HIDDENIMPORTS = collect_all('mlx_whisper')
 
@@ -13,9 +14,9 @@ MLX_WHISPER_DATA, MLX_WHISPER_BINARIES, MLX_WHISPER_HIDDENIMPORTS = collect_all(
 a = Analysis(
     ['desktop_entry.py'],
     pathex=[],
-    binaries=[*MLX_BINARIES, *MLX_WHISPER_BINARIES],
-    datas=[('static', 'static'), ('scripts', 'scripts'), *MLX_DATA, *MLX_WHISPER_DATA],
-    hiddenimports=[*MLX_HIDDENIMPORTS, *MLX_WHISPER_HIDDENIMPORTS],
+    binaries=[*MLX_LM_BINARIES, *MLX_BINARIES, *MLX_WHISPER_BINARIES],
+    datas=[('static', 'static'), ('scripts', 'scripts'), *MLX_LM_DATA, *MLX_DATA, *MLX_WHISPER_DATA],
+    hiddenimports=[*MLX_LM_HIDDENIMPORTS, *MLX_HIDDENIMPORTS, *MLX_WHISPER_HIDDENIMPORTS],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

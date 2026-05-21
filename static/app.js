@@ -94,6 +94,28 @@ const state = {
     persona: { identity: null, active: 'moxy', custom_overrides: '' },
 };
 
+function isGemma4StyleModel(model = state.loadedModelMeta) {
+    const fingerprint = `${model?.name || ''} ${model?.path || ''}`.toLowerCase();
+    return fingerprint.includes('gemma4')
+        || fingerprint.includes('gemma-4')
+        || fingerprint.includes('supergemma4');
+}
+
+function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
+    const text = String(content || '');
+    if (!text || !isGemma4StyleModel(model)) return text;
+    if (!text.includes('<|channel>')) return text;
+
+    const finalMatch = text.match(/<\|channel\>final\s*([\s\S]*)$/i);
+    if (finalMatch) {
+        return finalMatch[1].replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
+    }
+    if (/<\|channel\>thought/i.test(text)) {
+        return '';
+    }
+    return text.replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
+}
+
 // ===========================================================================
 // Preset Profiles
 // ===========================================================================
@@ -1437,7 +1459,7 @@ async function sendMessageHttpFallback(params) {
             }
         }
 
-        state.currentStreamText = data.response || '';
+        state.currentStreamText = sanitizeAssistantOutput(data.response || '');
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
             state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
@@ -1515,7 +1537,8 @@ function handleStreamMessage(data) {
     if (data.type === 'token') {
         state.currentStreamText += data.text;
         if (state.currentStreamEl) {
-            state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
+            const visible = sanitizeAssistantOutput(state.currentStreamText);
+            state.currentStreamEl.innerHTML = formatMarkdown(visible || '…');
             state.currentStreamEl.classList.add('cursor-blink');
         }
         dom.statTps.textContent = `${data.tps} t/s`;
@@ -1563,9 +1586,10 @@ function handleStreamMessage(data) {
                 .then(() => fetchWorkspaceTree({ silent: true }))
                 .catch(() => null);
         }
+        const finalText = sanitizeAssistantOutput(state.currentStreamText);
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
-            state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
+            state.currentStreamEl.innerHTML = formatMarkdown(finalText);
         }
         // Update final stats
         dom.statTps.textContent = `${data.tokens_per_second} t/s`;
@@ -1579,10 +1603,10 @@ function handleStreamMessage(data) {
             dom.statusDetail.textContent = `${data.tokens_per_second} tok/s · ${data.total_tokens} tokens`;
         }
 
-        // Save to message history
+        // Save to message history (store clean text so copy/speak use final answer)
         state.messages.push({
             role: 'assistant',
-            content: state.currentStreamText,
+            content: finalText,
             tokens: data.total_tokens,
             tps: data.tokens_per_second,
         });

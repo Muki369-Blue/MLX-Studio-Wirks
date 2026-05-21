@@ -763,6 +763,69 @@ def _loaded_model_meta() -> Optional[dict]:
     }
 
 
+_GEMMA4_OUTPUT_GUIDANCE = (
+    "Gemma 4 output contract:\n"
+    "- Return only the final user-facing answer.\n"
+    "- Do not expose hidden reasoning or chain-of-thought.\n"
+    "- Do not emit channel control tags such as <|channel>thought or <|channel>final.\n"
+    "- Output plain Markdown prose only."
+)
+
+
+def _model_type_hints(model_path: Optional[str]) -> set[str]:
+    if not model_path:
+        return set()
+
+    path = Path(model_path).expanduser()
+    config_path = path / "config.json"
+    if not config_path.exists():
+        return set()
+
+    config = _load_json_file(config_path)
+    types: set[str] = set()
+    for root in (config, config.get("text_config"), config.get("llm_config"), config.get("language_config")):
+        if not isinstance(root, dict):
+            continue
+        model_type = str(root.get("model_type") or "").strip().lower()
+        if model_type:
+            types.add(model_type)
+
+    for architecture in config.get("architectures") or []:
+        label = str(architecture or "").strip().lower()
+        if label:
+            types.add(label)
+
+    return types
+
+
+def _is_gemma4_model(model_path: Optional[str] = None, model_name: Optional[str] = None) -> bool:
+    name_lower = str(model_name or _model_name or "").lower()
+    if any(token in name_lower for token in ("gemma4", "gemma-4", "supergemma4")):
+        return True
+
+    model_types = _model_type_hints(model_path or _model_path)
+    return any("gemma4" in model_type for model_type in model_types)
+
+
+def _inject_model_output_guidance(messages: list[dict]) -> list[dict]:
+    if not messages or not _is_gemma4_model():
+        return messages
+
+    updated = list(messages)
+    for idx, msg in enumerate(updated):
+        if msg.get("role") != "system":
+            continue
+        content = str(msg.get("content") or "")
+        if _GEMMA4_OUTPUT_GUIDANCE in content:
+            return updated
+        merged = f"{content.rstrip()}\n\n{_GEMMA4_OUTPUT_GUIDANCE}" if content.strip() else _GEMMA4_OUTPUT_GUIDANCE
+        updated[idx] = {**msg, "content": merged}
+        return updated
+
+    updated.insert(0, {"role": "system", "content": _GEMMA4_OUTPUT_GUIDANCE})
+    return updated
+
+
 def _extract_pdf_text(data: bytes) -> str:
     try:
         from io import BytesIO
@@ -2463,6 +2526,26 @@ def _extract_context_length_from_config(config: dict) -> int:
     return detected
 
 
+def _extract_param_size_from_name(name: str) -> str:
+    candidates: list[tuple[float, str]] = []
+    for match in re.finditer(r"(?:(?<=^)|(?<=[^A-Za-z0-9]))(\d+(?:\.\d+)?)b(?=$|[^A-Za-z0-9])", name, re.IGNORECASE):
+        raw = match.group(1)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        candidates.append((value, raw))
+
+    if not candidates:
+        return ""
+
+    _, raw = max(candidates, key=lambda item: item[0])
+    value = float(raw)
+    if value.is_integer():
+        return f"{int(value)}B"
+    return f"{raw}B"
+
+
 def _detect_model_profile(p: Path, name: str) -> dict:
     """
     Rich model profiling — ported from AI-ArtWirks _detect_model_profile().
@@ -2568,9 +2651,9 @@ def _detect_model_profile(p: Path, name: str) -> dict:
                 break
 
     # ── Parameter count detection ──
-    param_patterns = re.findall(r"(\d+\.?\d*)[bB]", name)
-    if param_patterns:
-        meta["params"] = param_patterns[-1] + "B"
+    param_size = _extract_param_size_from_name(name)
+    if param_size:
+        meta["params"] = param_size
     elif not meta["params"]:
         # Estimate from config (hidden_size × num_layers × ~12 for typical LLM)
         hidden = config.get("hidden_size", 0)
@@ -3188,6 +3271,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
         tool_runs = []
 
     if messages:
+        messages = _inject_model_output_guidance(list(messages))
         messages, context_meta = _compact_messages_for_context(
             list(messages),
             prepared["max_tokens"],

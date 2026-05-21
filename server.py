@@ -172,9 +172,11 @@ _browser_service_process: Optional[subprocess.Popen] = None
 _browser_service_lock = threading.Lock()
 _browser_service_restart_count: int = 0
 
-# Voice / STT configuration (user-selectable, persisted in app_state)
+# Voice / STT configuration (user-selectable, persisted in app_state).
+# TTS defaults to a neural XTTS persona — the app no longer surfaces
+# macOS system voices; we only ship cloned neural voices.
 _whisper_model: str = "mlx-community/whisper-tiny"
-_tts_voice: str = "Samantha"
+_tts_voice: str = "nayara"
 
 # XTTS v2 neural voice cloning — Nayara-style personas.
 # Loaded lazily on first synthesis request (1.8 GB model download on first run).
@@ -203,20 +205,76 @@ def _patch_transformers_for_xtts() -> None:
     except Exception:
         pass
 
+
+def _patch_inspect_for_pyinstaller() -> None:
+    """coqpit/trainer call `inspect.getsource(cls)` to introspect dataclass fields.
+    In a PyInstaller-frozen bundle, the default `inspect.getsource` lookup falls
+    through `linecache` which doesn't know about source files alongside the
+    bundled .pyc — so the call raises `OSError: could not get source code`.
+
+    We monkey-patch `inspect.getsourcefile` to also check for a sibling .py
+    next to the module's __file__, and prime `linecache` with its contents.
+    Safe to call multiple times.
+    """
+    try:
+        import inspect
+        import linecache
+        if getattr(inspect, "_moxy_patched_for_pyinstaller", False):
+            return
+
+        original_getsourcefile = inspect.getsourcefile
+
+        def patched_getsourcefile(obj):
+            try:
+                result = original_getsourcefile(obj)
+                if result:
+                    return result
+            except Exception:
+                pass
+            # Fall back: look at the module's __file__, swap .pyc → .py
+            try:
+                mod = inspect.getmodule(obj)
+                fname = getattr(mod, "__file__", None)
+                if fname:
+                    if fname.endswith(".pyc"):
+                        candidate = fname[:-1]  # .pyc → .py
+                    elif fname.endswith(".py"):
+                        candidate = fname
+                    else:
+                        candidate = None
+                    if candidate and Path(candidate).exists():
+                        # Prime linecache so inspect.getsourcelines() works.
+                        with open(candidate, "r", encoding="utf-8") as fh:
+                            lines = fh.readlines()
+                        linecache.cache[candidate] = (len(lines), None, lines, candidate)
+                        return candidate
+            except Exception:
+                pass
+            return None
+
+        inspect.getsourcefile = patched_getsourcefile
+        inspect._moxy_patched_for_pyinstaller = True
+    except Exception:
+        pass
+
 XTTS_PERSONAS: dict[str, dict] = {
     "nayara": {
         "label": "Nayara",
         "description": "Warm, unfiltered (neural clone)",
-        "voice_ref": "static/voices/nayara.mp3",
+        "voice_ref": "static/voices/nayara.wav",
         "language": "en",
     },
-    "v2": {
-        "label": "V2",
-        "description": "V2 reference voice (neural clone)",
-        "voice_ref": "static/voices/v2.wav",
+    "mpg_lydia": {
+        "label": "MPG Lydia",
+        "description": "MPG Lydia (neural clone)",
+        "voice_ref": "static/voices/mpg_lydia.wav",
         "language": "en",
     },
 }
+
+# Cached speaker latents per persona — avoids re-encoding the reference WAV
+# on every synthesis call (faster + more consistent voice match).
+_xtts_speaker_latents: dict[str, tuple] = {}
 
 # Workspace file watcher
 _workspace_observer: Optional[Any] = None
@@ -5334,6 +5392,19 @@ if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+@app.middleware("http")
+async def _disable_static_cache(request: Request, call_next):
+    """Disable browser caching of /static so users always see the latest UI
+    after a rebuild — no more stale app.js / style.css."""
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith("/static") or path == "/":
+        response.headers["Cache-Control"] = "no-store, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+
 @app.get("/")
 async def root():
     index = static_dir / "index.html"
@@ -5372,17 +5443,30 @@ def _load_xtts_blocking() -> None:
         os.environ.setdefault("TTS_AGREE_TERMS", "1")
         os.environ.setdefault("COQUI_TOS_AGREED", "1")
         _patch_transformers_for_xtts()
+        _patch_inspect_for_pyinstaller()
         from TTS.api import TTS
         model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
         with _xtts_lock:
             _xtts_model = model
             _xtts_loading = False
+        # Pre-warm speaker latents for every persona whose reference exists,
+        # so the first Speak click is instant and synthesis stays consistent.
+        for persona_id in XTTS_PERSONAS.keys():
+            ref = _xtts_voice_ref_path(persona_id)
+            if ref is not None:
+                try:
+                    _get_xtts_latents(model, persona_id, ref)
+                except Exception:
+                    pass
         _push_event("xtts_loaded", {"status": "ready"})
     except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"❌ XTTS load failed:\n{tb}", flush=True)
         with _xtts_lock:
             _xtts_loading = False
             _xtts_error = str(exc)
-        _push_event("xtts_error", {"error": str(exc)})
+        _push_event("xtts_error", {"error": str(exc), "traceback": tb})
 
 
 def _xtts_start_loading_async() -> None:
@@ -5400,8 +5484,34 @@ def _strip_reasoning_for_speech(text: str) -> str:
     return cleaned.strip()
 
 
+def _get_xtts_latents(model, persona_id: str, voice_ref: Path) -> tuple:
+    """Compute and cache speaker latents for a persona. Re-extracting per
+    synthesis is slow and produces small variations in voice — caching makes
+    synthesis faster and the cloned voice more consistent across utterances."""
+    cached = _xtts_speaker_latents.get(persona_id)
+    if cached is not None:
+        return cached
+    try:
+        # XTTS exposes get_conditioning_latents via the underlying model.
+        # Returns (gpt_cond_latent, speaker_embedding).
+        latents = model.synthesizer.tts_model.get_conditioning_latents(
+            audio_path=str(voice_ref),
+            gpt_cond_len=30,
+            max_ref_length=30,
+        )
+        _xtts_speaker_latents[persona_id] = latents
+        return latents
+    except Exception:
+        # Fallback: caller will use tts_to_file with file path.
+        return None
+
+
 def _synthesize_xtts(text: str, persona_id: str) -> bytes:
-    """Synthesize WAV bytes via XTTS v2 with the persona's reference voice."""
+    """Synthesize WAV bytes via XTTS v2 with the persona's reference voice.
+
+    Uses cached speaker latents when available (faster + consistent voice).
+    Falls back to file-based tts_to_file if the low-level path fails.
+    """
     persona = XTTS_PERSONAS.get(persona_id) or XTTS_PERSONAS["nayara"]
     voice_ref = _xtts_voice_ref_path(persona_id)
     if voice_ref is None:
@@ -5416,6 +5526,43 @@ def _synthesize_xtts(text: str, persona_id: str) -> bytes:
     clean = _strip_reasoning_for_speech(text)
     if not clean:
         raise RuntimeError("No speakable text after stripping reasoning markup.")
+
+    # Try cached-latents fast path: skip re-encoding the WAV on each call.
+    latents = _get_xtts_latents(model, persona_id, voice_ref)
+    if latents is not None:
+        try:
+            import numpy as np
+            import soundfile as sf
+            gpt_cond_latent, speaker_embedding = latents
+            out = model.synthesizer.tts_model.inference(
+                text=clean,
+                language=language,
+                gpt_cond_latent=gpt_cond_latent,
+                speaker_embedding=speaker_embedding,
+                temperature=0.70,
+                length_penalty=1.0,
+                repetition_penalty=5.0,
+                top_k=50,
+                top_p=0.85,
+                speed=1.18,
+                enable_text_splitting=len(clean) > 200,
+            )
+            wav = out.get("wav") if isinstance(out, dict) else out
+            wav_np = np.asarray(wav, dtype=np.float32)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            try:
+                sf.write(tmp.name, wav_np, 24000, subtype="PCM_16")
+                with open(tmp.name, "rb") as fh:
+                    return fh.read()
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        except Exception as exc:
+            # If the fast path fails, fall through to the file-based API.
+            print(f"⚠ XTTS fast-path failed ({exc}), falling back to tts_to_file", flush=True)
 
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
@@ -5451,10 +5598,12 @@ def _restore_voice_settings() -> None:
                 "medium": "mlx-community/whisper-medium",
             }
             _whisper_model = SIZE_MAP.get(settings["whisper_model"], _whisper_model)
-        # If a neural persona was previously selected, start loading XTTS now
-        # so it's ready when the user clicks Speak.
-        if _tts_voice.lower() in XTTS_PERSONAS:
-            _xtts_start_loading_async()
+    except Exception:
+        pass
+    # We only offer neural voices — always start loading XTTS at startup so
+    # auto-speak works out of the box without a manual trigger.
+    try:
+        _xtts_start_loading_async()
     except Exception:
         pass
 

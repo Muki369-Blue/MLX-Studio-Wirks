@@ -428,6 +428,13 @@ const voice = {
     isRecording: false,
     autoSpeak: localStorage.getItem('moxy_autoSpeak') === 'true',
     currentAudio: null,
+    // Sentence-level streaming TTS state.
+    spokenUpToIdx: 0,           // chars of state.currentStreamText already dispatched
+    speechQueue: [],            // pending Audio elements waiting their turn
+    queuePlaying: false,        // is a queued clip currently playing?
+    // Cached set of neural persona ids (e.g. {'nayara','mpg_lydia'}), populated
+    // from /api/audio/personas at init so we never hardcode a stale list.
+    neuralPersonas: new Set(),
 };
 
 function setupVoice() {
@@ -560,11 +567,12 @@ async function speakText(text) {
     if (!clean) return;
 
     try {
-        // If the user selected a neural persona (Nayara/V2), send it as `persona`
-        // so the backend routes through XTTS v2; otherwise the voice falls through
-        // to macOS `say`.
+        // If the user selected a neural persona (Nayara/MPG Lydia/etc), send
+        // it as `persona` so the backend routes through XTTS v2; otherwise
+        // the voice falls through to macOS `say`. The neural persona set is
+        // populated dynamically from /api/audio/personas, never hardcoded.
         const selected = (dom.ttsVoiceSelect?.value || '').trim();
-        const isNeural = ['nayara', 'v2'].includes(selected.toLowerCase());
+        const isNeural = voice.neuralPersonas.has(selected.toLowerCase());
         const payload = isNeural
             ? { text: clean, persona: selected.toLowerCase() }
             : { text: clean, voice: selected };
@@ -609,11 +617,129 @@ function stopSpeaking() {
         try { voice.currentAudio.pause(); } catch {}
         voice.currentAudio = null;
     }
+    voice.speechQueue.forEach(item => { try { URL.revokeObjectURL(item.url); } catch {} });
+    voice.speechQueue = [];
+    voice.queuePlaying = false;
+    voice.spokenUpToIdx = 0;
     if (window.speechSynthesis && speechSynthesis.speaking) {
         try { speechSynthesis.cancel(); } catch {}
     }
     document.querySelectorAll('.btn-msg-speak.playing').forEach(b => b.classList.remove('playing'));
     showStopSpeakingButton(false);
+}
+
+// Fetch a WAV for the given chunk and add it to the playback queue.
+async function enqueueSpeechChunk(text) {
+    const clean = extractFinalAnswer(text)
+        .replace(/```[\s\S]*?```/g, ' code block ')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*(.*?)\*\*/g, '$1')
+        .replace(/\*(.*?)\*/g, '$1')
+        .replace(/#{1,6}\s/g, '')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .trim();
+    if (!clean) return;
+
+    const selected = (dom.ttsVoiceSelect?.value || '').trim();
+    const isNeural = voice.neuralPersonas.has(selected.toLowerCase());
+    const payload = isNeural
+        ? { text: clean, persona: selected.toLowerCase() }
+        : { text: clean, voice: selected };
+
+    try {
+        const res = await fetch('/api/audio/speak', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        if (res.status === 503) {
+            const err = await res.json().catch(() => ({}));
+            if (!voice._loadingToastShown) {
+                voice._loadingToastShown = true;
+                showToast(err.error || 'Neural voice still loading…', 'info');
+            }
+            return;
+        }
+        if (!res.ok) return;
+        voice._loadingToastShown = false;
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        voice.speechQueue.push({ url });
+        playNextSpeechChunk();
+    } catch { /* swallow */ }
+}
+
+function playNextSpeechChunk() {
+    if (voice.queuePlaying) return;
+    const next = voice.speechQueue.shift();
+    if (!next) {
+        showStopSpeakingButton(false);
+        return;
+    }
+    voice.queuePlaying = true;
+    const audio = new Audio(next.url);
+    voice.currentAudio = audio;
+    showStopSpeakingButton(true);
+    audio.onended = () => {
+        URL.revokeObjectURL(next.url);
+        voice.currentAudio = null;
+        voice.queuePlaying = false;
+        playNextSpeechChunk();
+    };
+    audio.onerror = () => {
+        URL.revokeObjectURL(next.url);
+        voice.queuePlaying = false;
+        playNextSpeechChunk();
+    };
+    audio.play().catch(() => {
+        voice.queuePlaying = false;
+        playNextSpeechChunk();
+    });
+}
+
+// Look at the streaming text past spokenUpToIdx for any new completed
+// sentences (ends in . ! ? followed by space/newline). Dispatch each to
+// the TTS queue and advance the pointer.
+function drainPendingSpeechSentences(flushTail = false) {
+    const visible = sanitizeAssistantOutput(state.currentStreamText);
+    // Don't speak the sentinel/thoughts portion — only what's after FINAL.
+    let speakable;
+    if (visible.startsWith('\x00THOUGHTS\x00')) {
+        const parts = visible.split('\x00FINAL\x00');
+        speakable = (parts[1] || '');
+    } else if (/<\|channel\>thought/i.test(visible) && !/<\|channel\>final|<channel\|\>/i.test(visible)) {
+        return;  // still in thought-only territory
+    } else {
+        speakable = visible;
+    }
+
+    const pending = speakable.slice(voice.spokenUpToIdx);
+    if (!pending) return;
+
+    // Find sentence boundaries. Be conservative: need a punctuation followed
+    // by whitespace or end-of-string.
+    const sentenceRe = /[^.!?\n]+[.!?]+(?:\s+|$)/g;
+    let m;
+    let consumed = 0;
+    const chunks = [];
+    while ((m = sentenceRe.exec(pending)) !== null) {
+        const chunk = m[0].trim();
+        if (chunk.length >= 6) {  // ignore tiny fragments
+            chunks.push(chunk);
+            consumed = m.index + m[0].length;
+        }
+    }
+    if (consumed > 0) {
+        voice.spokenUpToIdx += consumed;
+        chunks.forEach(c => enqueueSpeechChunk(c));
+    } else if (flushTail) {
+        // End of stream: flush whatever's left as a final chunk.
+        const tail = pending.trim();
+        if (tail.length >= 3) {
+            voice.spokenUpToIdx = speakable.length;
+            enqueueSpeechChunk(tail);
+        }
+    }
 }
 
 function showStopSpeakingButton(visible) {
@@ -719,62 +845,60 @@ function setupMemoryFlush() {
 // Voice Settings (TTS voice + Whisper model selects)
 // ===========================================================================
 async function setupVoiceSettings() {
-    // Populate TTS voice dropdown: Nayara neural personas + macOS voices.
+    // Populate the TTS voice dropdown with NEURAL personas only — the app
+    // no longer surfaces macOS system voices (they sounded computerized).
     if (dom.ttsVoiceSelect) {
         try {
-            const [voicesRes, personasRes] = await Promise.all([
-                fetch('/api/audio/voices').then(r => r.json()).catch(() => ({})),
-                fetch('/api/audio/personas').then(r => r.json()).catch(() => ({})),
-            ]);
-            const voices = Array.isArray(voicesRes.voices) ? voicesRes.voices : [];
+            const personasRes = await fetch('/api/audio/personas')
+                .then(r => r.json())
+                .catch(() => ({}));
             const personas = (personasRes.personas || []).filter(p => p.available);
+            voice.neuralPersonas = new Set(personas.map(p => String(p.id).toLowerCase()));
 
-            const groups = [];
             if (personas.length) {
-                groups.push(
-                    `<optgroup label="🧠 Neural Voice (XTTS v2)">` +
-                    personas.map(p =>
-                        `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)} · ${escapeHtml(p.description)}</option>`
-                    ).join('') +
-                    `</optgroup>`
-                );
+                dom.ttsVoiceSelect.innerHTML = personas.map(p =>
+                    `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)} · ${escapeHtml(p.description)}</option>`
+                ).join('');
+            } else {
+                dom.ttsVoiceSelect.innerHTML = '<option value="nayara">Nayara</option>';
+                voice.neuralPersonas.add('nayara');
             }
-            if (voices.length) {
-                groups.push(
-                    `<optgroup label="🔊 macOS System Voices">` +
-                    voices.map(v =>
-                        `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
-                    ).join('') +
-                    `</optgroup>`
-                );
-            }
-            dom.ttsVoiceSelect.innerHTML = groups.join('') || '<option value="Samantha">Samantha</option>';
 
-            // Read current voice from backend
+            // Read current voice from backend; fall back to first persona.
             const curRes = await fetch('/api/audio/voice');
             const curData = await curRes.json();
-            if (curData.voice) dom.ttsVoiceSelect.value = curData.voice;
+            const want = (curData.voice || '').toLowerCase();
+            if (want && voice.neuralPersonas.has(want)) {
+                dom.ttsVoiceSelect.value = want;
+            } else if (personas.length) {
+                dom.ttsVoiceSelect.value = personas[0].id;
+                // Persist so backend matches UI on next boot.
+                fetch('/api/audio/voice', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ voice: personas[0].id }),
+                }).catch(() => null);
+            }
 
-            // Surface load status for neural model
             if (personasRes.loading) {
-                showToast('Neural voice (XTTS) is loading in the background…', 'info');
+                showToast('Neural voice loading in the background…', 'info');
             } else if (personasRes.error) {
                 console.warn('XTTS load error:', personasRes.error);
             }
         } catch {
-            dom.ttsVoiceSelect.innerHTML = '<option value="Samantha">Samantha</option>';
+            dom.ttsVoiceSelect.innerHTML = '<option value="nayara">Nayara</option>';
+            voice.neuralPersonas = new Set(['nayara']);
         }
 
         dom.ttsVoiceSelect.addEventListener('change', () => {
-            const voice = dom.ttsVoiceSelect.value;
+            const selectedVoice = dom.ttsVoiceSelect.value;
             fetch('/api/audio/voice', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ voice }),
+                body: JSON.stringify({ voice: selectedVoice }),
             }).then(() => {
-                showToast(`Voice: ${voice}`, 'success');
-                // Neural personas trigger ~1.8 GB download on first selection.
-                if (['nayara', 'v2'].includes(voice.toLowerCase())) {
+                showToast(`Voice: ${selectedVoice}`, 'success');
+                if (voice.neuralPersonas.has(selectedVoice.toLowerCase())) {
                     showToast('Neural voice loading — first run downloads ~1.8 GB', 'info');
                 }
             }).catch(() => null);
@@ -1799,6 +1923,12 @@ function handleStreamMessage(data) {
             state.currentStreamEl.innerHTML = renderWithThoughts(visible || '…');
             state.currentStreamEl.classList.add('cursor-blink');
         }
+        // Sentence-level streaming TTS: start speaking the first sentence as
+        // soon as it's complete, so the user hears voice playback while the
+        // model is still generating the rest. Massive perceived latency win.
+        if (voice.autoSpeak) {
+            drainPendingSpeechSentences();
+        }
         dom.statTps.textContent = `${data.tps} t/s`;
         dom.statTps.classList.add('active');
         dom.statTokens.textContent = `${data.tokens}`;
@@ -1872,16 +2002,15 @@ function handleStreamMessage(data) {
             tokens: data.total_tokens,
             tps: data.tokens_per_second,
         });
-        // Attach a speak button to the streamed bubble and auto-speak if enabled
-        // (appendMessage's auto-speak hook ran while content was empty, so we
-        // re-trigger here with the final text).
+        // Attach speak button to the streamed bubble. Auto-speak chunks
+        // already streamed during generation; flush any remaining tail.
         const streamedBubble = state.currentStreamEl?.closest('.message');
         if (streamedBubble && finalText) {
             if (!streamedBubble.querySelector('.btn-msg-speak')) {
                 addSpeakButton(streamedBubble, finalText);
             }
             if (voice.autoSpeak) {
-                speakText(finalText);
+                drainPendingSpeechSentences(true);  // flush the last partial sentence
             }
         }
         saveCurrentSession();
@@ -2098,6 +2227,8 @@ async function sendMessage(customText = null, options = {}) {
     const msgEl = appendMessage('assistant', '', 0);
     state.currentStreamEl = msgEl.querySelector('.message-body');
     state.currentStreamText = '';
+    // Reset sentence-streaming state for the new response.
+    voice.spokenUpToIdx = 0;
 
     // Send via WebSocket
     const generation = getGenerationParams();

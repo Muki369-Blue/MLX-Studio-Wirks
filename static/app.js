@@ -528,11 +528,25 @@ async function speakText(text) {
     if (!clean) return;
 
     try {
+        // If the user selected a neural persona (Nayara/V2), send it as `persona`
+        // so the backend routes through XTTS v2; otherwise the voice falls through
+        // to macOS `say`.
+        const selected = (dom.ttsVoiceSelect?.value || '').trim();
+        const isNeural = ['nayara', 'v2'].includes(selected.toLowerCase());
+        const payload = isNeural
+            ? { text: clean, persona: selected.toLowerCase() }
+            : { text: clean, voice: selected };
+
         const res = await fetch('/api/audio/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: clean }),
+            body: JSON.stringify(payload),
         });
+        if (res.status === 503) {
+            const err = await res.json().catch(() => ({}));
+            showToast(err.error || 'Neural voice still loading…', 'info');
+            throw new Error('loading');
+        }
         if (!res.ok) throw new Error('TTS failed');
         const audioBlob = await res.blob();
         const url = URL.createObjectURL(audioBlob);
@@ -647,20 +661,48 @@ function setupMemoryFlush() {
 // Voice Settings (TTS voice + Whisper model selects)
 // ===========================================================================
 async function setupVoiceSettings() {
-    // Populate TTS voice dropdown
+    // Populate TTS voice dropdown: Nayara neural personas + macOS voices.
     if (dom.ttsVoiceSelect) {
         try {
-            const res = await fetch('/api/audio/voices');
-            const data = await res.json();
-            const voices = Array.isArray(data.voices) ? data.voices : [];
-            dom.ttsVoiceSelect.innerHTML = voices.map(v =>
-                `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
-            ).join('') || '<option value="Samantha">Samantha</option>';
+            const [voicesRes, personasRes] = await Promise.all([
+                fetch('/api/audio/voices').then(r => r.json()).catch(() => ({})),
+                fetch('/api/audio/personas').then(r => r.json()).catch(() => ({})),
+            ]);
+            const voices = Array.isArray(voicesRes.voices) ? voicesRes.voices : [];
+            const personas = (personasRes.personas || []).filter(p => p.available);
+
+            const groups = [];
+            if (personas.length) {
+                groups.push(
+                    `<optgroup label="🧠 Neural Voice (XTTS v2)">` +
+                    personas.map(p =>
+                        `<option value="${escapeHtml(p.id)}">${escapeHtml(p.label)} · ${escapeHtml(p.description)}</option>`
+                    ).join('') +
+                    `</optgroup>`
+                );
+            }
+            if (voices.length) {
+                groups.push(
+                    `<optgroup label="🔊 macOS System Voices">` +
+                    voices.map(v =>
+                        `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+                    ).join('') +
+                    `</optgroup>`
+                );
+            }
+            dom.ttsVoiceSelect.innerHTML = groups.join('') || '<option value="Samantha">Samantha</option>';
 
             // Read current voice from backend
             const curRes = await fetch('/api/audio/voice');
             const curData = await curRes.json();
             if (curData.voice) dom.ttsVoiceSelect.value = curData.voice;
+
+            // Surface load status for neural model
+            if (personasRes.loading) {
+                showToast('Neural voice (XTTS) is loading in the background…', 'info');
+            } else if (personasRes.error) {
+                console.warn('XTTS load error:', personasRes.error);
+            }
         } catch {
             dom.ttsVoiceSelect.innerHTML = '<option value="Samantha">Samantha</option>';
         }
@@ -671,7 +713,13 @@ async function setupVoiceSettings() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ voice }),
-            }).then(() => showToast(`TTS voice: ${voice}`, 'success')).catch(() => null);
+            }).then(() => {
+                showToast(`Voice: ${voice}`, 'success');
+                // Neural personas trigger ~1.8 GB download on first selection.
+                if (['nayara', 'v2'].includes(voice.toLowerCase())) {
+                    showToast('Neural voice loading — first run downloads ~1.8 GB', 'info');
+                }
+            }).catch(() => null);
         });
     }
 

@@ -39,7 +39,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
@@ -175,6 +175,28 @@ _browser_service_restart_count: int = 0
 # Voice / STT configuration (user-selectable, persisted in app_state)
 _whisper_model: str = "mlx-community/whisper-tiny"
 _tts_voice: str = "Samantha"
+
+# XTTS v2 neural voice cloning — Nayara-style personas.
+# Loaded lazily on first synthesis request (1.8 GB model download on first run).
+_xtts_model: Optional[Any] = None
+_xtts_loading: bool = False
+_xtts_error: Optional[str] = None
+_xtts_lock = threading.Lock()
+
+XTTS_PERSONAS: dict[str, dict] = {
+    "nayara": {
+        "label": "Nayara",
+        "description": "Warm, unfiltered (neural clone)",
+        "voice_ref": "static/voices/nayara.mp3",
+        "language": "en",
+    },
+    "v2": {
+        "label": "V2",
+        "description": "V2 reference voice (neural clone)",
+        "voice_ref": "static/voices/v2.wav",
+        "language": "en",
+    },
+}
 
 # Workspace file watcher
 _workspace_observer: Optional[Any] = None
@@ -4626,12 +4648,72 @@ async def web_search(query: str):
 # ---------------------------------------------------------------------------
 import tempfile
 
+@app.get("/api/audio/personas")
+async def audio_personas():
+    """List neural voice personas (XTTS v2 clones) and their load state."""
+    with _xtts_lock:
+        loaded = _xtts_model is not None
+        loading = _xtts_loading
+        error = _xtts_error
+    return {
+        "personas": [
+            {
+                "id": key,
+                "label": p["label"],
+                "description": p["description"],
+                "language": p.get("language", "en"),
+                "available": _xtts_voice_ref_path(key) is not None,
+            }
+            for key, p in XTTS_PERSONAS.items()
+        ],
+        "loaded": loaded,
+        "loading": loading,
+        "error": error,
+    }
+
+
+@app.post("/api/audio/personas/load")
+async def audio_personas_load():
+    """Trigger background load of the XTTS v2 model (first run downloads ~1.8 GB)."""
+    _xtts_start_loading_async()
+    with _xtts_lock:
+        return {
+            "loaded": _xtts_model is not None,
+            "loading": _xtts_loading,
+            "error": _xtts_error,
+        }
+
+
 @app.post("/api/audio/speak")
 async def audio_speak(request: dict):
-    """TTS via macOS `say` command.  Returns audio/aac stream."""
+    """TTS endpoint. Routes to XTTS v2 when a neural persona is selected,
+    otherwise falls back to macOS `say`. Returns audio/wav or audio/aiff."""
     text = (request.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
+
+    persona_id = (request.get("persona") or "").strip().lower()
+    if persona_id and persona_id in XTTS_PERSONAS:
+        with _xtts_lock:
+            ready = _xtts_model is not None
+            loading = _xtts_loading
+            err = _xtts_error
+        if not ready:
+            if not loading:
+                _xtts_start_loading_async()
+            return JSONResponse(
+                {
+                    "error": err or "Neural voice is still loading. First-run download is ~1.8 GB.",
+                    "loading": True,
+                },
+                status_code=503,
+            )
+        try:
+            wav_bytes = await asyncio.to_thread(_synthesize_xtts, text, persona_id)
+        except Exception as exc:
+            return JSONResponse({"error": f"XTTS synthesis failed: {exc}"}, status_code=500)
+        return Response(content=wav_bytes, media_type="audio/wav")
+
     voice = (request.get("voice") or _tts_voice or "Samantha").strip()
 
     tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
@@ -4686,7 +4768,8 @@ async def audio_voices():
 
 @app.post("/api/audio/voice")
 async def set_tts_voice(request: dict):
-    """Set the default macOS TTS voice (persisted for this session)."""
+    """Set the default voice. Accepts either a macOS voice name or a Nayara
+    neural persona id (e.g. 'nayara', 'v2'). Neural personas trigger XTTS load."""
     global _tts_voice
     voice = (request.get("voice") or "").strip()
     if not voice:
@@ -4695,6 +4778,9 @@ async def set_tts_voice(request: dict):
     state = _load_app_state()
     state.setdefault("settings", {})["tts_voice"] = voice
     _save_app_state(state)
+    # If the user picked a neural persona, kick off background XTTS load now.
+    if voice.lower() in XTTS_PERSONAS:
+        _xtts_start_loading_async()
     return {"voice": _tts_voice}
 
 
@@ -5236,6 +5322,95 @@ async def root():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# XTTS v2 — neural voice cloning (Nayara-style personas)
+# ---------------------------------------------------------------------------
+def _xtts_voice_ref_path(persona_id: str) -> Optional[Path]:
+    persona = XTTS_PERSONAS.get(persona_id)
+    if not persona:
+        return None
+    rel = persona.get("voice_ref") or ""
+    candidate = (BASE_DIR / rel).resolve() if not Path(rel).is_absolute() else Path(rel)
+    return candidate if candidate.exists() else None
+
+
+def _load_xtts_blocking() -> None:
+    """Load XTTS v2 model synchronously. Sets _xtts_model on success or _xtts_error on failure.
+
+    Runs on a worker thread; downloads ~1.8 GB of weights on first run.
+    """
+    global _xtts_model, _xtts_loading, _xtts_error
+    with _xtts_lock:
+        if _xtts_model is not None or _xtts_loading:
+            return
+        _xtts_loading = True
+        _xtts_error = None
+    try:
+        os.environ.setdefault("TTS_AGREE_TERMS", "1")
+        os.environ.setdefault("COQUI_TOS_AGREED", "1")
+        from TTS.api import TTS
+        model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
+        with _xtts_lock:
+            _xtts_model = model
+            _xtts_loading = False
+        _push_event("xtts_loaded", {"status": "ready"})
+    except Exception as exc:
+        with _xtts_lock:
+            _xtts_loading = False
+            _xtts_error = str(exc)
+        _push_event("xtts_error", {"error": str(exc)})
+
+
+def _xtts_start_loading_async() -> None:
+    with _xtts_lock:
+        if _xtts_model is not None or _xtts_loading:
+            return
+    threading.Thread(target=_load_xtts_blocking, daemon=True, name="xtts-load").start()
+
+
+def _strip_reasoning_for_speech(text: str) -> str:
+    """Remove Gemma 4 channel markup + <think> blocks so TTS only speaks the answer."""
+    cleaned = re.sub(r"<think>[\s\S]*?</think>", "", str(text or ""), flags=re.IGNORECASE)
+    cleaned = re.sub(r"<\|channel\>[a-z_]+\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<channel\|\>\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def _synthesize_xtts(text: str, persona_id: str) -> bytes:
+    """Synthesize WAV bytes via XTTS v2 with the persona's reference voice."""
+    persona = XTTS_PERSONAS.get(persona_id) or XTTS_PERSONAS["nayara"]
+    voice_ref = _xtts_voice_ref_path(persona_id)
+    if voice_ref is None:
+        raise RuntimeError(f"Voice reference missing for persona '{persona_id}'.")
+
+    with _xtts_lock:
+        model = _xtts_model
+    if model is None:
+        raise RuntimeError("XTTS model not yet loaded.")
+
+    language = persona.get("language", "en")
+    clean = _strip_reasoning_for_speech(text)
+    if not clean:
+        raise RuntimeError("No speakable text after stripping reasoning markup.")
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        model.tts_to_file(
+            text=clean,
+            speaker_wav=str(voice_ref),
+            language=language,
+            file_path=tmp.name,
+        )
+        with open(tmp.name, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def _restore_voice_settings() -> None:
     """Restore user-saved voice/whisper settings from app_state on startup."""
     global _tts_voice, _whisper_model
@@ -5252,6 +5427,10 @@ def _restore_voice_settings() -> None:
                 "medium": "mlx-community/whisper-medium",
             }
             _whisper_model = SIZE_MAP.get(settings["whisper_model"], _whisper_model)
+        # If a neural persona was previously selected, start loading XTTS now
+        # so it's ready when the user clicks Speak.
+        if _tts_voice.lower() in XTTS_PERSONAS:
+            _xtts_start_loading_async()
     except Exception:
         pass
 

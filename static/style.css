@@ -881,18 +881,13 @@ body {
     background: var(--accent-start);
 }
 
+/* Pro Mode removed — all params always visible. */
 .advanced-param {
-    max-height: 0;
-    overflow: hidden;
-    opacity: 0;
-    margin-bottom: 0 !important;
-    transition: max-height 0.3s var(--ease-out), opacity 0.2s ease, margin 0.3s ease;
-}
-
-.advanced-param.visible {
-    max-height: 80px;
     opacity: 1;
-    margin-bottom: 12px !important;
+    margin-bottom: 12px;
+}
+.advanced-param.visible {
+    opacity: 1;
 }
 
 /* Parameter Sliders */

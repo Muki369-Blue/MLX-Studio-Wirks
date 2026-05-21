@@ -103,30 +103,49 @@ function isGemma4StyleModel(model = state.loadedModelMeta) {
         || fingerprint.includes('supergemma4');
 }
 
+// Gemma 4 emits channel tags in several variants:
+//   <|channel>thought   (opening, escaped pipe before brackets)
+//   <|channel>final     (named final channel)
+//   <channel|>          (separator the model produces between thought and answer)
+// Match any of these, including bare <|channel> closers.
+const CHANNEL_TAG_RE = /<\|channel\>[a-z_]+\s*|<channel\|\>\s*|<\|channel\>\s*/gi;
+const CHANNEL_FINAL_RE = /(?:<\|channel\>final|<channel\|\>)\s*([\s\S]*)$/i;
+const CHANNEL_THOUGHT_RE = /<\|channel\>thought\s*([\s\S]*?)(?=<\|channel\>final|<channel\|\>|$)/i;
+const CHANNEL_ANY_RE = /<\|channel\>|<channel\|\>/i;
+
 function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
     const text = String(content || '');
     if (!text || !isGemma4StyleModel(model)) return text;
-    if (!text.includes('<|channel>')) return text;
+    if (!CHANNEL_ANY_RE.test(text)) return text;
 
-    const thoughtMatch = text.match(/<\|channel\>thought\s*([\s\S]*?)(?=<\|channel\>final|$)/i);
-    const finalMatch = text.match(/<\|channel\>final\s*([\s\S]*)$/i);
+    const thoughtMatch = text.match(CHANNEL_THOUGHT_RE);
+    const finalMatch = text.match(CHANNEL_FINAL_RE);
 
-    if (state.showThoughts && thoughtMatch?.[1]?.trim()) {
+    // Whenever Gemma 4 emits thought content, always surface it as a
+    // collapsible dropdown next to whatever final text we have so far
+    // (may be empty while still thinking). renderWithThoughts() turns
+    // the sentinel into a <details> element; state.showThoughts controls
+    // whether it auto-opens.
+    if (thoughtMatch?.[1]?.trim()) {
         const thought = thoughtMatch[1].trim();
         const final = finalMatch
-            ? finalMatch[1].replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart()
+            ? finalMatch[1].replace(CHANNEL_TAG_RE, '').trimStart()
             : '';
-        // Return a sentinel that appendMessage/stream handler will detect
         return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
     }
 
     if (finalMatch) {
-        return finalMatch[1].replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
+        return finalMatch[1].replace(CHANNEL_TAG_RE, '').trimStart();
     }
-    if (/<\|channel\>thought/i.test(text)) {
-        return '';
-    }
-    return text.replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
+    return text.replace(CHANNEL_TAG_RE, '').trimStart();
+}
+
+function finalizeAssistantText(rawText) {
+    const sanitized = sanitizeAssistantOutput(rawText);
+    if (sanitized.trim()) return sanitized;
+    // Model never emitted a final-channel separator (hit token cap during thought).
+    // Surface the content with channel markers stripped rather than dropping it.
+    return String(rawText || '').replace(CHANNEL_TAG_RE, '').trim();
 }
 
 function renderWithThoughts(sanitized) {
@@ -134,7 +153,10 @@ function renderWithThoughts(sanitized) {
     const parts = sanitized.split('\x00FINAL\x00');
     const thought = parts[0].replace('\x00THOUGHTS\x00', '').trim();
     const final = (parts[1] || '').trim();
-    return `<details class="thought-block"><summary>Reasoning</summary><div class="thought-content">${formatMarkdown(thought)}</div></details>${final ? formatMarkdown(final) : ''}`;
+    const stillThinking = state.isGenerating && !final;
+    const summaryLabel = stillThinking ? 'Thinking…' : 'Reasoning';
+    const openAttr = state.showThoughts ? ' open' : '';
+    return `<details class="thought-block"${openAttr}><summary>${summaryLabel}</summary><div class="thought-content">${formatMarkdown(thought)}</div></details>${final ? formatMarkdown(final) : ''}`;
 }
 
 // ===========================================================================
@@ -470,10 +492,19 @@ async function transcribeAudio(blob) {
         const data = await res.json();
         if (data.error) { showToast(data.error, 'error'); return; }
         if (data.text) {
-            dom.chatInput.value = data.text;
+            // Preserve any text the user already typed; append the transcription.
+            const existing = (dom.chatInput.value || '').trimEnd();
+            const transcript = data.text.trim();
+            dom.chatInput.value = existing ? `${existing} ${transcript}` : transcript;
             dom.chatInput.dispatchEvent(new Event('input'));
-            // Auto-send — call sendMessage directly (textarea is not in a <form>)
-            sendMessage();
+            // Resize the textarea to fit, focus it, and move caret to the end so
+            // the Creator can review or edit before pressing Send.
+            dom.chatInput.focus();
+            dom.chatInput.style.height = 'auto';
+            dom.chatInput.style.height = `${Math.min(dom.chatInput.scrollHeight, 300)}px`;
+            const len = dom.chatInput.value.length;
+            dom.chatInput.setSelectionRange(len, len);
+            showToast('Transcribed — review and send', 'success');
         }
     } catch (e) {
         showToast('Transcription failed', 'error');
@@ -1565,7 +1596,7 @@ async function sendMessageHttpFallback(params) {
             }
         }
 
-        state.currentStreamText = sanitizeAssistantOutput(data.response || '');
+        state.currentStreamText = finalizeAssistantText(data.response || '');
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
             state.currentStreamEl.innerHTML = renderWithThoughts(state.currentStreamText);
@@ -1587,6 +1618,16 @@ async function sendMessageHttpFallback(params) {
         if (state.loadedModel) {
             dom.statusDetail.textContent = 'HTTP fallback response';
         }
+        // Attach speak button + auto-speak on HTTP fallback too.
+        const httpBubble = state.currentStreamEl?.closest('.message');
+        if (httpBubble && state.currentStreamText) {
+            if (!httpBubble.querySelector('.btn-msg-speak')) {
+                addSpeakButton(httpBubble, state.currentStreamText);
+            }
+            if (voice.autoSpeak) {
+                speakText(state.currentStreamText);
+            }
+        }
         saveCurrentSession();
         scheduleAppStateSave();
         stopGenerating();
@@ -1607,15 +1648,16 @@ async function sendMessageHttpFallback(params) {
 }
 
 function finalizeCancelledGeneration(totalTokens = 0) {
+    const cancelledText = finalizeAssistantText(state.currentStreamText);
     if (state.currentStreamEl) {
         state.currentStreamEl.classList.remove('cursor-blink');
-        state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
+        state.currentStreamEl.innerHTML = renderWithThoughts(cancelledText);
     }
-    if (state.currentStreamText.trim()) {
+    if (cancelledText.trim()) {
         state.messages.push({
             role: 'assistant',
-            content: state.currentStreamText,
-            tokens: totalTokens || Math.ceil(state.currentStreamText.split(/\s+/).filter(Boolean).length * 1.3),
+            content: cancelledText,
+            tokens: totalTokens || Math.ceil(cancelledText.split(/\s+/).filter(Boolean).length * 1.3),
             cancelled: true,
         });
         saveCurrentSession();
@@ -1696,7 +1738,7 @@ function handleStreamMessage(data) {
                 .then(() => fetchWorkspaceTree({ silent: true }))
                 .catch(() => null);
         }
-        const finalText = sanitizeAssistantOutput(state.currentStreamText);
+        const finalText = finalizeAssistantText(state.currentStreamText);
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
             state.currentStreamEl.innerHTML = renderWithThoughts(finalText);
@@ -1724,6 +1766,18 @@ function handleStreamMessage(data) {
             tokens: data.total_tokens,
             tps: data.tokens_per_second,
         });
+        // Attach a speak button to the streamed bubble and auto-speak if enabled
+        // (appendMessage's auto-speak hook ran while content was empty, so we
+        // re-trigger here with the final text).
+        const streamedBubble = state.currentStreamEl?.closest('.message');
+        if (streamedBubble && finalText) {
+            if (!streamedBubble.querySelector('.btn-msg-speak')) {
+                addSpeakButton(streamedBubble, finalText);
+            }
+            if (voice.autoSpeak) {
+                speakText(finalText);
+            }
+        }
         saveCurrentSession();
         scheduleAppStateSave();
         stopGenerating();
@@ -3000,27 +3054,14 @@ function applyPreset(name) {
 // ===========================================================================
 // Pro Mode (Upgrade #9)
 // ===========================================================================
+// Pro Mode removed — all parameters always visible.
 function setupProMode() {
-    dom.proModeToggle.checked = state.proMode;
-    updateProMode();
-
-    dom.proModeToggle.addEventListener('change', () => {
-        state.proMode = dom.proModeToggle.checked;
-        localStorage.setItem(`${LS_PREFIX}pro_mode`, state.proMode);
-        updateProMode();
-    });
+    state.proMode = true;
+    $$('.advanced-param').forEach(p => p.classList.add('visible'));
 }
 
 function updateProMode() {
-    const params = $$('.advanced-param');
-    params.forEach(p => {
-        if (state.proMode) {
-            p.classList.add('visible');
-        } else {
-            p.classList.remove('visible');
-        }
-    });
-    dom.proLabel.textContent = state.proMode ? 'Pro' : 'Simple';
+    $$('.advanced-param').forEach(p => p.classList.add('visible'));
 }
 
 // ===========================================================================

@@ -183,6 +183,26 @@ _xtts_loading: bool = False
 _xtts_error: Optional[str] = None
 _xtts_lock = threading.Lock()
 
+
+def _patch_transformers_for_xtts() -> None:
+    """Coqui-tts/tortoise imports `isin_mps_friendly` from transformers.pytorch_utils,
+    which was removed in transformers 5.x. We need transformers 5.x for Gemma 4
+    tokenizers (older versions hit `extra_special_tokens` list-vs-dict bug), so
+    we re-inject a torch.isin wrapper. Safe to call multiple times.
+    """
+    try:
+        import transformers.pytorch_utils as tpu
+        if hasattr(tpu, "isin_mps_friendly"):
+            return
+        import torch
+
+        def isin_mps_friendly(elements, test_elements):
+            return torch.isin(elements, test_elements)
+
+        tpu.isin_mps_friendly = isin_mps_friendly
+    except Exception:
+        pass
+
 XTTS_PERSONAS: dict[str, dict] = {
     "nayara": {
         "label": "Nayara",
@@ -3971,8 +3991,11 @@ async def load_model(request: dict):
             "engine": _active_engine,
         }
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"❌ model_load failed:\n{tb}", flush=True)
         _model_loading = False
-        _push_event("model_load_failed", {"error": str(e)})
+        _push_event("model_load_failed", {"error": str(e), "traceback": tb})
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -5348,6 +5371,7 @@ def _load_xtts_blocking() -> None:
     try:
         os.environ.setdefault("TTS_AGREE_TERMS", "1")
         os.environ.setdefault("COQUI_TOS_AGREED", "1")
+        _patch_transformers_for_xtts()
         from TTS.api import TTS
         model = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=False)
         with _xtts_lock:

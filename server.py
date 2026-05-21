@@ -71,7 +71,7 @@ MODEL_DIRS = [
     os.path.expanduser("~/.cache/huggingface/hub"),
 ]
 
-HOST = "0.0.0.0"
+HOST = os.environ.get("MLX_MOXY_HOST", "127.0.0.1")
 PORT = 8899
 APP_NAME = "MLX-Moxy-Wirks"
 APP_SLUG = "mlx_moxy_wirks"
@@ -79,6 +79,16 @@ APP_STATE_DIR = Path.home() / f".{APP_SLUG}"
 APP_STATE_FILE = APP_STATE_DIR / "app_state.json"
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 LEGACY_APP_STATE_DIRS = [Path.home() / ".mlx_studio"]
+LOCAL_UI_ORIGINS = (
+    f"http://127.0.0.1:{PORT}",
+    f"http://localhost:{PORT}",
+)
+EXTENSION_ORIGIN_REGEX = (
+    r"^(?:chrome-extension://[a-p]{32}"
+    r"|moz-extension://[-a-zA-Z0-9]+"
+    r"|safari-web-extension://.+)$"
+)
+EXTENSION_ORIGIN_PATTERN = re.compile(EXTENSION_ORIGIN_REGEX)
 MAX_PAGE_CLIPS = 20
 MAX_ATTACHMENT_EXCERPT_CHARS = 12000
 MAX_ATTACHMENT_TEXT_BYTES = 1024 * 1024 * 2
@@ -121,7 +131,8 @@ WORKSPACE_MAX_FILE_READ_BYTES = 1024 * 512  # 512 KB
 app = FastAPI(title=APP_NAME, version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(LOCAL_UI_ORIGINS),
+    allow_origin_regex=EXTENSION_ORIGIN_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -176,6 +187,33 @@ def _is_generation_cancelled(generation_id: str) -> bool:
 def _clear_generation_cancel(generation_id: str) -> None:
     if generation_id:
         _cancelled_generations.discard(generation_id)
+
+
+def _is_trusted_browser_origin(origin: Optional[str], request_host: Optional[str] = None) -> bool:
+    if not origin:
+        return True
+    if origin in LOCAL_UI_ORIGINS or bool(EXTENSION_ORIGIN_PATTERN.fullmatch(origin)):
+        return True
+
+    if request_host:
+        try:
+            parsed = urlparse(origin)
+        except Exception:
+            return False
+        if parsed.scheme in {"http", "https"} and parsed.netloc.lower() == request_host.lower():
+            return True
+
+    return False
+
+
+@app.middleware("http")
+async def enforce_trusted_browser_origins(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = request.headers.get("origin")
+        request_host = request.headers.get("host")
+        if origin and not _is_trusted_browser_origin(origin, request_host=request_host):
+            return JSONResponse({"error": "Untrusted browser origin."}, status_code=403)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +295,14 @@ def _llama_server_healthy() -> bool:
         return resp.status == 200
     except Exception:
         return False
+
+
+def _gguf_engine_ready() -> bool:
+    return (
+        _active_engine == "gguf"
+        and _llama_server_process is not None
+        and _llama_server_process.poll() is None
+    )
 
 
 def _default_app_state() -> dict:
@@ -1662,6 +1708,28 @@ def _summarize_browser_action(action: str, payload: dict) -> str:
 
 
 def _generate_text(prompt: str, max_tokens: int, temperature: float, top_p: float, repetition_penalty: float) -> str:
+    if _gguf_engine_ready():
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "stream": False,
+        }
+        with httpx.Client(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            response = client.post(
+                f"http://127.0.0.1:{LLAMA_SERVER_PORT}/v1/chat/completions",
+                json=payload,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"llama-server returned {response.status_code}: {response.text[:300]}")
+        payload = response.json()
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        return str(message.get("content") or "")
+
     from mlx_lm import generate
 
     generation_runtime = _build_generation_runtime(
@@ -1681,14 +1749,24 @@ def _generate_text(prompt: str, max_tokens: int, temperature: float, top_p: floa
 def _render_prompt_from_messages(messages: list[dict], fallback_prompt: str = "") -> str:
     prompt = fallback_prompt
     if messages:
-        try:
-            prompt = _tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-        except Exception:
-            prompt = json.dumps(messages, ensure_ascii=False)
+        if _tokenizer is not None and hasattr(_tokenizer, "apply_chat_template"):
+            try:
+                prompt = _tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                prompt = fallback_prompt
+        if not prompt:
+            lines: list[str] = []
+            for message in messages:
+                role = str(message.get("role") or "user").upper()
+                content = str(message.get("content") or "").strip()
+                if content:
+                    lines.append(f"{role}:\n{content}")
+            lines.append("ASSISTANT:\n")
+            prompt = "\n\n".join(lines).strip()
     return prompt
 
 
@@ -1782,7 +1860,7 @@ async def _resolve_agent_tools(
     repetition_penalty: float,
     status_callback: Optional[Any] = None,
 ) -> tuple[list[dict], list[dict]]:
-    if _model is None or _tokenizer is None:
+    if not _gguf_engine_ready() and (_model is None or _tokenizer is None):
         return messages, []
 
     working_messages = list(messages) if messages else [{"role": "user", "content": prompt}]
@@ -3057,6 +3135,189 @@ def _inject_runtime_capabilities(messages: list[dict], agent_mode: bool = False)
     return updated
 
 
+def _normalize_generation_request(payload: dict) -> dict:
+    prompt = payload.get("prompt", "")
+    max_tokens = payload.get("max_tokens", 512)
+    temperature = payload.get("temperature", 0.7)
+    top_p = payload.get("top_p", 0.9)
+    repetition_penalty = payload.get("repetition_penalty", 1.1)
+    agent_mode = bool(payload.get("agent_mode"))
+    workflow_mode = str(payload.get("workflow_mode") or "chat").strip().lower()
+    if workflow_mode == "build":
+        agent_mode = True
+        max_tokens = max(max_tokens, 2048)
+    return {
+        "prompt": prompt,
+        "messages": payload.get("messages"),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+        "agent_mode": agent_mode,
+        "workflow_mode": workflow_mode,
+        "request_context_length": payload.get("context_length"),
+        "generation_id": (payload.get("generation_id") or "").strip() or uuid.uuid4().hex,
+    }
+
+
+async def _prepare_generation_request(payload: dict, status_callback: Optional[Any] = None) -> dict:
+    prepared = _normalize_generation_request(payload)
+    messages = prepared.get("messages")
+
+    if isinstance(messages, list) and messages:
+        messages = _inject_runtime_capabilities(messages, agent_mode=prepared["agent_mode"])
+        messages = _inject_workspace_context(messages)
+
+    if prepared["agent_mode"]:
+        resolve_kwargs = {
+            "messages": list(messages) if isinstance(messages, list) else [],
+            "prompt": prepared["prompt"],
+            "temperature": prepared["temperature"],
+            "top_p": prepared["top_p"],
+            "repetition_penalty": prepared["repetition_penalty"],
+        }
+        if status_callback is not None:
+            resolve_kwargs["status_callback"] = status_callback
+        messages, tool_runs = await _resolve_agent_tools(**resolve_kwargs)
+        if tool_runs and status_callback is not None:
+            await status_callback({
+                "type": "agent_status",
+                "message": f"Agent resolved {len(tool_runs)} tool step{'s' if len(tool_runs) != 1 else ''}. Generating final answer…",
+            })
+    else:
+        tool_runs = []
+
+    if messages:
+        messages, context_meta = _compact_messages_for_context(
+            list(messages),
+            prepared["max_tokens"],
+            fallback_prompt=prepared["prompt"],
+            context_length=prepared["request_context_length"],
+        )
+        context_notice = _format_context_compaction_notice(context_meta)
+        if context_notice and status_callback is not None:
+            await status_callback({
+                "type": "context_notice",
+                "message": context_notice,
+            })
+        prompt = _render_prompt_from_messages(messages, prepared["prompt"])
+    else:
+        context_notice = ""
+        prompt = prepared["prompt"]
+
+    prepared.update({
+        "messages": messages,
+        "tool_runs": tool_runs,
+        "context_notice": context_notice,
+        "prompt": prompt,
+    })
+    return prepared
+
+
+def _messages_for_chat_payload(messages: Any, prompt: str) -> list[dict]:
+    if isinstance(messages, list) and messages:
+        return list(messages)
+    fallback_prompt = str(prompt or "").strip()
+    if not fallback_prompt:
+        raise RuntimeError("No prompt available for GGUF generation.")
+    return [{"role": "user", "content": fallback_prompt}]
+
+
+def _record_generation_stats(token_count: int, first_token_time: Optional[float], final_tps: float) -> None:
+    global _generation_stats
+    _generation_stats = {
+        "last_tps": final_tps,
+        "last_latency": round(first_token_time * 1000, 0) if first_token_time else 0,
+        "last_tokens": token_count,
+        "total_generated": _generation_stats["total_generated"] + token_count,
+    }
+
+
+async def _stream_gguf_completion(
+    messages: list[dict],
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    generation_id: str,
+    token_callback: Optional[Any] = None,
+) -> dict:
+    url = f"http://127.0.0.1:{LLAMA_SERVER_PORT}/v1/chat/completions"
+    payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stream": True,
+    }
+
+    token_count = 0
+    response_parts: list[str] = []
+    start_time = time.time()
+    first_token_time: Optional[float] = None
+    cancelled = False
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        async with client.stream("POST", url, json=payload) as response:
+            if response.status_code != 200:
+                body = await response.aread()
+                raise RuntimeError(f"llama-server returned {response.status_code}: {body.decode()[:300]}")
+
+            async for line in response.aiter_lines():
+                if _is_generation_cancelled(generation_id):
+                    cancelled = True
+                    break
+
+                if not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:].strip()
+                if chunk_data == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(chunk_data)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                text = delta.get("content", "")
+                if not text:
+                    continue
+
+                response_parts.append(text)
+                token_count += 1
+                elapsed = time.time() - start_time
+                tps = token_count / elapsed if elapsed > 0 else 0
+
+                if first_token_time is None:
+                    first_token_time = elapsed
+
+                if token_callback is not None:
+                    await token_callback({
+                        "type": "token",
+                        "text": text,
+                        "tokens": token_count,
+                        "tps": round(tps, 1),
+                        "latency_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+                    })
+                    await asyncio.sleep(0)
+
+    elapsed = time.time() - start_time
+    final_tps = round(token_count / elapsed if elapsed > 0 else 0, 1)
+    _record_generation_stats(token_count, first_token_time, final_tps)
+
+    return {
+        "response": "".join(response_parts),
+        "total_tokens": token_count,
+        "elapsed_seconds": round(elapsed, 2),
+        "tokens_per_second": final_tps,
+        "first_token_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+        "cancelled": cancelled,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Workspace endpoints
 # ---------------------------------------------------------------------------
@@ -3518,7 +3779,11 @@ async def unload_model():
 @app.post("/api/generate")
 async def generate_sync(request: dict):
     """Non-streaming generation endpoint with memory guard."""
-    if _model is None or _tokenizer is None:
+    request = dict(request or {})
+    generation_id = (request.get("generation_id") or "").strip() or uuid.uuid4().hex
+    request["generation_id"] = generation_id
+
+    if not _gguf_engine_ready() and (_model is None or _tokenizer is None):
         return JSONResponse({"error": "No model loaded"}, status_code=400)
 
     # ── Memory guard (from AI-ArtWirks _ensure_comfyui_headroom) ──
@@ -3527,79 +3792,66 @@ async def generate_sync(request: dict):
     except RuntimeError as mem_err:
         return JSONResponse({"error": str(mem_err)}, status_code=503)
 
-    prompt = request.get("prompt", "")
-    max_tokens = request.get("max_tokens", 512)
-    temperature = request.get("temperature", 0.7)
-    top_p = request.get("top_p", 0.9)
-    repetition_penalty = request.get("repetition_penalty", 1.1)
-    agent_mode = bool(request.get("agent_mode"))
-    workflow_mode = str(request.get("workflow_mode") or "chat").strip().lower()
-    # Build mode implies agent_mode so Moxy can use workspace tools
-    if workflow_mode == "build":
-        agent_mode = True
-        max_tokens = max(max_tokens, 2048)
-    request_context_length = request.get("context_length")
-    generation_id = (request.get("generation_id") or "").strip() or uuid.uuid4().hex
-
     try:
+        prepared = await _prepare_generation_request(request)
+        generation_id = prepared["generation_id"]
         _clear_generation_cancel(generation_id)
-        messages = request.get("messages")
-        # Inject workspace repo context into system prompt if workspace is active
-        if isinstance(messages, list) and messages:
-            messages = _inject_workspace_context(messages)
-        if agent_mode:
-            messages, tool_runs = await _resolve_agent_tools(
-                messages=list(messages) if isinstance(messages, list) else [],
-                prompt=prompt,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
+
+        if _gguf_engine_ready():
+            result = await _stream_gguf_completion(
+                messages=_messages_for_chat_payload(prepared["messages"], prepared["prompt"]),
+                max_tokens=prepared["max_tokens"],
+                temperature=prepared["temperature"],
+                top_p=prepared["top_p"],
+                generation_id=generation_id,
             )
-        else:
-            tool_runs = []
-        if messages:
-            messages, context_meta = _compact_messages_for_context(
-                list(messages),
-                max_tokens,
-                fallback_prompt=prompt,
-                context_length=request_context_length,
-            )
-            context_notice = _format_context_compaction_notice(context_meta)
-            prompt = _render_prompt_from_messages(messages, prompt)
-        else:
-            context_notice = ""
+            return {
+                "response": result["response"],
+                "agent_tools": prepared["tool_runs"],
+                "cancelled": result["cancelled"],
+                "context_notice": prepared["context_notice"],
+            }
 
         from mlx_lm import stream_generate
 
         generation_runtime = _build_generation_runtime(
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
+            temperature=prepared["temperature"],
+            top_p=prepared["top_p"],
+            repetition_penalty=prepared["repetition_penalty"],
         )
         response_parts: list[str] = []
-        with PerfTimer(f"generate:{max_tokens}tok"):
+        token_count = 0
+        start_time = time.time()
+        first_token_time: Optional[float] = None
+        with PerfTimer(f"generate:{prepared['max_tokens']}tok"):
             for chunk in stream_generate(
                 _model,
                 _tokenizer,
-                prompt=prompt,
-                max_tokens=max_tokens,
+                prompt=prepared["prompt"],
+                max_tokens=prepared["max_tokens"],
                 **generation_runtime,
             ):
                 if _is_generation_cancelled(generation_id):
                     response = "".join(response_parts)
                     return {
                         "response": response,
-                        "agent_tools": tool_runs,
+                        "agent_tools": prepared["tool_runs"],
                         "cancelled": True,
-                        "context_notice": context_notice,
+                        "context_notice": prepared["context_notice"],
                     }
                 response_parts.append(chunk.text if hasattr(chunk, "text") else str(chunk))
+                token_count += 1
+                if first_token_time is None:
+                    first_token_time = time.time() - start_time
+        elapsed = time.time() - start_time
+        final_tps = round(token_count / elapsed if elapsed > 0 else 0, 1)
+        _record_generation_stats(token_count, first_token_time, final_tps)
         response = "".join(response_parts)
         return {
             "response": response,
-            "agent_tools": tool_runs,
+            "agent_tools": prepared["tool_runs"],
             "cancelled": False,
-            "context_notice": context_notice,
+            "context_notice": prepared["context_notice"],
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -4288,109 +4540,30 @@ async def get_presets():
 # ---------------------------------------------------------------------------
 async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
     """Proxy generation through llama-server's OpenAI-compatible endpoint."""
-    global _generation_stats
+    result = await _stream_gguf_completion(
+        messages=_messages_for_chat_payload(data["messages"], data["prompt"]),
+        max_tokens=data["max_tokens"],
+        temperature=data["temperature"],
+        top_p=data["top_p"],
+        generation_id=data["generation_id"],
+        token_callback=websocket.send_json,
+    )
 
-    messages = data.get("messages") or []
-    if isinstance(messages, list) and messages:
-        messages = _inject_runtime_capabilities(messages, agent_mode=False)
-        messages = _inject_workspace_context(messages)
-
-    max_tokens = data.get("max_tokens", 512)
-    temperature = data.get("temperature", 0.7)
-    top_p = data.get("top_p", 0.9)
-    generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
-
-    _clear_generation_cancel(generation_id)
-
-    url = f"http://127.0.0.1:{LLAMA_SERVER_PORT}/v1/chat/completions"
-    payload = {
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "stream": True,
-    }
-
-    token_count = 0
-    full_response = ""
-    start_time = time.time()
-    first_token_time = None
-    cancelled = False
-
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-        async with client.stream("POST", url, json=payload) as response:
-            if response.status_code != 200:
-                body = await response.aread()
-                raise RuntimeError(f"llama-server returned {response.status_code}: {body.decode()[:300]}")
-
-            async for line in response.aiter_lines():
-                if _is_generation_cancelled(generation_id):
-                    cancelled = True
-                    break
-
-                if not line.startswith("data: "):
-                    continue
-                chunk_data = line[6:].strip()
-                if chunk_data == "[DONE]":
-                    break
-
-                try:
-                    chunk = json.loads(chunk_data)
-                except json.JSONDecodeError:
-                    continue
-
-                choices = chunk.get("choices", [])
-                if not choices:
-                    continue
-                delta = choices[0].get("delta", {})
-                text = delta.get("content", "")
-                if not text:
-                    continue
-
-                full_response += text
-                token_count += 1
-                elapsed = time.time() - start_time
-                tps = token_count / elapsed if elapsed > 0 else 0
-
-                if first_token_time is None:
-                    first_token_time = elapsed
-
-                await websocket.send_json({
-                    "type": "token",
-                    "text": text,
-                    "tokens": token_count,
-                    "tps": round(tps, 1),
-                    "latency_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
-                })
-                await asyncio.sleep(0)
-
-    elapsed = time.time() - start_time
-    final_tps = round(token_count / elapsed if elapsed > 0 else 0, 1)
-
-    _generation_stats = {
-        "last_tps": final_tps,
-        "last_latency": round(first_token_time * 1000, 0) if first_token_time else 0,
-        "last_tokens": token_count,
-        "total_generated": _generation_stats["total_generated"] + token_count,
-    }
-
-    if cancelled:
-        await websocket.send_json({"type": "cancelled", "total_tokens": token_count})
+    if result["cancelled"]:
+        await websocket.send_json({"type": "cancelled", "total_tokens": result["total_tokens"]})
     else:
         await websocket.send_json({
             "type": "done",
-            "total_tokens": token_count,
-            "elapsed_seconds": round(elapsed, 2),
-            "tokens_per_second": final_tps,
-            "first_token_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+            "total_tokens": result["total_tokens"],
+            "elapsed_seconds": result["elapsed_seconds"],
+            "tokens_per_second": result["tokens_per_second"],
+            "first_token_ms": result["first_token_ms"],
         })
         _push_event("generation_done", {
-            "tokens": token_count,
-            "tps": final_tps,
+            "tokens": result["total_tokens"],
+            "tps": result["tokens_per_second"],
             "model": _model_name,
         })
-
-    _clear_generation_cancel(generation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -4399,20 +4572,21 @@ async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
 @app.websocket("/ws/generate")
 async def ws_generate(websocket: WebSocket):
     global _generation_stats
+    origin = websocket.headers.get("origin")
+    request_host = websocket.headers.get("host")
+    if origin and not _is_trusted_browser_origin(origin, request_host=request_host):
+        await websocket.close(code=1008, reason="Untrusted browser origin.")
+        return
     await websocket.accept()
     try:
         while True:
-            data = await websocket.receive_json()
+            data = dict(await websocket.receive_json() or {})
+            generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
+            data["generation_id"] = generation_id
 
-            # ── GGUF engine: proxy to llama-server ──
-            if _active_engine == "gguf" and _llama_server_process is not None:
-                try:
-                    await _ws_generate_gguf(websocket, data)
-                except Exception as e:
-                    await websocket.send_json({"type": "error", "error": str(e)})
-                continue
+            gguf_ready = _gguf_engine_ready()
 
-            if _model is None or _tokenizer is None:
+            if not gguf_ready and (_model is None or _tokenizer is None):
                 await websocket.send_json({"error": "No model loaded"})
                 continue
 
@@ -4423,67 +4597,33 @@ async def ws_generate(websocket: WebSocket):
                 await websocket.send_json({"error": str(mem_err)})
                 continue
 
-            prompt = data.get("prompt", "")
-            max_tokens = data.get("max_tokens", 512)
-            temperature = data.get("temperature", 0.7)
-            top_p = data.get("top_p", 0.9)
-            repetition_penalty = data.get("repetition_penalty", 1.1)
-            agent_mode = bool(data.get("agent_mode"))
-            workflow_mode = str(data.get("workflow_mode") or "chat").strip().lower()
-            # Build mode implies agent_mode so Moxy can use workspace tools
-            if workflow_mode == "build":
-                agent_mode = True
-                max_tokens = max(max_tokens, 2048)
-            request_context_length = data.get("context_length")
-            generation_id = (data.get("generation_id") or "").strip() or uuid.uuid4().hex
+            try:
+                prepared = await _prepare_generation_request(data, status_callback=websocket.send_json)
+            except Exception as e:
+                await websocket.send_json({"type": "error", "error": str(e)})
+                _clear_generation_cancel(generation_id)
+                continue
+            generation_id = prepared["generation_id"]
 
-            messages = data.get("messages")
-            # Inject workspace repo context into system prompt if workspace is active
-            if isinstance(messages, list) and messages:
-                messages = _inject_runtime_capabilities(messages, agent_mode=agent_mode)
-                messages = _inject_workspace_context(messages)
+            # ── GGUF engine: proxy to llama-server ──
+            if gguf_ready:
+                try:
+                    _clear_generation_cancel(generation_id)
+                    await _ws_generate_gguf(websocket, prepared)
+                except Exception as e:
+                    await websocket.send_json({"type": "error", "error": str(e)})
+                finally:
+                    _clear_generation_cancel(generation_id)
+                continue
 
             try:
                 _clear_generation_cancel(generation_id)
                 from mlx_lm import stream_generate
 
-                if agent_mode:
-                    messages, tool_runs = await _resolve_agent_tools(
-                        messages=list(messages) if isinstance(messages, list) else [],
-                        prompt=prompt,
-                        temperature=temperature,
-                        top_p=top_p,
-                        repetition_penalty=repetition_penalty,
-                        status_callback=websocket.send_json,
-                    )
-                    if tool_runs:
-                        await websocket.send_json({
-                            "type": "agent_status",
-                            "message": f"Agent resolved {len(tool_runs)} tool step{'s' if len(tool_runs) != 1 else ''}. Generating final answer…",
-                        })
-                else:
-                    tool_runs = []
-                if messages:
-                    messages, context_meta = _compact_messages_for_context(
-                        list(messages),
-                        max_tokens,
-                        fallback_prompt=prompt,
-                        context_length=request_context_length,
-                    )
-                    context_notice = _format_context_compaction_notice(context_meta)
-                    if context_notice:
-                        await websocket.send_json({
-                            "type": "context_notice",
-                            "message": context_notice,
-                        })
-                    prompt = _render_prompt_from_messages(messages, prompt)
-                else:
-                    context_notice = ""
-
                 generation_runtime = _build_generation_runtime(
-                    temperature=temperature,
-                    top_p=top_p,
-                    repetition_penalty=repetition_penalty,
+                    temperature=prepared["temperature"],
+                    top_p=prepared["top_p"],
+                    repetition_penalty=prepared["repetition_penalty"],
                 )
                 token_count = 0
                 start_time = time.time()
@@ -4495,8 +4635,8 @@ async def ws_generate(websocket: WebSocket):
                     for chunk in stream_generate(
                         _model,
                         _tokenizer,
-                        prompt=prompt,
-                        max_tokens=max_tokens,
+                        prompt=prepared["prompt"],
+                        max_tokens=prepared["max_tokens"],
                         **generation_runtime,
                     ):
                         if _is_generation_cancelled(generation_id):
@@ -4524,13 +4664,7 @@ async def ws_generate(websocket: WebSocket):
                 elapsed = time.time() - start_time
                 final_tps = round(token_count / elapsed if elapsed > 0 else 0, 1)
 
-                # Update global stats
-                _generation_stats = {
-                    "last_tps": final_tps,
-                    "last_latency": round(first_token_time * 1000, 0) if first_token_time else 0,
-                    "last_tokens": token_count,
-                    "total_generated": _generation_stats["total_generated"] + token_count,
-                }
+                _record_generation_stats(token_count, first_token_time, final_tps)
 
                 if cancelled:
                     await websocket.send_json({

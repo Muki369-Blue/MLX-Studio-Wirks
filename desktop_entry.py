@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Desktop entrypoint for the packaged MLX-Moxy-Wirks macOS app."""
 
+import os
 import threading
 import time
 import webbrowser
+
+# Packaged app builds should stay LAN-reachable unless the user overrides it.
+os.environ.setdefault("MLX_MOXY_HOST", "0.0.0.0")
 
 from server import PORT, main
 

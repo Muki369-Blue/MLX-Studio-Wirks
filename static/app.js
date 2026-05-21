@@ -86,6 +86,8 @@ const state = {
     connectorSearchQuery: '',
     workspaceTree: [],
     agentMode: false,
+    showThoughts: false,
+    agentSteps: 10,
     currentGenerationId: null,
     currentAbortController: null,
     saveStateTimer: null,
@@ -106,7 +108,18 @@ function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
     if (!text || !isGemma4StyleModel(model)) return text;
     if (!text.includes('<|channel>')) return text;
 
+    const thoughtMatch = text.match(/<\|channel\>thought\s*([\s\S]*?)(?=<\|channel\>final|$)/i);
     const finalMatch = text.match(/<\|channel\>final\s*([\s\S]*)$/i);
+
+    if (state.showThoughts && thoughtMatch?.[1]?.trim()) {
+        const thought = thoughtMatch[1].trim();
+        const final = finalMatch
+            ? finalMatch[1].replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart()
+            : '';
+        // Return a sentinel that appendMessage/stream handler will detect
+        return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
+    }
+
     if (finalMatch) {
         return finalMatch[1].replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
     }
@@ -114,6 +127,14 @@ function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
         return '';
     }
     return text.replace(/<\|channel\>[a-z_]+\s*/gi, '').trimStart();
+}
+
+function renderWithThoughts(sanitized) {
+    if (!sanitized.startsWith('\x00THOUGHTS\x00')) return formatMarkdown(sanitized);
+    const parts = sanitized.split('\x00FINAL\x00');
+    const thought = parts[0].replace('\x00THOUGHTS\x00', '').trim();
+    const final = (parts[1] || '').trim();
+    return `<details class="thought-block"><summary>Reasoning</summary><div class="thought-content">${formatMarkdown(thought)}</div></details>${final ? formatMarkdown(final) : ''}`;
 }
 
 // ===========================================================================
@@ -363,6 +384,16 @@ const dom = {
     btnExportLastMd: $('#btn-export-last-md'),
     btnVoice: $('#btn-voice'),
     btnSpeakToggle: $('#btn-speak-toggle'),
+    // Context stat
+    statContext: $('#stat-context'),
+    // Agent steps slider
+    sliderAgentSteps: $('#agent-steps'),
+    valAgentSteps: $('#agent-steps-val'),
+    // Show thoughts toggle
+    showThoughtsToggle: $('#show-thoughts-toggle'),
+    // Voice/whisper selects
+    ttsVoiceSelect: $('#tts-voice-select'),
+    whisperModelSelect: $('#whisper-model-select'),
 };
 
 // ===========================================================================
@@ -534,6 +565,8 @@ async function init() {
     setupWebSearch();
     setupVoice();
     setupMemoryFlush();
+    setupVoiceSettings();
+    setupExtraSliders();
 }
 // ===========================================================================
 // Web Search Integration
@@ -577,6 +610,79 @@ function setupMemoryFlush() {
             btn.textContent = '\uD83E\uDDF9 Flush Memory';
         }
     });
+}
+
+// ===========================================================================
+// Voice Settings (TTS voice + Whisper model selects)
+// ===========================================================================
+async function setupVoiceSettings() {
+    // Populate TTS voice dropdown
+    if (dom.ttsVoiceSelect) {
+        try {
+            const res = await fetch('/api/audio/voices');
+            const data = await res.json();
+            const voices = Array.isArray(data.voices) ? data.voices : [];
+            dom.ttsVoiceSelect.innerHTML = voices.map(v =>
+                `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`
+            ).join('') || '<option value="Samantha">Samantha</option>';
+
+            // Read current voice from backend
+            const curRes = await fetch('/api/audio/voice');
+            const curData = await curRes.json();
+            if (curData.voice) dom.ttsVoiceSelect.value = curData.voice;
+        } catch {
+            dom.ttsVoiceSelect.innerHTML = '<option value="Samantha">Samantha</option>';
+        }
+
+        dom.ttsVoiceSelect.addEventListener('change', () => {
+            const voice = dom.ttsVoiceSelect.value;
+            fetch('/api/audio/voice', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ voice }),
+            }).then(() => showToast(`TTS voice: ${voice}`, 'success')).catch(() => null);
+        });
+    }
+
+    // Whisper model select
+    if (dom.whisperModelSelect) {
+        try {
+            const res = await fetch('/api/audio/whisper-model');
+            const data = await res.json();
+            if (data.model) dom.whisperModelSelect.value = data.model;
+        } catch { /* ok */ }
+
+        dom.whisperModelSelect.addEventListener('change', () => {
+            const model = dom.whisperModelSelect.value;
+            fetch('/api/audio/whisper-model', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model }),
+            }).then(() => showToast(`Whisper: ${model}`, 'success')).catch(() => null);
+        });
+    }
+}
+
+// ===========================================================================
+// Extra sliders — Agent Steps + Show Thoughts toggle
+// ===========================================================================
+function setupExtraSliders() {
+    if (dom.sliderAgentSteps && dom.valAgentSteps) {
+        dom.sliderAgentSteps.value = state.agentSteps;
+        dom.valAgentSteps.textContent = state.agentSteps;
+        dom.sliderAgentSteps.addEventListener('input', () => {
+            state.agentSteps = parseInt(dom.sliderAgentSteps.value, 10);
+            dom.valAgentSteps.textContent = state.agentSteps;
+        });
+    }
+
+    if (dom.showThoughtsToggle) {
+        dom.showThoughtsToggle.checked = state.showThoughts;
+        dom.showThoughtsToggle.addEventListener('change', () => {
+            state.showThoughts = dom.showThoughtsToggle.checked;
+            showToast(`Reasoning visibility ${state.showThoughts ? 'on' : 'off'}`, 'info');
+        });
+    }
 }
 
 // ===========================================================================
@@ -1462,7 +1568,11 @@ async function sendMessageHttpFallback(params) {
         state.currentStreamText = sanitizeAssistantOutput(data.response || '');
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
-            state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
+            state.currentStreamEl.innerHTML = renderWithThoughts(state.currentStreamText);
+        }
+        if (data.context_used != null && data.context_total) {
+            const pct = Math.round((data.context_used / data.context_total) * 100);
+            if (dom.statContext) dom.statContext.textContent = `${pct}%`;
         }
 
         const tokenEstimate = Math.ceil(state.currentStreamText.split(/\s+/).filter(Boolean).length * 1.3);
@@ -1538,7 +1648,7 @@ function handleStreamMessage(data) {
         state.currentStreamText += data.text;
         if (state.currentStreamEl) {
             const visible = sanitizeAssistantOutput(state.currentStreamText);
-            state.currentStreamEl.innerHTML = formatMarkdown(visible || '…');
+            state.currentStreamEl.innerHTML = renderWithThoughts(visible || '…');
             state.currentStreamEl.classList.add('cursor-blink');
         }
         dom.statTps.textContent = `${data.tps} t/s`;
@@ -1589,13 +1699,17 @@ function handleStreamMessage(data) {
         const finalText = sanitizeAssistantOutput(state.currentStreamText);
         if (state.currentStreamEl) {
             state.currentStreamEl.classList.remove('cursor-blink');
-            state.currentStreamEl.innerHTML = formatMarkdown(finalText);
+            state.currentStreamEl.innerHTML = renderWithThoughts(finalText);
         }
         // Update final stats
         dom.statTps.textContent = `${data.tokens_per_second} t/s`;
         dom.statTokens.textContent = `${data.total_tokens}`;
         if (data.first_token_ms) {
             dom.statLatency.textContent = `${data.first_token_ms}ms`;
+        }
+        if (data.context_used != null && data.context_total) {
+            const pct = Math.round((data.context_used / data.context_total) * 100);
+            if (dom.statContext) dom.statContext.textContent = `${pct}%`;
         }
 
         // Update status bar detail
@@ -1841,6 +1955,8 @@ async function sendMessage(customText = null, options = {}) {
         workflow_mode: generation.workflow_mode,
         approval_mode: generation.approval_mode,
         deep_research: generation.deep_research,
+        agent_steps: state.agentSteps,
+        show_thoughts: state.showThoughts,
         project_id: state.activeProjectId,
         generation_id: generationId,
     };
@@ -2084,7 +2200,10 @@ function handleSlashCommand(text) {
             }
             break;
         case '/research':
-            if (!arg || ['toggle'].includes(arg.toLowerCase())) {
+            if (arg && !['on','off','toggle','enable','disable','enabled','disabled','true','false'].includes(arg.toLowerCase())) {
+                // Real research pipeline — stream from /api/research
+                runResearch(arg);
+            } else if (!arg || arg.toLowerCase() === 'toggle') {
                 const current = getProjectWorkflowSettings();
                 setActiveProjectWorkflowSettings({ deep_research: !current.deep_research });
                 showToast(`Extended research ${!current.deep_research ? 'enabled' : 'disabled'}`, 'success');
@@ -2095,9 +2214,100 @@ function handleSlashCommand(text) {
                 setActiveProjectWorkflowSettings({ deep_research: false });
                 showToast('Extended research disabled', 'success');
             } else {
-                showToast('Usage: /research [on|off|toggle]', 'info');
+                showToast('Usage: /research <query> — or /research [on|off|toggle]', 'info');
             }
             break;
+
+        case '/refine': {
+            const lastAssistant = state.messages.slice().reverse().find(m => m.role === 'assistant');
+            if (!lastAssistant) { showToast('No response to refine yet', 'info'); break; }
+            sendMessage('Please revise your last response to be more concise and direct. Keep the same meaning but tighten the language.');
+            break;
+        }
+
+        case '/explain': {
+            const lastA = state.messages.slice().reverse().find(m => m.role === 'assistant');
+            if (!lastA) { showToast('No response to explain yet', 'info'); break; }
+            sendMessage('Explain your last response in simpler terms, as if to someone unfamiliar with the topic.');
+            break;
+        }
+
+        case '/debug': {
+            const lastD = state.messages.slice().reverse().find(m => m.role === 'assistant');
+            if (!lastD) { showToast('No response to debug yet', 'info'); break; }
+            sendMessage('Review your last response carefully for errors, inaccuracies, or issues. Correct anything wrong and explain what you changed.');
+            break;
+        }
+
+        case '/thoughts':
+            state.showThoughts = !state.showThoughts;
+            if (dom.showThoughtsToggle) dom.showThoughtsToggle.checked = state.showThoughts;
+            showToast(`Reasoning visibility ${state.showThoughts ? 'on' : 'off'}`, 'info');
+            break;
+
+        case '/steps': {
+            const n = parseInt(arg, 10);
+            if (n > 0 && n <= 20) {
+                state.agentSteps = n;
+                if (dom.sliderAgentSteps) dom.sliderAgentSteps.value = n;
+                if (dom.valAgentSteps) dom.valAgentSteps.textContent = n;
+                showToast(`Agent steps set to ${n}`, 'success');
+            } else {
+                showToast('Usage: /steps <number 1-20>', 'info');
+            }
+            break;
+        }
+
+        case '/context': {
+            const ctx = dom.statContext?.textContent;
+            if (ctx && ctx !== '—') {
+                showToast(`Context window: ${ctx} used`, 'info');
+            } else if (state.contextInspection) {
+                const { token_count, context_length } = state.contextInspection;
+                const pct = context_length ? Math.round((token_count / context_length) * 100) : '?';
+                showToast(`Context: ${token_count}/${context_length} tokens (${pct}%)`, 'info');
+            } else {
+                showToast('No context data yet — send a message first', 'info');
+            }
+            break;
+        }
+
+        case '/voice': {
+            if (!arg) { showToast('Usage: /voice <name> — e.g. /voice Samantha', 'info'); break; }
+            fetch('/api/audio/voice', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ voice: arg }),
+            }).then(r => r.json()).then(d => {
+                if (d.voice) {
+                    showToast(`TTS voice: ${d.voice}`, 'success');
+                    if (dom.ttsVoiceSelect) {
+                        for (const opt of dom.ttsVoiceSelect.options) {
+                            if (opt.value === d.voice || opt.text === d.voice) {
+                                dom.ttsVoiceSelect.value = opt.value;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }).catch(() => showToast('Failed to set voice', 'error'));
+            break;
+        }
+
+        case '/whisper': {
+            const model = arg || 'tiny';
+            fetch('/api/audio/whisper-model', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model }),
+            }).then(r => r.json()).then(d => {
+                if (d.model) {
+                    showToast(`Whisper: ${d.model}`, 'success');
+                    if (dom.whisperModelSelect) dom.whisperModelSelect.value = d.model;
+                }
+            }).catch(() => showToast('Failed to set Whisper model', 'error'));
+            break;
+        }
         case '/workspace':
             if (!arg || arg === 'open') {
                 openWorkspaceSelection();
@@ -2131,6 +2341,76 @@ function handleSlashCommand(text) {
     }
 
     hideSlashMenu();
+}
+
+async function runResearch(query) {
+    if (!query.trim()) { showToast('Provide a research query', 'info'); return; }
+    if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
+
+    if (dom.welcomeScreen) dom.welcomeScreen.style.display = 'none';
+    appendMessage('user', `/research ${query}`, 0);
+    state.messages.push({ role: 'user', content: `/research ${query}`, tokens: 0 });
+
+    startGenerating();
+    const msgEl = appendMessage('assistant', '', 0);
+    state.currentStreamEl = msgEl.querySelector('.message-body');
+    state.currentStreamText = '';
+    state.currentStreamEl.innerHTML = '<em style="opacity:.5">Searching…</em>';
+
+    try {
+        const res = await fetch('/api/research', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query, max_sources: 3 }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let evt;
+                try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+                if (evt.type === 'search') {
+                    state.currentStreamEl.innerHTML = `<em style="opacity:.5">${escapeHtml(evt.message)}</em>`;
+                } else if (evt.type === 'reading') {
+                    state.currentStreamEl.innerHTML = `<em style="opacity:.5">${escapeHtml(evt.message)}</em>`;
+                } else if (evt.type === 'synthesis_start') {
+                    state.currentStreamText = '';
+                    state.currentStreamEl.innerHTML = '';
+                } else if (evt.type === 'token') {
+                    state.currentStreamText += evt.text;
+                    state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText || '…');
+                    scrollToBottom();
+                } else if (evt.type === 'done') {
+                    state.currentStreamEl.innerHTML = formatMarkdown(state.currentStreamText);
+                    state.messages.push({ role: 'assistant', content: state.currentStreamText, tokens: 0 });
+                    saveCurrentSession();
+                    scheduleAppStateSave();
+                    stopGenerating();
+                    scrollToBottom();
+                    return;
+                } else if (evt.type === 'error') {
+                    throw new Error(evt.error || 'Research failed');
+                }
+            }
+        }
+    } catch (e) {
+        showToast(`Research: ${e.message}`, 'error');
+        if (state.currentStreamEl) {
+            state.currentStreamEl.closest('.message')?.remove();
+        }
+        stopGenerating();
+    }
 }
 
 function startGenerating() {
@@ -2197,6 +2477,10 @@ function appendMessage(role, content, tokens) {
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
                 Copy
             </button>
+            ${role === 'assistant' ? `<button class="btn-msg-action btn-revise" title="Revise response">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+                Revise
+            </button>` : ''}
         </div>
     `;
 
@@ -2211,6 +2495,16 @@ function appendMessage(role, content, tokens) {
                     copyBtn.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg> Copy`;
                 }, 2000);
             });
+        });
+    }
+
+    // Revise button handler
+    const reviseBtn = div.querySelector('.btn-revise');
+    if (reviseBtn) {
+        reviseBtn.addEventListener('click', () => {
+            const snippet = content.slice(0, 200).trim();
+            dom.chatInput.value = `Please revise your last response. `;
+            dom.chatInput.focus();
         });
     }
 
@@ -2780,12 +3074,20 @@ function applyModelDefaultPrompt(modelName) {
 
 function applySystemPromptPreset(name) {
     const text = SP_PRESETS[name];
-    if (!text) return;
+    if (text === undefined) return;
     dom.systemPrompt.value = text;
     dom.activePromptName.textContent = name.charAt(0).toUpperCase() + name.slice(1);
 
     $$('.sp-preset').forEach(b => b.classList.remove('active'));
     $(`.sp-preset[data-sp="${name}"]`)?.classList.add('active');
+
+    fetch('/api/persona', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: name }),
+    }).catch(() => null);
+
+    showToast(`Persona: ${name.charAt(0).toUpperCase() + name.slice(1)}`, 'success');
     scheduleAppStateSave();
 }
 

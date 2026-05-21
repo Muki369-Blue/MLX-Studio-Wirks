@@ -23,6 +23,12 @@ voice = [
   "sounddevice>=0.5",
   "numpy>=1.26",
 ]
+workspace = [
+  "watchdog>=6.0",
+]
+vision = [
+  "mlx-vlm>=0.1",
+]
 
 [project.scripts]
 mlx-moxy-wirks = "server:main"

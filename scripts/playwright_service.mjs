@@ -287,6 +287,40 @@ async function handleWait(body) {
   };
 }
 
+async function handleScroll(body) {
+  const activePage = await ensurePage();
+  const direction = String(body.direction || 'down').toLowerCase();
+  const pixels = Math.max(1, Math.min(Number(body.pixels || 400), 5000));
+
+  await activePage.evaluate(({ dir, px }) => {
+    if (dir === 'top') { window.scrollTo(0, 0); }
+    else if (dir === 'bottom') { window.scrollTo(0, document.body.scrollHeight); }
+    else if (dir === 'up') { window.scrollBy(0, -px); }
+    else { window.scrollBy(0, px); }
+  }, { dir: direction, px: pixels });
+
+  await activePage.waitForTimeout(100);
+  const scrollY = await activePage.evaluate(() => window.scrollY);
+  return {
+    ok: true,
+    url: activePage.url(),
+    title: await activePage.title().catch(() => ''),
+    scrollY,
+    message: `Scrolled ${direction}.`,
+  };
+}
+
+async function handleScreenshot() {
+  const activePage = await ensurePage();
+  const buf = await activePage.screenshot({ fullPage: false, type: 'png' });
+  return {
+    ok: true,
+    screenshot_base64: buf.toString('base64'),
+    url: activePage.url(),
+    title: await activePage.title().catch(() => ''),
+  };
+}
+
 async function handleReset() {
   lastSnapshot = null;
   if (page && !page.isClosed()) {
@@ -360,6 +394,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/page/wait') {
       json(res, 200, await handleWait(body));
+      return;
+    }
+    if (url.pathname === '/page/scroll') {
+      json(res, 200, await handleScroll(body));
+      return;
+    }
+    if (url.pathname === '/page/screenshot') {
+      json(res, 200, await handleScreenshot());
       return;
     }
 

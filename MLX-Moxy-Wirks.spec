@@ -9,14 +9,15 @@ ICON_PATH = ROOT / 'assets' / 'MLX-Moxy-Wirks.icns'
 MLX_LM_DATA, MLX_LM_BINARIES, MLX_LM_HIDDENIMPORTS = collect_all('mlx_lm')
 MLX_DATA, MLX_BINARIES, MLX_HIDDENIMPORTS = collect_all('mlx')
 MLX_WHISPER_DATA, MLX_WHISPER_BINARIES, MLX_WHISPER_HIDDENIMPORTS = collect_all('mlx_whisper')
+WATCHDOG_DATA, WATCHDOG_BINARIES, WATCHDOG_HIDDENIMPORTS = collect_all('watchdog')
 
 
 a = Analysis(
     ['desktop_entry.py'],
     pathex=[],
-    binaries=[*MLX_LM_BINARIES, *MLX_BINARIES, *MLX_WHISPER_BINARIES],
-    datas=[('static', 'static'), ('scripts', 'scripts'), *MLX_LM_DATA, *MLX_DATA, *MLX_WHISPER_DATA],
-    hiddenimports=[*MLX_LM_HIDDENIMPORTS, *MLX_HIDDENIMPORTS, *MLX_WHISPER_HIDDENIMPORTS],
+    binaries=[*MLX_LM_BINARIES, *MLX_BINARIES, *MLX_WHISPER_BINARIES, *WATCHDOG_BINARIES],
+    datas=[('static', 'static'), ('scripts', 'scripts'), ('persona', 'persona'), *MLX_LM_DATA, *MLX_DATA, *MLX_WHISPER_DATA, *WATCHDOG_DATA],
+    hiddenimports=[*MLX_LM_HIDDENIMPORTS, *MLX_HIDDENIMPORTS, *MLX_WHISPER_HIDDENIMPORTS, *WATCHDOG_HIDDENIMPORTS, 'watchdog.observers', 'watchdog.events', 'difflib'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

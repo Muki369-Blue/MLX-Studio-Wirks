@@ -15,6 +15,7 @@ Architecture patterns borrowed:
 """
 
 import asyncio
+import difflib
 import gc
 import json
 import os
@@ -97,7 +98,7 @@ CONNECTOR_RESULT_LIMIT = 8
 MAX_CONNECTOR_FETCH_CHARS = 40000
 GITHUB_API_BASE = "https://api.github.com"
 HUGGINGFACE_API_BASE = "https://huggingface.co/api"
-MAX_AGENT_TOOL_STEPS = 6
+MAX_AGENT_TOOL_STEPS = 10
 AGENT_TOOL_MAX_TOKENS = 400
 PLAYWRIGHT_SERVICE_HOST = os.environ.get("PLAYWRIGHT_SERVICE_HOST", "127.0.0.1")
 PLAYWRIGHT_SERVICE_PORT = int(os.environ.get("PLAYWRIGHT_SERVICE_PORT", "8941"))
@@ -105,8 +106,8 @@ PLAYWRIGHT_START_TIMEOUT_SECONDS = 18.0
 PLAYWRIGHT_REQUEST_TIMEOUT_SECONDS = 20.0
 BROWSER_SNAPSHOT_TEXT_LIMIT = 7000
 BROWSER_SNAPSHOT_ELEMENT_LIMIT = 24
-DEFAULT_CONTEXT_LENGTH = 8192
-MIN_PROMPT_BUDGET_TOKENS = 1024
+DEFAULT_CONTEXT_LENGTH = 32768
+MIN_PROMPT_BUDGET_TOKENS = 4096
 MIN_COMPLETION_RESERVE_TOKENS = 256
 CONTEXT_COMPLETION_BUFFER_TOKENS = 96
 GROUNDING_CONTEXT_MARKER = "\n\nUse the following grounded context when relevant:\n\n"
@@ -169,6 +170,15 @@ _active_pulls: dict[str, dict] = {}
 _cancelled_generations: set[str] = set()
 _browser_service_process: Optional[subprocess.Popen] = None
 _browser_service_lock = threading.Lock()
+_browser_service_restart_count: int = 0
+
+# Voice / STT configuration (user-selectable, persisted in app_state)
+_whisper_model: str = "mlx-community/whisper-tiny"
+_tts_voice: str = "Samantha"
+
+# Workspace file watcher
+_workspace_observer: Optional[Any] = None
+_workspace_observer_lock = threading.Lock()
 
 
 def _utc_now() -> str:
@@ -771,6 +781,13 @@ _GEMMA4_OUTPUT_GUIDANCE = (
     "- Output plain Markdown prose only."
 )
 
+_GEMMA4_SHOW_THOUGHTS_GUIDANCE = (
+    "Gemma 4 output contract (reasoning mode):\n"
+    "- Show your step-by-step reasoning inside a <|channel>thought block.\n"
+    "- Then provide the final user-facing answer inside a <|channel>final block.\n"
+    "- Format: <|channel>thought\\n[reasoning]\\n<|channel>final\\n[answer]"
+)
+
 
 def _model_type_hints(model_path: Optional[str]) -> set[str]:
     if not model_path:
@@ -807,22 +824,28 @@ def _is_gemma4_model(model_path: Optional[str] = None, model_name: Optional[str]
     return any("gemma4" in model_type for model_type in model_types)
 
 
-def _inject_model_output_guidance(messages: list[dict]) -> list[dict]:
+def _inject_model_output_guidance(messages: list[dict], show_thoughts: bool = False) -> list[dict]:
     if not messages or not _is_gemma4_model():
         return messages
+
+    guidance = _GEMMA4_SHOW_THOUGHTS_GUIDANCE if show_thoughts else _GEMMA4_OUTPUT_GUIDANCE
+    sentinel = _GEMMA4_SHOW_THOUGHTS_GUIDANCE if show_thoughts else _GEMMA4_OUTPUT_GUIDANCE
 
     updated = list(messages)
     for idx, msg in enumerate(updated):
         if msg.get("role") != "system":
             continue
         content = str(msg.get("content") or "")
-        if _GEMMA4_OUTPUT_GUIDANCE in content:
+        if sentinel in content:
             return updated
-        merged = f"{content.rstrip()}\n\n{_GEMMA4_OUTPUT_GUIDANCE}" if content.strip() else _GEMMA4_OUTPUT_GUIDANCE
+        # Strip any previous Gemma 4 guidance before inserting the new one
+        for old in (_GEMMA4_OUTPUT_GUIDANCE, _GEMMA4_SHOW_THOUGHTS_GUIDANCE):
+            content = content.replace(old, "").rstrip()
+        merged = f"{content}\n\n{guidance}" if content.strip() else guidance
         updated[idx] = {**msg, "content": merged}
         return updated
 
-    updated.insert(0, {"role": "system", "content": _GEMMA4_OUTPUT_GUIDANCE})
+    updated.insert(0, {"role": "system", "content": guidance})
     return updated
 
 
@@ -1593,11 +1616,17 @@ async def _browser_service_healthcheck() -> Optional[dict]:
 
 
 async def _ensure_browser_service() -> dict:
-    global _browser_service_process
+    global _browser_service_process, _browser_service_restart_count
 
     healthy = await _browser_service_healthcheck()
     if healthy is not None:
         return healthy
+
+    # If the process has exited since last start, clear it so we re-launch cleanly.
+    with _browser_service_lock:
+        proc = _browser_service_process
+        if proc is not None and proc.poll() is not None:
+            _browser_service_process = None
 
     script_path = BASE_DIR / "scripts" / "playwright_service.mjs"
     if not script_path.exists():
@@ -1617,6 +1646,9 @@ async def _ensure_browser_service() -> dict:
                 stderr=subprocess.PIPE,
                 text=True,
             )
+            _browser_service_restart_count += 1
+            if _browser_service_restart_count > 1:
+                _push_event("browser_restarted", {"restart_count": _browser_service_restart_count})
 
     deadline = time.time() + PLAYWRIGHT_START_TIMEOUT_SECONDS
     while time.time() < deadline:
@@ -1875,6 +1907,7 @@ def _agent_tool_prompt() -> str:
         '  browser_click:    {"action":"tool","tool":"browser_click","args":{"selector":"CSS_SELECTOR"}}\n'
         '  browser_type:     {"action":"tool","tool":"browser_type","args":{"selector":"CSS_SELECTOR","text":"TEXT","submit":true}}\n'
         '  browser_wait:     {"action":"tool","tool":"browser_wait","args":{"text":"TEXT","seconds":2}}\n'
+        '  browser_scroll:   {"action":"tool","tool":"browser_scroll","args":{"direction":"down","pixels":400}}\n'
         '  workspace_read:   {"action":"tool","tool":"workspace_read","args":{"path":"RELATIVE_PATH"}}\n'
         '  workspace_write:  {"action":"tool","tool":"workspace_write","args":{"path":"RELATIVE_PATH","content":"FILE_CONTENT"}}\n'
         '  workspace_scaffold: {"action":"tool","tool":"workspace_scaffold","args":{"files":[{"path":"RELATIVE_PATH","content":"CONTENT"}]}}\n'
@@ -1922,14 +1955,16 @@ async def _resolve_agent_tools(
     top_p: float,
     repetition_penalty: float,
     status_callback: Optional[Any] = None,
+    max_steps: int = MAX_AGENT_TOOL_STEPS,
 ) -> tuple[list[dict], list[dict]]:
     if not _gguf_engine_ready() and (_model is None or _tokenizer is None):
         return messages, []
 
     working_messages = list(messages) if messages else [{"role": "user", "content": prompt}]
     tool_runs: list[dict] = []
+    max_steps = max(1, int(max_steps or MAX_AGENT_TOOL_STEPS))
 
-    for step in range(MAX_AGENT_TOOL_STEPS):
+    for step in range(max_steps):
         planner_messages = [{"role": "system", "content": _agent_tool_prompt()}, *working_messages]
         planner_messages, _ = _compact_messages_for_context(
             planner_messages,
@@ -2035,6 +2070,17 @@ async def _resolve_agent_tools(
                 result = await _browser_wait(text=text_value, seconds=float(seconds))
                 tool_runs.append({"tool": tool_name, "text": text_value, "seconds": seconds})
                 tool_feedback = _summarize_browser_action("wait", result)
+            elif tool_name == "browser_scroll":
+                direction = str(args.get("direction") or "down").lower()
+                pixels = int(args.get("pixels") or 400)
+                await _ensure_browser_service()
+                result = await _browser_service_request("POST", "/page/scroll", {
+                    "direction": direction,
+                    "pixels": pixels,
+                })
+                tool_runs.append({"tool": tool_name, "direction": direction, "pixels": pixels})
+                scroll_y = result.get("scrollY", "?")
+                tool_feedback = f"Scrolled {direction} {pixels}px — current scrollY: {scroll_y}. URL: {result.get('url', '')}"
             elif tool_name == "workspace_read":
                 rel_path = str(args.get("path") or "").strip()
                 if not rel_path:
@@ -2978,24 +3024,31 @@ async def save_app_state(request: dict):
 
 @app.get("/api/persona")
 async def get_persona():
-    """Return Moxy's identity and composed system prompt (base + Creator overrides)."""
-    from persona.moxy import MOXY_IDENTITY, compose_moxy_prompt
+    """Return Moxy's identity, composed system prompt, and available persona presets."""
+    from persona.moxy import MOXY_IDENTITY, PRESET_PROMPTS, compose_moxy_prompt, get_preset_prompt
 
     state = _load_app_state()
     persona_state = state.get("persona") or {}
     overrides = persona_state.get("custom_overrides") or ""
+    active = persona_state.get("active", "moxy")
+
+    if active == "moxy":
+        system_prompt = compose_moxy_prompt(overrides)
+    else:
+        system_prompt = get_preset_prompt(active) or compose_moxy_prompt(overrides)
+
     return {
         "identity": MOXY_IDENTITY,
-        "active": persona_state.get("active", "moxy"),
+        "active": active,
         "custom_overrides": overrides,
-        "system_prompt": compose_moxy_prompt(overrides),
+        "system_prompt": system_prompt,
+        "presets": list(PRESET_PROMPTS.keys()),
     }
 
 
 @app.post("/api/persona")
 async def save_persona(request: dict):
-    """Update the persona overrides / active selection. The base identity is
-    source-controlled and not editable from the UI."""
+    """Update the persona overrides / active selection."""
     request = request or {}
     state = _load_app_state()
     persona_state = dict(state.get("persona") or {})
@@ -3005,14 +3058,22 @@ async def save_persona(request: dict):
         persona_state["custom_overrides"] = request["custom_overrides"]
     state["persona"] = persona_state
     saved = _save_app_state(state)
-    from persona.moxy import MOXY_IDENTITY, compose_moxy_prompt
+    from persona.moxy import MOXY_IDENTITY, PRESET_PROMPTS, compose_moxy_prompt, get_preset_prompt
     overrides = (saved.get("persona") or {}).get("custom_overrides") or ""
+    active = (saved.get("persona") or {}).get("active", "moxy")
+
+    if active == "moxy":
+        system_prompt = compose_moxy_prompt(overrides)
+    else:
+        system_prompt = get_preset_prompt(active) or compose_moxy_prompt(overrides)
+
     return {
         "status": "saved",
         "identity": MOXY_IDENTITY,
-        "active": (saved.get("persona") or {}).get("active", "moxy"),
+        "active": active,
         "custom_overrides": overrides,
-        "system_prompt": compose_moxy_prompt(overrides),
+        "system_prompt": system_prompt,
+        "presets": list(PRESET_PROMPTS.keys()),
     }
 
 
@@ -3229,6 +3290,12 @@ def _normalize_generation_request(payload: dict) -> dict:
     if workflow_mode == "build":
         agent_mode = True
         max_tokens = max(max_tokens, 2048)
+    raw_steps = payload.get("agent_steps")
+    try:
+        agent_steps = max(1, int(raw_steps)) if raw_steps is not None else MAX_AGENT_TOOL_STEPS
+    except (TypeError, ValueError):
+        agent_steps = MAX_AGENT_TOOL_STEPS
+    show_thoughts = bool(payload.get("show_thoughts", False))
     return {
         "prompt": prompt,
         "messages": payload.get("messages"),
@@ -3238,6 +3305,8 @@ def _normalize_generation_request(payload: dict) -> dict:
         "repetition_penalty": repetition_penalty,
         "agent_mode": agent_mode,
         "workflow_mode": workflow_mode,
+        "agent_steps": agent_steps,
+        "show_thoughts": show_thoughts,
         "request_context_length": payload.get("context_length"),
         "generation_id": (payload.get("generation_id") or "").strip() or uuid.uuid4().hex,
     }
@@ -3258,6 +3327,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
             "temperature": prepared["temperature"],
             "top_p": prepared["top_p"],
             "repetition_penalty": prepared["repetition_penalty"],
+            "max_steps": prepared.get("agent_steps", MAX_AGENT_TOOL_STEPS),
         }
         if status_callback is not None:
             resolve_kwargs["status_callback"] = status_callback
@@ -3271,7 +3341,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
         tool_runs = []
 
     if messages:
-        messages = _inject_model_output_guidance(list(messages))
+        messages = _inject_model_output_guidance(list(messages), show_thoughts=prepared.get("show_thoughts", False))
         messages, context_meta = _compact_messages_for_context(
             list(messages),
             prepared["max_tokens"],
@@ -3287,6 +3357,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
         prompt = _render_prompt_from_messages(messages, prepared["prompt"])
     else:
         context_notice = ""
+        context_meta = {"context_length": _context_length_for_generation(prepared["request_context_length"])}
         prompt = prepared["prompt"]
 
     prepared.update({
@@ -3294,6 +3365,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
         "tool_runs": tool_runs,
         "context_notice": context_notice,
         "prompt": prompt,
+        "context_meta": context_meta,
     })
     return prepared
 
@@ -3403,6 +3475,45 @@ async def _stream_gguf_completion(
 
 
 # ---------------------------------------------------------------------------
+# Workspace file watcher helpers
+# ---------------------------------------------------------------------------
+
+def _stop_workspace_watcher() -> None:
+    global _workspace_observer
+    with _workspace_observer_lock:
+        if _workspace_observer is not None:
+            try:
+                _workspace_observer.stop()
+                _workspace_observer.join(timeout=2)
+            except Exception:
+                pass
+            _workspace_observer = None
+
+
+def _start_workspace_watcher(root: Path) -> None:
+    global _workspace_observer
+    _stop_workspace_watcher()
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        class _WatchHandler(FileSystemEventHandler):
+            def on_any_event(self, event):
+                if event.is_directory:
+                    return
+                _push_event("workspace_changed", {"path": str(event.src_path)})
+
+        with _workspace_observer_lock:
+            obs = Observer()
+            obs.schedule(_WatchHandler(), str(root), recursive=True)
+            obs.daemon = True
+            obs.start()
+            _workspace_observer = obs
+    except Exception:
+        pass  # watchdog unavailable — silent degradation
+
+
+# ---------------------------------------------------------------------------
 # Workspace endpoints
 # ---------------------------------------------------------------------------
 
@@ -3427,6 +3538,7 @@ async def workspace_select(request: dict):
 
     # ── Clear workspace ───────────────────────────────────────
     if clear:
+        _stop_workspace_watcher()
         _update_active_project(state, {
             "workspace_enabled": False,
             "workspace_root": None,
@@ -3487,6 +3599,8 @@ async def workspace_select(request: dict):
         "workspace_root": str(workspace_root),
         "project_id": saved.get("active_project_id"),
     })
+
+    _start_workspace_watcher(workspace_root)
 
     return {
         "project": updated_project,
@@ -3599,6 +3713,69 @@ async def workspace_apply(request: dict):
         "applied": applied,
         "errors": errors,
     }
+
+
+@app.get("/api/workspace/diff")
+async def workspace_diff():
+    """Return unified diff of each pending file vs current on-disk state."""
+    state = _load_app_state()
+    project = _get_active_project(state)
+    if not project:
+        return JSONResponse({"error": "No active project"}, status_code=400)
+
+    raw_root = project.get("workspace_root") or ""
+    pending_batch: list[dict] = list(project.get("workspace_pending_batch") or [])
+    if not pending_batch:
+        return {"diffs": []}
+
+    try:
+        workspace_root = _validate_workspace_path(raw_root) if raw_root else None
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    diffs = []
+    for item in pending_batch:
+        rel_path = (item.get("path") or "").strip()
+        new_content = item.get("content") or ""
+        op = (item.get("op") or "write").lower()
+        if not rel_path:
+            continue
+
+        current_content = ""
+        if workspace_root:
+            try:
+                target = (workspace_root / rel_path).resolve()
+                target.relative_to(workspace_root)
+                if target.exists() and target.is_file():
+                    current_content = target.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        if op == "delete":
+            unified = list(difflib.unified_diff(
+                current_content.splitlines(keepends=True),
+                [],
+                fromfile=f"a/{rel_path}",
+                tofile="/dev/null",
+                lineterm="",
+            ))
+        else:
+            unified = list(difflib.unified_diff(
+                current_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{rel_path}",
+                tofile=f"b/{rel_path}",
+                lineterm="",
+            ))
+
+        diffs.append({
+            "path": rel_path,
+            "op": op,
+            "is_new": current_content == "" and op != "delete",
+            "unified_diff": "\n".join(unified),
+        })
+
+    return {"diffs": diffs}
 
 
 @app.post("/api/workspace/stage")
@@ -3881,6 +4058,10 @@ async def generate_sync(request: dict):
         generation_id = prepared["generation_id"]
         _clear_generation_cancel(generation_id)
 
+        sync_ctx = prepared.get("context_meta") or {}
+        sync_ctx_total = int(sync_ctx.get("context_length") or _context_length_for_generation(None))
+        sync_prompt_tokens = int(sync_ctx.get("final_tokens") or 0)
+
         if _gguf_engine_ready():
             result = await _stream_gguf_completion(
                 messages=_messages_for_chat_payload(prepared["messages"], prepared["prompt"]),
@@ -3894,6 +4075,8 @@ async def generate_sync(request: dict):
                 "agent_tools": prepared["tool_runs"],
                 "cancelled": result["cancelled"],
                 "context_notice": prepared["context_notice"],
+                "context_used": sync_prompt_tokens + result["total_tokens"],
+                "context_total": sync_ctx_total,
             }
 
         from mlx_lm import stream_generate
@@ -3936,6 +4119,8 @@ async def generate_sync(request: dict):
             "agent_tools": prepared["tool_runs"],
             "cancelled": False,
             "context_notice": prepared["context_notice"],
+            "context_used": sync_prompt_tokens + token_count,
+            "context_total": sync_ctx_total,
         }
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -4272,6 +4457,34 @@ async def browser_wait(request: dict):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+@app.post("/api/browser/scroll")
+async def browser_scroll(request: dict):
+    """Scroll the current browser page.
+
+    Body: { "direction": "up"|"down"|"top"|"bottom", "pixels": 400 }
+    """
+    direction = (request.get("direction") or "down").lower()
+    pixels = int(request.get("pixels") or 400)
+    try:
+        await _ensure_browser_service()
+        return await _browser_service_request("POST", "/page/scroll", {
+            "direction": direction,
+            "pixels": pixels,
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.post("/api/browser/screenshot")
+async def browser_screenshot():
+    """Capture a PNG screenshot of the current browser page, returned as base64."""
+    try:
+        await _ensure_browser_service()
+        return await _browser_service_request("POST", "/page/screenshot", {})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 # ---------------------------------------------------------------------------
 # HuggingFace Model Pull — ported from AI-ArtWirks runtime/models.py
 # ---------------------------------------------------------------------------
@@ -4419,7 +4632,7 @@ async def audio_speak(request: dict):
     text = (request.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
-    voice = (request.get("voice") or "Samantha").strip()
+    voice = (request.get("voice") or _tts_voice or "Samantha").strip()
 
     tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
     tmp.close()
@@ -4471,6 +4684,55 @@ async def audio_voices():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/audio/voice")
+async def set_tts_voice(request: dict):
+    """Set the default macOS TTS voice (persisted for this session)."""
+    global _tts_voice
+    voice = (request.get("voice") or "").strip()
+    if not voice:
+        return JSONResponse({"error": "voice is required"}, status_code=400)
+    _tts_voice = voice
+    state = _load_app_state()
+    state.setdefault("settings", {})["tts_voice"] = voice
+    _save_app_state(state)
+    return {"voice": _tts_voice}
+
+
+@app.get("/api/audio/voice")
+async def get_tts_voice():
+    """Return the currently configured TTS voice."""
+    return {"voice": _tts_voice}
+
+
+@app.post("/api/audio/whisper-model")
+async def set_whisper_model(request: dict):
+    """Set the Whisper model size for transcription (tiny/base/small/medium)."""
+    global _whisper_model
+    SIZE_MAP = {
+        "tiny": "mlx-community/whisper-tiny",
+        "base": "mlx-community/whisper-base",
+        "small": "mlx-community/whisper-small",
+        "medium": "mlx-community/whisper-medium",
+    }
+    model = (request.get("model") or "").strip().lower()
+    if model not in SIZE_MAP:
+        return JSONResponse(
+            {"error": f"model must be one of: {', '.join(SIZE_MAP)}"}, status_code=400
+        )
+    _whisper_model = SIZE_MAP[model]
+    state = _load_app_state()
+    state.setdefault("settings", {})["whisper_model"] = model
+    _save_app_state(state)
+    return {"model": model, "repo": _whisper_model}
+
+
+@app.get("/api/audio/whisper-model")
+async def get_whisper_model():
+    """Return the currently configured Whisper model size."""
+    size = _whisper_model.split("/whisper-")[-1] if "/" in _whisper_model else "tiny"
+    return {"model": size, "repo": _whisper_model}
+
+
 @app.post("/api/audio/transcribe")
 async def audio_transcribe(request: Request):
     """STT via mlx-whisper. Accepts audio blob (multipart/form-data)."""
@@ -4518,7 +4780,7 @@ async def audio_transcribe(request: Request):
 
         result = mlx_whisper.transcribe(
             tmp.name,
-            path_or_hf_repo="mlx-community/whisper-tiny",
+            path_or_hf_repo=_whisper_model or "mlx-community/whisper-tiny",
         )
         text = (result.get("text") or "").strip()
         return {"text": text}
@@ -4642,6 +4904,147 @@ async def get_presets():
 
 
 # ---------------------------------------------------------------------------
+# Session search
+# ---------------------------------------------------------------------------
+@app.get("/api/sessions/search")
+async def sessions_search(q: str = ""):
+    """Case-insensitive substring search across all session messages.
+
+    Returns sessions with matching excerpts (±80 chars around match).
+    """
+    query = (q or "").strip().lower()
+    if not query:
+        return {"results": []}
+
+    state = _load_app_state()
+    sessions: list[dict] = list(state.get("sessions") or [])
+    results = []
+
+    for session in sessions:
+        session_id = session.get("id") or ""
+        title = session.get("name") or session_id
+        created_at = session.get("created_at") or session.get("created") or ""
+        messages: list[dict] = list(session.get("messages") or [])
+        matches = []
+
+        for msg in messages:
+            role = str(msg.get("role") or "")
+            content = str(msg.get("content") or "")
+            idx = content.lower().find(query)
+            if idx != -1:
+                start = max(0, idx - 80)
+                end = min(len(content), idx + len(query) + 80)
+                excerpt = ("…" if start > 0 else "") + content[start:end] + ("…" if end < len(content) else "")
+                matches.append({"role": role, "excerpt": excerpt})
+
+        if matches:
+            results.append({
+                "session_id": session_id,
+                "title": title,
+                "created_at": created_at,
+                "matches": matches[:5],
+            })
+
+    return {"results": results, "total": len(results)}
+
+
+# ---------------------------------------------------------------------------
+# Research endpoint — multi-step web search + synthesis
+# ---------------------------------------------------------------------------
+@app.post("/api/research")
+async def research(request: dict):
+    """Multi-step research pipeline: search → read sources → synthesise.
+
+    Body: { "query": "...", "max_sources": 3, "depth": "shallow"|"deep" }
+    Streams SSE events: search / reading / source / synthesis_start / token / done
+    """
+    query = (request.get("query") or "").strip()
+    if not query:
+        return JSONResponse({"error": "query is required"}, status_code=400)
+
+    max_sources = max(1, min(int(request.get("max_sources") or 3), 6))
+
+    async def _research_stream() -> AsyncGenerator[str, None]:
+        def _sse(event_type: str, data: dict) -> str:
+            return f"data: {json.dumps({'type': event_type, **data})}\n\n"
+
+        # Step 1 — web search
+        yield _sse("search", {"message": f"Searching: {query}"})
+        try:
+            search_results = await _web_search(query)
+        except Exception as e:
+            yield _sse("error", {"error": f"Search failed: {e}"})
+            return
+
+        urls = [r.get("url") for r in search_results if r.get("url")][:max_sources]
+        if not urls:
+            yield _sse("error", {"error": "No search results found."})
+            return
+
+        # Step 2 — fetch each source
+        source_texts: list[str] = []
+        for idx, url in enumerate(urls, 1):
+            yield _sse("reading", {"message": f"Reading source {idx}/{len(urls)}: {url}", "url": url})
+            try:
+                fetch_result = await _web_fetch(f"web:{url}")
+                attachment = fetch_result.get("attachment") or {}
+                text = (attachment.get("text") or attachment.get("payload") or "")[:4000]
+                if text:
+                    source_texts.append(f"## Source {idx}: {url}\n\n{text}")
+                    yield _sse("source", {"index": idx, "url": url, "chars": len(text)})
+            except Exception:
+                yield _sse("source", {"index": idx, "url": url, "chars": 0, "error": "fetch failed"})
+
+        if not source_texts:
+            yield _sse("error", {"error": "Could not fetch any sources."})
+            return
+
+        # Step 3 — synthesise
+        yield _sse("synthesis_start", {"sources": len(source_texts)})
+
+        sources_block = "\n\n---\n\n".join(source_texts)
+        synthesis_prompt = (
+            f"You are a research assistant. Based solely on the following sources, "
+            f"provide a comprehensive, well-structured answer to the research query.\n\n"
+            f"Research query: {query}\n\n"
+            f"Sources:\n{sources_block}\n\n"
+            f"Provide a detailed synthesis with key findings, citing source numbers where relevant."
+        )
+
+        if _model is None or _tokenizer is None:
+            yield _sse("error", {"error": "No model loaded for synthesis."})
+            return
+
+        try:
+            from mlx_lm import stream_generate
+            generation_runtime = _build_generation_runtime(temperature=0.3, top_p=0.85)
+            for chunk in stream_generate(
+                _model,
+                _tokenizer,
+                prompt=synthesis_prompt,
+                max_tokens=2048,
+                **generation_runtime,
+            ):
+                text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                yield _sse("token", {"text": text})
+        except Exception as e:
+            yield _sse("error", {"error": f"Synthesis failed: {e}"})
+            return
+
+        yield _sse("done", {"message": "Research complete."})
+
+    return StreamingResponse(
+        _research_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # GGUF generation proxy — streams llama-server /v1/chat/completions to WebSocket
 # ---------------------------------------------------------------------------
 async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
@@ -4655,6 +5058,10 @@ async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
         token_callback=websocket.send_json,
     )
 
+    ctx = data.get("context_meta") or {}
+    ctx_total = int(ctx.get("context_length") or _context_length_for_generation(None))
+    prompt_tokens = int(ctx.get("final_tokens") or 0)
+
     if result["cancelled"]:
         await websocket.send_json({"type": "cancelled", "total_tokens": result["total_tokens"]})
     else:
@@ -4664,6 +5071,8 @@ async def _ws_generate_gguf(websocket: WebSocket, data: dict) -> None:
             "elapsed_seconds": result["elapsed_seconds"],
             "tokens_per_second": result["tokens_per_second"],
             "first_token_ms": result["first_token_ms"],
+            "context_used": prompt_tokens + result["total_tokens"],
+            "context_total": ctx_total,
         })
         _push_event("generation_done", {
             "tokens": result["total_tokens"],
@@ -4772,6 +5181,10 @@ async def ws_generate(websocket: WebSocket):
 
                 _record_generation_stats(token_count, first_token_time, final_tps)
 
+                ws_ctx = prepared.get("context_meta") or {}
+                ws_ctx_total = int(ws_ctx.get("context_length") or _context_length_for_generation(None))
+                ws_prompt_tokens = int(ws_ctx.get("final_tokens") or 0)
+
                 if cancelled:
                     await websocket.send_json({
                         "type": "cancelled",
@@ -4784,6 +5197,8 @@ async def ws_generate(websocket: WebSocket):
                         "elapsed_seconds": round(elapsed, 2),
                         "tokens_per_second": final_tps,
                         "first_token_ms": round(first_token_time * 1000, 0) if first_token_time else 0,
+                        "context_used": ws_prompt_tokens + token_count,
+                        "context_total": ws_ctx_total,
                     })
 
                     _push_event("generation_done", {
@@ -4821,7 +5236,28 @@ async def root():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _restore_voice_settings() -> None:
+    """Restore user-saved voice/whisper settings from app_state on startup."""
+    global _tts_voice, _whisper_model
+    try:
+        state = _load_app_state()
+        settings = state.get("settings") or {}
+        if settings.get("tts_voice"):
+            _tts_voice = settings["tts_voice"]
+        if settings.get("whisper_model"):
+            SIZE_MAP = {
+                "tiny": "mlx-community/whisper-tiny",
+                "base": "mlx-community/whisper-base",
+                "small": "mlx-community/whisper-small",
+                "medium": "mlx-community/whisper-medium",
+            }
+            _whisper_model = SIZE_MAP.get(settings["whisper_model"], _whisper_model)
+    except Exception:
+        pass
+
+
 def main() -> None:
+    _restore_voice_settings()
     print(f"\n🧠 {APP_NAME} (Moxy) starting on http://localhost:{PORT}")
     print(f"   ⚡ Memory guard: warn@{MEMORY_PRESSURE_WARN}% · block@{MEMORY_PRESSURE_BLOCK}%")
     print(f"   📡 SSE events: /api/events")

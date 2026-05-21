@@ -3338,3 +3338,42 @@ kbd {
         font-size: clamp(1.8rem, 7vw, 2.25rem);
     }
 }
+
+/* Thought / reasoning block */
+.thought-block {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--accent-purple);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+    font-size: 0.82rem;
+}
+.thought-block summary {
+    cursor: pointer;
+    color: var(--text-tertiary);
+    font-style: italic;
+    user-select: none;
+}
+.thought-block summary:hover { color: var(--text-secondary); }
+.thought-content {
+    margin-top: 8px;
+    color: var(--text-secondary);
+    opacity: 0.85;
+    line-height: 1.5;
+}
+
+/* param-select (voice/whisper dropdowns) */
+.param-select {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-primary);
+    font-size: 0.78rem;
+    padding: 4px 8px;
+    cursor: pointer;
+}
+.param-select:focus { outline: 1px solid var(--accent-purple); }
+
+/* revise button */
+.btn-revise { color: var(--accent-purple); }

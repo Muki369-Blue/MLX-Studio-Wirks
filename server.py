@@ -4403,11 +4403,33 @@ async def audio_transcribe(request: Request):
 
         try:
             import mlx_whisper
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            os.unlink(tmp.name)
+            missing_name = exc.name or "mlx_whisper"
+            if missing_name == "mlx_whisper":
+                return JSONResponse(
+                    {"error": "mlx-whisper not installed. Run: pip install mlx-whisper"},
+                    status_code=501,
+                )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"Missing speech dependency in this build: {missing_name}. "
+                        "Rebuild the app bundle after installing voice dependencies."
+                    )
+                },
+                status_code=500,
+            )
+        except ImportError as exc:
             os.unlink(tmp.name)
             return JSONResponse(
-                {"error": "mlx-whisper not installed. Run: pip install mlx-whisper"},
-                status_code=501,
+                {
+                    "error": (
+                        "mlx-whisper failed to load in this build: "
+                        f"{exc}"
+                    )
+                },
+                status_code=500,
             )
 
         result = mlx_whisper.transcribe(

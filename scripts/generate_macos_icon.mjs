@@ -8,6 +8,7 @@ const __filename = fileURLToPath(import.meta.url);
 const rootDir = path.resolve(path.dirname(__filename), '..');
 const assetsDir = path.join(rootDir, 'assets');
 const iconsetDir = path.join(assetsDir, 'MLX-Moxy-Wirks.iconset');
+const sourceSvgPath = path.join(rootDir, 'static', 'logo-moxy-wirks.svg');
 const svgPath = path.join(assetsDir, 'MLX-Moxy-Wirks.svg');
 const quicklookPng = `${svgPath}.png`;
 const basePng = path.join(assetsDir, 'MLX-Moxy-Wirks-1024.png');
@@ -34,40 +35,26 @@ function run(command, args) {
 
 async function build() {
   await fs.mkdir(assetsDir, { recursive: true });
+  await fs.rm(iconsetDir, { recursive: true, force: true });
   await fs.mkdir(iconsetDir, { recursive: true });
+  await fs.rm(quicklookPng, { force: true });
+  await fs.rm(basePng, { force: true });
 
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 720 720">
-  <defs>
-    <linearGradient id="ring" x1="120" y1="100" x2="600" y2="620" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#6f8fe8"/>
-      <stop offset="1" stop-color="#4a6fda"/>
-    </linearGradient>
-    <linearGradient id="ink" x1="180" y1="180" x2="560" y2="560" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#111c40"/>
-      <stop offset="1" stop-color="#1e3a8a"/>
-    </linearGradient>
-    <linearGradient id="core" x1="250" y1="250" x2="470" y2="480" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#95b6ff"/>
-      <stop offset="1" stop-color="#6c91f0"/>
-    </linearGradient>
-  </defs>
-
-  <rect width="720" height="720" fill="#f4f8ff"/>
-
-  <circle cx="360" cy="360" r="306" fill="none" stroke="url(#ring)" stroke-width="26"/>
-
-  <path d="M140 248 L320 110 L322 208" fill="none" stroke="url(#ink)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M580 248 L400 110" fill="none" stroke="url(#ink)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M170 522 L326 376 L360 450 L394 376 L550 522" fill="none" stroke="url(#core)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M210 560 L300 470 L360 548 L420 470 L510 560" fill="none" stroke="#6f8fe8" stroke-width="10" stroke-linecap="round" stroke-linejoin="round" opacity="0.9"/>
-  <path d="M286 378 L434 378" fill="none" stroke="#75a4ff" stroke-width="9" stroke-linecap="round"/>
-
-  <path d="M155 242 L122 272" fill="none" stroke="#0f172a" stroke-width="9" stroke-linecap="round"/>
-  <path d="M563 242 L598 272" fill="none" stroke="#0f172a" stroke-width="9" stroke-linecap="round"/>
-  <path d="M177 540 L145 578" fill="none" stroke="#0f172a" stroke-width="9" stroke-linecap="round"/>
-  <path d="M543 540 L575 578" fill="none" stroke="#0f172a" stroke-width="9" stroke-linecap="round"/>
-</svg>`;
-  await fs.writeFile(svgPath, svg, 'utf8');
+  const sourceSvg = await fs.readFile(sourceSvgPath, 'utf8');
+  const normalizedSvg = sourceSvg.replace(
+    /<svg\b([^>]*)>/,
+    (match, attrs) => {
+      let nextAttrs = attrs;
+      if (!/\bwidth=/.test(nextAttrs)) {
+        nextAttrs += ' width="1024"';
+      }
+      if (!/\bheight=/.test(nextAttrs)) {
+        nextAttrs += ' height="1024"';
+      }
+      return `<svg${nextAttrs}>`;
+    },
+  );
+  await fs.writeFile(svgPath, normalizedSvg, 'utf8');
 
   run('qlmanage', ['-t', '-s', '1024', '-o', assetsDir, svgPath]);
   await fs.rename(quicklookPng, basePng);

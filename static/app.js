@@ -2509,6 +2509,13 @@ function handleSlashCommand(text) {
             }
             break;
 
+        case '/image':
+        case '/img': {
+            if (!arg) { showToast('Usage: /image <prompt>', 'info'); break; }
+            runImageGeneration(arg);
+            break;
+        }
+
         case '/refine': {
             const lastAssistant = state.messages.slice().reverse().find(m => m.role === 'assistant');
             if (!lastAssistant) { showToast('No response to refine yet', 'info'); break; }
@@ -2697,6 +2704,80 @@ async function runResearch(query) {
         }
     } catch (e) {
         showToast(`Research: ${e.message}`, 'error');
+        if (state.currentStreamEl) {
+            state.currentStreamEl.closest('.message')?.remove();
+        }
+        stopGenerating();
+    }
+}
+
+async function runImageGeneration(prompt) {
+    if (!prompt.trim()) { showToast('Provide an image prompt', 'info'); return; }
+    if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
+
+    if (dom.welcomeScreen) dom.welcomeScreen.style.display = 'none';
+    appendMessage('user', `/image ${prompt}`, 0);
+    state.messages.push({ role: 'user', content: `/image ${prompt}`, tokens: 0 });
+
+    startGenerating();
+    const msgEl = appendMessage('assistant', '', 0);
+    state.currentStreamEl = msgEl.querySelector('.message-body');
+    state.currentStreamEl.innerHTML = '<em style="opacity:.6">Loading FLUX.1-schnell…</em>';
+
+    try {
+        const res = await fetch('/api/images/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            const lines = buf.split('\n');
+            buf = lines.pop();
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                let evt;
+                try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+                if (evt.type === 'loading') {
+                    state.currentStreamEl.innerHTML = `<em style="opacity:.6">${escapeHtml(evt.message)}</em>`;
+                } else if (evt.type === 'generating') {
+                    state.currentStreamEl.innerHTML = `<em style="opacity:.6">${escapeHtml(evt.message)}</em>`;
+                } else if (evt.type === 'done') {
+                    // Add cache-buster so subsequent regenerations don't show stale
+                    const imgUrl = `${evt.url}?t=${Date.now()}`;
+                    const caption = `${evt.width}×${evt.height} · ${evt.steps} steps · seed ${evt.seed}`;
+                    state.currentStreamEl.innerHTML = `
+                        <img src="${imgUrl}" alt="${escapeHtml(evt.prompt)}" class="generated-image"
+                             style="max-width:100%; border-radius:8px; display:block; margin-bottom:8px;"/>
+                        <div style="font-size:0.8em; opacity:0.6;">${escapeHtml(caption)}</div>
+                    `;
+                    state.messages.push({
+                        role: 'assistant',
+                        content: `![${evt.prompt}](${evt.url})\n\n${caption}`,
+                        tokens: 0,
+                        image_url: evt.url,
+                    });
+                    saveCurrentSession();
+                    scheduleAppStateSave();
+                    stopGenerating();
+                    scrollToBottom();
+                    return;
+                } else if (evt.type === 'error') {
+                    throw new Error(evt.error || 'Image generation failed');
+                }
+            }
+        }
+    } catch (e) {
+        showToast(`Image: ${e.message}`, 'error');
         if (state.currentStreamEl) {
             state.currentStreamEl.closest('.message')?.remove();
         }

@@ -276,6 +276,17 @@ XTTS_PERSONAS: dict[str, dict] = {
 # on every synthesis call (faster + more consistent voice match).
 _xtts_speaker_latents: dict[str, tuple] = {}
 
+# FLUX.1-schnell image generation (MLX-native via mflux). Quantized to Q4
+# to coexist comfortably with Gemma 4 26B on 36 GB M4 Max.
+_flux_model: Optional[Any] = None
+_flux_loading: bool = False
+_flux_error: Optional[str] = None
+_flux_busy: bool = False
+_flux_lock = threading.Lock()
+FLUX_VARIANT = os.environ.get("MOXY_FLUX_VARIANT", "schnell")  # schnell / dev
+FLUX_QUANTIZE = int(os.environ.get("MOXY_FLUX_QUANTIZE", "4"))  # 4 or 8 bit
+FLUX_IMAGE_DIR = APP_STATE_DIR / "images"
+
 # Workspace file watcher
 _workspace_observer: Optional[Any] = None
 _workspace_observer_lock = threading.Lock()
@@ -5065,6 +5076,146 @@ BUILTIN_PRESETS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Image generation — FLUX.1-schnell (MLX)
+# ---------------------------------------------------------------------------
+@app.get("/api/images/status")
+async def images_status():
+    with _flux_lock:
+        return {
+            "loaded": _flux_model is not None,
+            "loading": _flux_loading,
+            "busy": _flux_busy,
+            "error": _flux_error,
+            "variant": FLUX_VARIANT,
+            "quantize": FLUX_QUANTIZE,
+        }
+
+
+@app.post("/api/images/load")
+async def images_load():
+    """Trigger background load of FLUX.1-schnell. Unloads the LLM first."""
+    _flux_start_loading_async()
+    with _flux_lock:
+        return {
+            "loaded": _flux_model is not None,
+            "loading": _flux_loading,
+            "error": _flux_error,
+        }
+
+
+@app.post("/api/images/unload")
+async def images_unload():
+    _unload_flux()
+    return {"loaded": False}
+
+
+@app.post("/api/images/generate")
+async def images_generate(request: dict):
+    """Body: {prompt, steps?, width?, height?, guidance?, seed?}
+    Streams SSE events: loading | generating | done | error."""
+    prompt = (request.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": "prompt required"}, status_code=400)
+
+    # Schnell needs 1-4 steps; dev needs 20-30. Clamp accordingly.
+    if FLUX_VARIANT == "schnell":
+        steps = max(1, min(int(request.get("steps") or 4), 4))
+        guidance = float(request.get("guidance") or 0.0)
+    else:
+        steps = max(4, min(int(request.get("steps") or 25), 50))
+        guidance = float(request.get("guidance") or 4.0)
+
+    width = max(256, min(int(request.get("width") or 1024), 1536))
+    height = max(256, min(int(request.get("height") or 1024), 1536))
+    # FLUX needs dims divisible by 16
+    width -= width % 16
+    height -= height % 16
+    seed = request.get("seed")
+    if seed is not None:
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            seed = None
+
+    async def _stream() -> AsyncGenerator[str, None]:
+        def _sse(t: str, data: dict) -> str:
+            return f"data: {json.dumps({'type': t, **data})}\n\n"
+
+        # Ensure FLUX is loaded (kick off if not)
+        with _flux_lock:
+            ready = _flux_model is not None
+            loading = _flux_loading
+            err = _flux_error
+        if not ready:
+            yield _sse("loading", {"message": "Loading FLUX.1-schnell (~3-4 GB)…"})
+            if not loading:
+                _flux_start_loading_async()
+            # Poll until loaded or error
+            for _ in range(600):  # up to 5 minutes
+                await asyncio.sleep(0.5)
+                with _flux_lock:
+                    ready = _flux_model is not None
+                    err = _flux_error
+                if ready or err:
+                    break
+            if err:
+                yield _sse("error", {"error": err})
+                return
+            if not ready:
+                yield _sse("error", {"error": "FLUX load timed out."})
+                return
+
+        yield _sse("generating", {
+            "message": f"Generating {width}×{height} · {steps} steps…",
+            "steps": steps, "width": width, "height": height,
+        })
+
+        try:
+            result = await asyncio.to_thread(
+                _generate_image_blocking,
+                prompt,
+                steps=steps, width=width, height=height,
+                guidance=guidance, seed=seed,
+            )
+            # Expose under /static/.images/ so the browser can fetch it.
+            # The file lives in APP_STATE_DIR/images; mount on demand.
+            yield _sse("done", {
+                "filename": result["filename"],
+                "url": f"/api/images/file/{result['filename']}",
+                "seed": result["seed"],
+                "steps": result["steps"],
+                "width": result["width"],
+                "height": result["height"],
+                "prompt": result["prompt"],
+            })
+        except Exception as exc:
+            import traceback
+            yield _sse("error", {"error": str(exc), "traceback": traceback.format_exc()})
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/images/file/{filename}")
+async def images_file(filename: str):
+    """Serve a generated image by filename. Path-traversal guarded."""
+    # Reject anything that isn't a simple filename
+    if "/" in filename or ".." in filename or filename.startswith("."):
+        return JSONResponse({"error": "invalid filename"}, status_code=400)
+    target = FLUX_IMAGE_DIR / filename
+    if not target.exists() or not target.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(str(target), media_type="image/png")
+
+
 @app.get("/api/presets")
 async def get_presets():
     return {"presets": BUILTIN_PRESETS}
@@ -5580,6 +5731,117 @@ def _synthesize_xtts(text: str, persona_id: str) -> bytes:
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# FLUX.1-schnell — MLX-native image generation
+# ---------------------------------------------------------------------------
+def _load_flux_blocking() -> None:
+    """Load FLUX.1-schnell quantized (~3-4 GB at Q4). On first run mflux
+    downloads ~9 GB of weights to ~/.cache/huggingface; subsequent loads
+    are instant from disk. Auto-unloads the LLM first to free memory."""
+    global _flux_model, _flux_loading, _flux_error
+    with _flux_lock:
+        if _flux_model is not None or _flux_loading:
+            return
+        _flux_loading = True
+        _flux_error = None
+    try:
+        # Free the LLM to make room for FLUX (best-effort).
+        _smart_cleanup(reason="flux_load")
+        _stop_llama_server()
+        from mflux.models.flux.variants.txt2img.flux import Flux1
+        from mflux.models.common.config.model_config import ModelConfig
+        variant_cfg = ModelConfig.schnell() if FLUX_VARIANT == "schnell" else ModelConfig.dev()
+        print(f"🎨 Loading FLUX.1-{FLUX_VARIANT} (Q{FLUX_QUANTIZE})…", flush=True)
+        model = Flux1(quantize=FLUX_QUANTIZE, model_config=variant_cfg)
+        with _flux_lock:
+            _flux_model = model
+            _flux_loading = False
+        print(f"🎨 FLUX.1-{FLUX_VARIANT} ready.", flush=True)
+        _push_event("flux_loaded", {"variant": FLUX_VARIANT, "quantize": FLUX_QUANTIZE})
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"❌ FLUX load failed:\n{tb}", flush=True)
+        with _flux_lock:
+            _flux_loading = False
+            _flux_error = str(exc)
+        _push_event("flux_error", {"error": str(exc), "traceback": tb})
+
+
+def _flux_start_loading_async() -> None:
+    with _flux_lock:
+        if _flux_model is not None or _flux_loading:
+            return
+    threading.Thread(target=_load_flux_blocking, daemon=True, name="flux-load").start()
+
+
+def _unload_flux() -> None:
+    """Drop FLUX from memory (used before reloading the LLM)."""
+    global _flux_model
+    with _flux_lock:
+        if _flux_model is None:
+            return
+        _flux_model = None
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        pass
+    _push_event("flux_unloaded", {})
+
+
+def _generate_image_blocking(
+    prompt: str,
+    *,
+    steps: int = 4,
+    width: int = 1024,
+    height: int = 1024,
+    guidance: float = 4.0,
+    seed: Optional[int] = None,
+) -> dict:
+    """Synchronously generate an image with FLUX.1. Saves PNG to disk and
+    returns metadata + relative path."""
+    global _flux_busy
+    with _flux_lock:
+        model = _flux_model
+        if _flux_busy:
+            raise RuntimeError("Image generation already in progress.")
+        _flux_busy = True
+    if model is None:
+        with _flux_lock:
+            _flux_busy = False
+        raise RuntimeError("FLUX model not loaded.")
+    if seed is None:
+        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    try:
+        result = model.generate_image(
+            seed=seed,
+            prompt=prompt,
+            num_inference_steps=steps,
+            height=height,
+            width=width,
+            guidance=guidance,
+        )
+        FLUX_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        fname = f"flux_{int(time.time()*1000)}_{seed}.png"
+        out_path = FLUX_IMAGE_DIR / fname
+        result.image.save(str(out_path))
+        return {
+            "filename": fname,
+            "path": str(out_path),
+            "seed": seed,
+            "steps": steps,
+            "width": width,
+            "height": height,
+            "guidance": guidance,
+            "prompt": prompt,
+        }
+    finally:
+        with _flux_lock:
+            _flux_busy = False
 
 
 def _restore_voice_settings() -> None:

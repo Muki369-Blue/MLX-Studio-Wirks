@@ -2776,6 +2776,8 @@ async function runImageGeneration(prompt) {
                 }
             }
         }
+        // Stream closed without a 'done' event — treat as failure
+        throw new Error('Image stream ended unexpectedly');
     } catch (e) {
         showToast(`Image: ${e.message}`, 'error');
         if (state.currentStreamEl) {

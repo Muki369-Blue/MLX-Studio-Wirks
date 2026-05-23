@@ -3991,6 +3991,7 @@ async def load_model(request: dict):
 
     try:
         # ── Smart cleanup before loading (from AI-ArtWirks _prepare_for_engine) ──
+        _unload_flux()  # free FLUX RAM before loading the LLM
         with PerfTimer("model_cleanup"):
             _smart_cleanup(reason=f"swapping to {request.get('name', model_path)}")
         _stop_llama_server()

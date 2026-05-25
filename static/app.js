@@ -104,14 +104,24 @@ function isGemma4StyleModel(model = state.loadedModelMeta) {
 }
 
 // Gemma 4 emits channel tags in several variants:
-//   <|channel>thought   (opening, escaped pipe before brackets)
+//   <|channel>thought   (opening)
 //   <|channel>final     (named final channel)
 //   <channel|>          (separator the model produces between thought and answer)
-// Match any of these, including bare <|channel> closers.
 const CHANNEL_TAG_RE = /<\|channel\>[a-z_]+\s*|<channel\|\>\s*|<\|channel\>\s*/gi;
 const CHANNEL_FINAL_RE = /(?:<\|channel\>final|<channel\|\>)\s*([\s\S]*)$/i;
 const CHANNEL_THOUGHT_RE = /<\|channel\>thought\s*([\s\S]*?)(?=<\|channel\>final|<channel\|\>|$)/i;
 const CHANNEL_ANY_RE = /<\|channel\>|<channel\|\>/i;
+// Strip trailing <|channel>thought blocks the model sometimes appends after the answer
+// (empty or newline-only thought emitted when the model hits its token budget mid-stream).
+const CHANNEL_TRAILING_THOUGHT_RE = /<\|channel\>thought[\s\S]*$/i;
+// Strips an incomplete <|channel…> tag from the very end of streamed text.
+// Prevents "thought" appearing as plain text when <|channel> and the type
+// token arrive as separate streaming chunks.
+const CHANNEL_PARTIAL_TAIL_RE = /<\|channel(?:\>[a-z_]*\s*)?$/i;
+
+function _cleanFinal(s) {
+    return s.replace(CHANNEL_TRAILING_THOUGHT_RE, '').replace(CHANNEL_TAG_RE, '').trim();
+}
 
 function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
     const text = String(content || '');
@@ -128,16 +138,12 @@ function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
     // whether it auto-opens.
     if (thoughtMatch?.[1]?.trim()) {
         const thought = thoughtMatch[1].trim();
-        const final = finalMatch
-            ? finalMatch[1].replace(CHANNEL_TAG_RE, '').trimStart()
-            : '';
+        const final = finalMatch ? _cleanFinal(finalMatch[1]) : '';
         return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
     }
 
-    if (finalMatch) {
-        return finalMatch[1].replace(CHANNEL_TAG_RE, '').trimStart();
-    }
-    return text.replace(CHANNEL_TAG_RE, '').trimStart();
+    if (finalMatch) return _cleanFinal(finalMatch[1]);
+    return _cleanFinal(text);
 }
 
 function finalizeAssistantText(rawText) {
@@ -1910,7 +1916,8 @@ function handleStreamMessage(data) {
     if (data.type === 'token') {
         state.currentStreamText += data.text;
         if (state.currentStreamEl) {
-            const visible = sanitizeAssistantOutput(state.currentStreamText);
+            const visible = sanitizeAssistantOutput(state.currentStreamText)
+                .replace(CHANNEL_PARTIAL_TAIL_RE, '');
             state.currentStreamEl.innerHTML = renderWithThoughts(visible || '…');
             state.currentStreamEl.classList.add('cursor-blink');
         }

@@ -4779,101 +4779,50 @@ async def audio_personas_load():
 
 @app.post("/api/audio/speak")
 async def audio_speak(request: dict):
-    """TTS endpoint. Routes to XTTS v2 when a neural persona is selected,
-    otherwise falls back to macOS `say`. Returns audio/wav or audio/aiff."""
+    """TTS via XTTS v2 neural voice cloning. Requires a valid persona_id."""
     text = (request.get("text") or "").strip()
     if not text:
         return JSONResponse({"error": "No text provided"}, status_code=400)
 
     persona_id = (request.get("persona") or "").strip().lower()
-    if persona_id and persona_id in XTTS_PERSONAS:
-        with _xtts_lock:
-            ready = _xtts_model is not None
-            loading = _xtts_loading
-            err = _xtts_error
-        if not ready:
-            if not loading:
-                _xtts_start_loading_async()
-            return JSONResponse(
-                {
-                    "error": err or "Neural voice is still loading. First-run download is ~1.8 GB.",
-                    "loading": True,
-                },
-                status_code=503,
-            )
-        try:
-            wav_bytes = await asyncio.to_thread(_synthesize_xtts, text, persona_id)
-        except Exception as exc:
-            return JSONResponse({"error": f"XTTS synthesis failed: {exc}"}, status_code=500)
-        return Response(content=wav_bytes, media_type="audio/wav")
+    if not persona_id or persona_id not in XTTS_PERSONAS:
+        return JSONResponse({"error": "Unknown persona"}, status_code=400)
 
-    voice = (request.get("voice") or _tts_voice or "Samantha").strip()
-
-    tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
-    tmp.close()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "say", "-v", voice, "-o", tmp.name, text,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    with _xtts_lock:
+        ready = _xtts_model is not None
+        loading = _xtts_loading
+        err = _xtts_error
+    if not ready:
+        if not loading:
+            _xtts_start_loading_async()
+        return JSONResponse(
+            {
+                "error": err or "Neural voice is still loading. First-run download is ~1.8 GB.",
+                "loading": True,
+            },
+            status_code=503,
         )
-        _, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            os.unlink(tmp.name)
-            return JSONResponse(
-                {"error": f"say failed: {stderr.decode()}"}, status_code=500,
-            )
-
-        def _stream():
-            try:
-                with open(tmp.name, "rb") as f:
-                    while chunk := f.read(8192):
-                        yield chunk
-            finally:
-                os.unlink(tmp.name)
-
-        return StreamingResponse(_stream(), media_type="audio/aiff")
-    except Exception as e:
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
-@app.get("/api/audio/voices")
-async def audio_voices():
-    """List macOS voices available for say."""
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "say", "-v", "?",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await proc.communicate()
-        voices = []
-        for line in stdout.decode().splitlines():
-            parts = line.split()
-            if parts:
-                voices.append(parts[0])
-        return {"voices": voices}
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        wav_bytes = await asyncio.to_thread(_synthesize_xtts, text, persona_id)
+    except Exception as exc:
+        return JSONResponse({"error": f"XTTS synthesis failed: {exc}"}, status_code=500)
+    return Response(content=wav_bytes, media_type="audio/wav")
 
 
 @app.post("/api/audio/voice")
 async def set_tts_voice(request: dict):
-    """Set the default voice. Accepts either a macOS voice name or a Nayara
-    neural persona id (e.g. 'nayara', 'v2'). Neural personas trigger XTTS load."""
+    """Set the active neural persona. Must be a key in XTTS_PERSONAS."""
     global _tts_voice
-    voice = (request.get("voice") or "").strip()
+    voice = (request.get("voice") or "").strip().lower()
     if not voice:
         return JSONResponse({"error": "voice is required"}, status_code=400)
+    if voice not in XTTS_PERSONAS:
+        return JSONResponse({"error": f"Unknown persona '{voice}'"}, status_code=400)
     _tts_voice = voice
     state = _load_app_state()
     state.setdefault("settings", {})["tts_voice"] = voice
     _save_app_state(state)
-    # If the user picked a neural persona, kick off background XTTS load now.
-    if voice.lower() in XTTS_PERSONAS:
-        _xtts_start_loading_async()
+    _xtts_start_loading_async()
     return {"voice": _tts_voice}
 
 
@@ -5859,8 +5808,14 @@ def _restore_voice_settings() -> None:
     try:
         state = _load_app_state()
         settings = state.get("settings") or {}
-        if settings.get("tts_voice"):
-            _tts_voice = settings["tts_voice"]
+        saved_voice = settings.get("tts_voice", "")
+        if saved_voice and saved_voice.lower() in XTTS_PERSONAS:
+            _tts_voice = saved_voice.lower()
+        elif saved_voice:
+            # Saved voice was a macOS system voice — migrate to default persona.
+            _tts_voice = next(iter(XTTS_PERSONAS))
+            state.setdefault("settings", {})["tts_voice"] = _tts_voice
+            _save_app_state(state)
         if settings.get("whisper_model"):
             SIZE_MAP = {
                 "tiny": "mlx-community/whisper-tiny",

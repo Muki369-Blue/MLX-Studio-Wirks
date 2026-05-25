@@ -432,9 +432,6 @@ const voice = {
     spokenUpToIdx: 0,           // chars of state.currentStreamText already dispatched
     speechQueue: [],            // pending Audio elements waiting their turn
     queuePlaying: false,        // is a queued clip currently playing?
-    // Cached set of neural persona ids (e.g. {'nayara','mpg_lydia'}), populated
-    // from /api/audio/personas at init so we never hardcode a stale list.
-    neuralPersonas: new Set(),
 };
 
 function setupVoice() {
@@ -567,20 +564,11 @@ async function speakText(text) {
     if (!clean) return;
 
     try {
-        // If the user selected a neural persona (Nayara/MPG Lydia/etc), send
-        // it as `persona` so the backend routes through XTTS v2; otherwise
-        // the voice falls through to macOS `say`. The neural persona set is
-        // populated dynamically from /api/audio/personas, never hardcoded.
-        const selected = (dom.ttsVoiceSelect?.value || '').trim();
-        const isNeural = voice.neuralPersonas.has(selected.toLowerCase());
-        const payload = isNeural
-            ? { text: clean, persona: selected.toLowerCase() }
-            : { text: clean, voice: selected };
-
+        const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase();
         const res = await fetch('/api/audio/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({ text: clean, persona: selected }),
         });
         if (res.status === 503) {
             const err = await res.json().catch(() => ({}));
@@ -640,17 +628,12 @@ async function enqueueSpeechChunk(text) {
         .trim();
     if (!clean) return;
 
-    const selected = (dom.ttsVoiceSelect?.value || '').trim();
-    const isNeural = voice.neuralPersonas.has(selected.toLowerCase());
-    const payload = isNeural
-        ? { text: clean, persona: selected.toLowerCase() }
-        : { text: clean, voice: selected };
-
+    const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase();
     try {
         const res = await fetch('/api/audio/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+            body: JSON.stringify({ text: clean, persona: selected }),
         });
         if (res.status === 503) {
             const err = await res.json().catch(() => ({}));
@@ -845,15 +828,13 @@ function setupMemoryFlush() {
 // Voice Settings (TTS voice + Whisper model selects)
 // ===========================================================================
 async function setupVoiceSettings() {
-    // Populate the TTS voice dropdown with NEURAL personas only — the app
-    // no longer surfaces macOS system voices (they sounded computerized).
+    // Populate the TTS voice dropdown with XTTS neural personas.
     if (dom.ttsVoiceSelect) {
         try {
             const personasRes = await fetch('/api/audio/personas')
                 .then(r => r.json())
                 .catch(() => ({}));
             const personas = (personasRes.personas || []).filter(p => p.available);
-            voice.neuralPersonas = new Set(personas.map(p => String(p.id).toLowerCase()));
 
             if (personas.length) {
                 dom.ttsVoiceSelect.innerHTML = personas.map(p =>
@@ -861,18 +842,17 @@ async function setupVoiceSettings() {
                 ).join('');
             } else {
                 dom.ttsVoiceSelect.innerHTML = '<option value="nayara">Nayara</option>';
-                voice.neuralPersonas.add('nayara');
             }
 
             // Read current voice from backend; fall back to first persona.
             const curRes = await fetch('/api/audio/voice');
             const curData = await curRes.json();
             const want = (curData.voice || '').toLowerCase();
-            if (want && voice.neuralPersonas.has(want)) {
+            const knownIds = new Set(personas.map(p => p.id.toLowerCase()));
+            if (want && knownIds.has(want)) {
                 dom.ttsVoiceSelect.value = want;
             } else if (personas.length) {
                 dom.ttsVoiceSelect.value = personas[0].id;
-                // Persist so backend matches UI on next boot.
                 fetch('/api/audio/voice', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -887,7 +867,6 @@ async function setupVoiceSettings() {
             }
         } catch {
             dom.ttsVoiceSelect.innerHTML = '<option value="nayara">Nayara</option>';
-            voice.neuralPersonas = new Set(['nayara']);
         }
 
         dom.ttsVoiceSelect.addEventListener('change', () => {
@@ -896,12 +875,8 @@ async function setupVoiceSettings() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ voice: selectedVoice }),
-            }).then(() => {
-                showToast(`Voice: ${selectedVoice}`, 'success');
-                if (voice.neuralPersonas.has(selectedVoice.toLowerCase())) {
-                    showToast('Neural voice loading — first run downloads ~1.8 GB', 'info');
-                }
-            }).catch(() => null);
+            }).then(() => showToast(`Voice: ${selectedVoice}`, 'success'))
+              .catch(() => null);
         });
     }
 

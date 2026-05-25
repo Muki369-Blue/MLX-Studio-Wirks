@@ -570,7 +570,7 @@ async function speakText(text) {
     if (!clean) return;
 
     try {
-        const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase();
+        const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase() || 'nayara';
         const res = await fetch('/api/audio/speak', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -581,7 +581,10 @@ async function speakText(text) {
             showToast(err.error || 'Neural voice still loading…', 'info');
             throw new Error('loading');
         }
-        if (!res.ok) throw new Error('TTS failed');
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.error || 'TTS failed');
+        }
         const audioBlob = await res.blob();
         const url = URL.createObjectURL(audioBlob);
         const audio = new Audio(url);
@@ -634,7 +637,7 @@ async function enqueueSpeechChunk(text) {
         .trim();
     if (!clean) return;
 
-    const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase();
+    const selected = (dom.ttsVoiceSelect?.value || '').trim().toLowerCase() || 'nayara';
     try {
         const res = await fetch('/api/audio/speak', {
             method: 'POST',
@@ -649,7 +652,16 @@ async function enqueueSpeechChunk(text) {
             }
             return;
         }
-        if (!res.ok) return;
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            console.error('[TTS]', res.status, err.error || 'synthesis failed');
+            if (!voice._ttsErrorShown) {
+                voice._ttsErrorShown = true;
+                showToast(err.error || 'Voice synthesis failed', 'error');
+            }
+            return;
+        }
+        voice._ttsErrorShown = false;
         voice._loadingToastShown = false;
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
@@ -1787,6 +1799,13 @@ function handleServerEvent(event) {
     }
     if (event.type === 'flux_unloaded') {
         showToast('FLUX unloaded', 'info');
+    }
+    if (event.type === 'xtts_loaded') {
+        showToast('Neural voice ready', 'success');
+        setupVoiceSettings();
+    }
+    if (event.type === 'xtts_error') {
+        showToast(`Neural voice failed to load: ${event.error}`, 'error');
     }
     if (event.type.startsWith('workspace_')) {
         fetchAppState().catch(() => null);

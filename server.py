@@ -5748,9 +5748,17 @@ def _load_flux_blocking() -> None:
         _flux_loading = True
         _flux_error = None
     try:
-        # Free the LLM to make room for FLUX (best-effort).
+        # Free the LLM to make room for FLUX, then verify headroom.
         _smart_cleanup(reason="flux_load")
         _stop_llama_server()
+        try:
+            _ensure_memory_headroom("flux_load")
+        except RuntimeError as mem_err:
+            with _flux_lock:
+                _flux_loading = False
+                _flux_error = str(mem_err)
+            _push_event("flux_error", {"error": str(mem_err)})
+            return
         from mflux.models.flux.variants.txt2img.flux import Flux1
         from mflux.models.common.config.model_config import ModelConfig
         variant_cfg = ModelConfig.schnell() if FLUX_VARIANT == "schnell" else ModelConfig.dev()

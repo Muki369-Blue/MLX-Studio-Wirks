@@ -1784,12 +1784,28 @@ function handleServerEvent(event) {
         fetchPageClips();
         showToast(`Captured page clip: ${event.title || 'Untitled Page'}`, 'info');
     }
+    if (event.type === 'model_loading') {
+        showToast(`Loading ${event.model || 'model'}…`, 'info');
+    }
+    if (event.type === 'model_load_failed') {
+        showToast(`Model load failed: ${event.error}`, 'error');
+        fetchModels();
+    }
     if (event.type === 'model_pull_completed') {
         fetchModels();
         showToast(`Model downloaded: ${event.repo_id}`, 'success');
     }
     if (event.type === 'model_pull_failed') {
         showToast(`Model pull failed: ${event.error}`, 'error');
+    }
+    if (event.type === 'flux_loaded') {
+        showToast(`FLUX.1-${event.variant} ready (Q${event.quantize})`, 'success');
+    }
+    if (event.type === 'flux_error') {
+        showToast(`FLUX load failed: ${event.error}`, 'error');
+    }
+    if (event.type === 'flux_unloaded') {
+        showToast('FLUX unloaded', 'info');
     }
     if (event.type.startsWith('workspace_')) {
         fetchAppState().catch(() => null);
@@ -2511,8 +2527,14 @@ function handleSlashCommand(text) {
 
         case '/image':
         case '/img': {
-            if (!arg) { showToast('Usage: /image <prompt>', 'info'); break; }
-            runImageGeneration(arg);
+            if (!arg) { showToast('Usage: /image [WxH] <prompt>', 'info'); break; }
+            // Optional leading WxH size spec: /image 512x768 a sunset
+            const sizeMatch = arg.match(/^(\d{3,4})[xX×](\d{3,4})\s+(.+)$/);
+            if (sizeMatch) {
+                runImageGeneration(sizeMatch[3].trim(), { width: parseInt(sizeMatch[1]), height: parseInt(sizeMatch[2]) });
+            } else {
+                runImageGeneration(arg);
+            }
             break;
         }
 
@@ -2702,6 +2724,7 @@ async function runResearch(query) {
                 }
             }
         }
+        throw new Error('Research stream ended unexpectedly');
     } catch (e) {
         showToast(`Research: ${e.message}`, 'error');
         if (state.currentStreamEl) {
@@ -2711,13 +2734,14 @@ async function runResearch(query) {
     }
 }
 
-async function runImageGeneration(prompt) {
+async function runImageGeneration(prompt, { width, height } = {}) {
     if (!prompt.trim()) { showToast('Provide an image prompt', 'info'); return; }
     if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
 
     if (dom.welcomeScreen) dom.welcomeScreen.style.display = 'none';
-    appendMessage('user', `/image ${prompt}`, 0);
-    state.messages.push({ role: 'user', content: `/image ${prompt}`, tokens: 0 });
+    const sizeLabel = (width && height) ? ` [${width}×${height}]` : '';
+    appendMessage('user', `/image${sizeLabel} ${prompt}`, 0);
+    state.messages.push({ role: 'user', content: `/image${sizeLabel} ${prompt}`, tokens: 0 });
 
     startGenerating();
     const msgEl = appendMessage('assistant', '', 0);
@@ -2725,10 +2749,13 @@ async function runImageGeneration(prompt) {
     state.currentStreamEl.innerHTML = '<em style="opacity:.6">Loading FLUX.1-schnell…</em>';
 
     try {
+        const body = { prompt };
+        if (width) body.width = width;
+        if (height) body.height = height;
         const res = await fetch('/api/images/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ prompt }),
+            body: JSON.stringify(body),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
 

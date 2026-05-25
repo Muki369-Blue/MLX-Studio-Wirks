@@ -33,7 +33,8 @@ from html.parser import HTMLParser
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, AsyncGenerator, Any
-from urllib.parse import urlparse, parse_qs, quote, unquote, urljoin
+import tempfile
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import httpx
 import uvicorn
@@ -4737,9 +4738,8 @@ async def web_search(query: str):
 
 
 # ---------------------------------------------------------------------------
-# Voice — TTS (macOS say) and STT (MLX Whisper)
+# Voice — TTS (XTTS neural voice cloning) and STT (MLX Whisper)
 # ---------------------------------------------------------------------------
-import tempfile
 
 @app.get("/api/audio/personas")
 async def audio_personas():

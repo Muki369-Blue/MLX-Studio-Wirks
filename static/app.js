@@ -420,7 +420,7 @@ const dom = {
 };
 
 // ===========================================================================
-// Voice Engine — STT (mic → transcribe) + TTS (say → speaker)
+// Voice Engine — STT (mic → transcribe) + TTS (XTTS neural synthesis)
 // ===========================================================================
 const voice = {
     mediaRecorder: null,

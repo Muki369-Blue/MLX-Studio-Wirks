@@ -148,9 +148,14 @@ function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
 
 function finalizeAssistantText(rawText) {
     const sanitized = sanitizeAssistantOutput(rawText);
+    if (sanitized.startsWith('\x00THOUGHTS\x00')) {
+        const finalPart = (sanitized.split('\x00FINAL\x00')[1] || '').trim();
+        if (finalPart) return sanitized;
+        // Hit token cap mid-thought — no final answer was emitted.
+        // Return as thought-only sentinel so renderWithThoughts can label it correctly.
+        return sanitized;
+    }
     if (sanitized.trim()) return sanitized;
-    // Model never emitted a final-channel separator (hit token cap during thought).
-    // Surface the content with channel markers stripped rather than dropping it.
     return String(rawText || '').replace(CHANNEL_TAG_RE, '').trim();
 }
 
@@ -162,23 +167,26 @@ function renderWithThoughts(sanitized) {
     const stillThinking = state.isGenerating && !final;
     const summaryLabel = stillThinking ? 'Thinking…' : 'Reasoning';
     const openAttr = state.showThoughts ? ' open' : '';
-    return `<details class="thought-block"${openAttr}><summary>${summaryLabel}</summary><div class="thought-content">${formatMarkdown(thought)}</div></details>${final ? formatMarkdown(final) : ''}`;
+    const finalHtml = final
+        ? formatMarkdown(final)
+        : (!state.isGenerating ? '<p style="opacity:.5;font-style:italic;margin-top:.5em">⚠ Token limit reached — reasoning only, no final answer. Raise max tokens and retry.</p>' : '');
+    return `<details class="thought-block"${openAttr}><summary>${summaryLabel}</summary><div class="thought-content">${formatMarkdown(thought)}</div></details>${finalHtml}`;
 }
 
 // ===========================================================================
 // Preset Profiles
 // ===========================================================================
 const PRESETS = {
-    balanced: { temperature: 0.7, top_p: 0.9, max_tokens: 1024, repetition_penalty: 1.1 },
-    coding: { temperature: 0.2, top_p: 0.85, max_tokens: 3072, repetition_penalty: 1.05 },
-    creative: { temperature: 1.1, top_p: 0.95, max_tokens: 1536, repetition_penalty: 1.15 },
-    precise: { temperature: 0.1, top_p: 0.8, max_tokens: 1024, repetition_penalty: 1.0 },
-    debug: { temperature: 0.15, top_p: 0.82, max_tokens: 2048, repetition_penalty: 1.02 },
-    long_context: { temperature: 0.35, top_p: 0.88, max_tokens: 4096, repetition_penalty: 1.04 },
-    extract: { temperature: 0.05, top_p: 0.75, max_tokens: 1024, repetition_penalty: 1.0 },
-    brainstorm: { temperature: 1.25, top_p: 0.98, max_tokens: 2048, repetition_penalty: 1.08 },
-    low_latency: { temperature: 0.4, top_p: 0.85, max_tokens: 256, repetition_penalty: 1.0 },
-    review: { temperature: 0.18, top_p: 0.82, max_tokens: 2560, repetition_penalty: 1.05 },
+    balanced:     { temperature: 0.7,  top_p: 0.9,  max_tokens: 8192, repetition_penalty: 1.1  },
+    coding:       { temperature: 0.2,  top_p: 0.85, max_tokens: 8192, repetition_penalty: 1.05 },
+    creative:     { temperature: 1.1,  top_p: 0.95, max_tokens: 8192, repetition_penalty: 1.15 },
+    precise:      { temperature: 0.1,  top_p: 0.8,  max_tokens: 8192, repetition_penalty: 1.0  },
+    debug:        { temperature: 0.15, top_p: 0.82, max_tokens: 8192, repetition_penalty: 1.02 },
+    long_context: { temperature: 0.35, top_p: 0.88, max_tokens: 16384, repetition_penalty: 1.04 },
+    extract:      { temperature: 0.05, top_p: 0.75, max_tokens: 4096, repetition_penalty: 1.0  },
+    brainstorm:   { temperature: 1.25, top_p: 0.98, max_tokens: 8192, repetition_penalty: 1.08 },
+    low_latency:  { temperature: 0.4,  top_p: 0.85, max_tokens: 2048, repetition_penalty: 1.0  },
+    review:       { temperature: 0.18, top_p: 0.82, max_tokens: 8192, repetition_penalty: 1.05 },
 };
 
 const MAX_TOKEN_SLIDER_FLOOR = 1024;

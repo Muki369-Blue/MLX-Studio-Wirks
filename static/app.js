@@ -2502,16 +2502,30 @@ function handleSlashCommand(text) {
 
         case '/image':
         case '/img': {
-            if (!arg) { showToast('Usage: /image [WxH] <prompt>', 'info'); break; }
+            if (!arg) { showToast('Usage: /image [WxH] [steps:N] <prompt>', 'info'); break; }
+            let imgArg = arg, imgSteps = null;
+            // Strip optional steps:N / step:N anywhere in the arg
+            imgArg = imgArg.replace(/\bsteps?:(\d+)\b/i, (_, n) => {
+                imgSteps = Math.max(1, Math.min(parseInt(n), 4));
+                return '';
+            }).trim();
             // Optional leading WxH size spec: /image 512x768 a sunset
-            const sizeMatch = arg.match(/^(\d{3,4})[xX×](\d{3,4})\s+(.+)$/);
+            const sizeMatch = imgArg.match(/^(\d{3,4})[xX×](\d{3,4})\s+(.+)$/);
+            const imgOpts = {};
             if (sizeMatch) {
-                runImageGeneration(sizeMatch[3].trim(), { width: parseInt(sizeMatch[1]), height: parseInt(sizeMatch[2]) });
-            } else {
-                runImageGeneration(arg);
+                imgOpts.width = parseInt(sizeMatch[1]);
+                imgOpts.height = parseInt(sizeMatch[2]);
+                imgArg = sizeMatch[3].trim();
             }
+            if (imgSteps) imgOpts.steps = imgSteps;
+            if (!imgArg) { showToast('Usage: /image [WxH] [steps:N] <prompt>', 'info'); break; }
+            runImageGeneration(imgArg, imgOpts);
             break;
         }
+
+        case '/images':
+            runImageGallery();
+            break;
 
         case '/refine': {
             const lastAssistant = state.messages.slice().reverse().find(m => m.role === 'assistant');
@@ -2568,21 +2582,18 @@ function handleSlashCommand(text) {
         }
 
         case '/voice': {
-            if (!arg) { showToast('Usage: /voice <name> — e.g. /voice Samantha', 'info'); break; }
+            if (!arg) { showToast('Usage: /voice <persona> — e.g. /voice nayara', 'info'); break; }
             fetch('/api/audio/voice', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ voice: arg }),
-            }).then(r => r.json()).then(d => {
-                if (d.voice) {
-                    showToast(`TTS voice: ${d.voice}`, 'success');
-                    if (dom.ttsVoiceSelect) {
-                        for (const opt of dom.ttsVoiceSelect.options) {
-                            if (opt.value === d.voice || opt.text === d.voice) {
-                                dom.ttsVoiceSelect.value = opt.value;
-                                break;
-                            }
-                        }
+                body: JSON.stringify({ voice: arg.toLowerCase() }),
+            }).then(async r => {
+                const d = await r.json();
+                if (!r.ok) { showToast(d.error || 'Unknown persona', 'error'); return; }
+                showToast(`Voice: ${d.voice}`, 'success');
+                if (dom.ttsVoiceSelect) {
+                    for (const opt of dom.ttsVoiceSelect.options) {
+                        if (opt.value === d.voice) { dom.ttsVoiceSelect.value = d.voice; break; }
                     }
                 }
             }).catch(() => showToast('Failed to set voice', 'error'));
@@ -2615,7 +2626,13 @@ function handleSlashCommand(text) {
             }
             break;
         case '/export':
-            exportChat('json');
+            if (!arg || arg === 'json') {
+                exportChat('json');
+            } else if (arg === 'md' || arg === 'markdown') {
+                exportChat('md');
+            } else {
+                showToast('Usage: /export [json|md]', 'info');
+            }
             break;
         case '/preset':
             if (arg && ((state.presets && state.presets[arg]) || PRESETS[arg])) {
@@ -2709,14 +2726,50 @@ async function runResearch(query) {
     }
 }
 
-async function runImageGeneration(prompt, { width, height } = {}) {
+async function runImageGallery() {
+    if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
+    if (dom.welcomeScreen) dom.welcomeScreen.style.display = 'none';
+    try {
+        const data = await fetch('/api/images/list').then(r => r.json());
+        const images = data.images || [];
+        if (!images.length) {
+            showToast('No generated images yet — use /image to create one', 'info');
+            return;
+        }
+        let html = `<div style="margin-bottom:10px;font-size:0.85em;opacity:0.65;">${images.length} generated image${images.length !== 1 ? 's' : ''} · click to open full size</div>`;
+        html += '<div style="display:flex;flex-wrap:wrap;gap:12px;">';
+        for (const img of images) {
+            const caption = `${img.width}×${img.height} · ${img.steps}s · seed ${img.seed}`;
+            const dateStr = img.created_at ? new Date(img.created_at).toLocaleDateString() : '';
+            const promptSnip = (img.prompt || '').slice(0, 72) + ((img.prompt || '').length > 72 ? '…' : '');
+            html += `<div style="display:flex;flex-direction:column;gap:4px;width:180px;">
+                <a href="${img.url}" target="_blank" rel="noopener">
+                    <img src="${img.url}?t=${img.created_at || 0}" alt="${escapeHtml(img.prompt || '')}"
+                         style="width:180px;height:180px;object-fit:cover;border-radius:6px;display:block;" />
+                </a>
+                <div style="font-size:0.72em;opacity:0.55;">${escapeHtml(caption)}${dateStr ? ' · ' + dateStr : ''}</div>
+                ${promptSnip ? `<div style="font-size:0.75em;opacity:0.8;line-height:1.3;">${escapeHtml(promptSnip)}</div>` : ''}
+            </div>`;
+        }
+        html += '</div>';
+        const msgEl = appendMessage('assistant', '', 0);
+        msgEl.querySelector('.message-body').innerHTML = html;
+        state.messages.push({ role: 'assistant', content: `[Image gallery — ${images.length} images]`, tokens: 0 });
+        scrollToBottom();
+    } catch (e) {
+        showToast(`Gallery: ${e.message}`, 'error');
+    }
+}
+
+async function runImageGeneration(prompt, { width, height, steps } = {}) {
     if (!prompt.trim()) { showToast('Provide an image prompt', 'info'); return; }
     if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
 
     if (dom.welcomeScreen) dom.welcomeScreen.style.display = 'none';
     const sizeLabel = (width && height) ? ` [${width}×${height}]` : '';
-    appendMessage('user', `/image${sizeLabel} ${prompt}`, 0);
-    state.messages.push({ role: 'user', content: `/image${sizeLabel} ${prompt}`, tokens: 0 });
+    const stepsLabel = steps ? ` [${steps}s]` : '';
+    appendMessage('user', `/image${sizeLabel}${stepsLabel} ${prompt}`, 0);
+    state.messages.push({ role: 'user', content: `/image${sizeLabel}${stepsLabel} ${prompt}`, tokens: 0 });
 
     startGenerating();
     const msgEl = appendMessage('assistant', '', 0);
@@ -2727,6 +2780,7 @@ async function runImageGeneration(prompt, { width, height } = {}) {
         const body = { prompt };
         if (width) body.width = width;
         if (height) body.height = height;
+        if (steps) body.steps = steps;
         const res = await fetch('/api/images/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },

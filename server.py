@@ -5166,6 +5166,23 @@ async def images_file(filename: str):
     return FileResponse(str(target), media_type="image/png")
 
 
+@app.get("/api/images/list")
+async def images_list():
+    """Return metadata for all generated images, newest first (max 50)."""
+    if not FLUX_IMAGE_DIR.exists():
+        return {"images": []}
+    images = []
+    for jp in sorted(FLUX_IMAGE_DIR.glob("flux_*.json"), reverse=True)[:50]:
+        try:
+            meta = json.loads(jp.read_text())
+            png_name = jp.stem + ".png"
+            if (FLUX_IMAGE_DIR / png_name).exists():
+                images.append({"filename": png_name, "url": f"/api/images/file/{png_name}", **meta})
+        except Exception:
+            continue
+    return {"images": images}
+
+
 @app.get("/api/presets")
 async def get_presets():
     return {"presets": BUILTIN_PRESETS}
@@ -5784,19 +5801,24 @@ def _generate_image_blocking(
             guidance=guidance,
         )
         FLUX_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        fname = f"flux_{int(time.time()*1000)}_{seed}.png"
+        ts_ms = int(time.time() * 1000)
+        fname = f"flux_{ts_ms}_{seed}.png"
         out_path = FLUX_IMAGE_DIR / fname
         result.image.save(str(out_path))
-        return {
-            "filename": fname,
-            "path": str(out_path),
+        meta = {
+            "prompt": prompt,
             "seed": seed,
             "steps": steps,
             "width": width,
             "height": height,
             "guidance": guidance,
-            "prompt": prompt,
+            "created_at": ts_ms,
         }
+        try:
+            (FLUX_IMAGE_DIR / fname.replace(".png", ".json")).write_text(json.dumps(meta))
+        except Exception:
+            pass
+        return {"filename": fname, "path": str(out_path), **meta}
     finally:
         with _flux_lock:
             _flux_busy = False

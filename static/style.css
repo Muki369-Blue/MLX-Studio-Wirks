@@ -1632,6 +1632,23 @@ body {
     margin-bottom: 6px;
 }
 
+.btn-enhance {
+    flex-shrink: 0;
+    color: var(--accent-primary);
+    opacity: 0.75;
+    transition: opacity 0.15s, color 0.15s;
+}
+.btn-enhance:hover { opacity: 1; }
+.btn-enhance.loading {
+    opacity: 0.5;
+    animation: enhanceSpin 0.9s linear infinite;
+    pointer-events: none;
+}
+@keyframes enhanceSpin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
 .chat-input {
     flex: 1;
     background: none;

@@ -1,10 +1,14 @@
 .venv/
 .vscode/
+.DS_Store
 __pycache__/
 node_modules/
 nohup.out
 playwright-artifacts/
 *.pyc
+*.egg-info/
 assets/
 build/
 dist/
+.build/
+.swiftpm/

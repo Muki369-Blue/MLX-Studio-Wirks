@@ -16,6 +16,63 @@ const APP_NAME = 'MLX-Moxy-Wirks';
 const APP_SLUG = 'mlx_moxy_wirks';
 const LS_PREFIX = `${APP_SLUG}_`;
 const ASSISTANT_DISPLAY_NAME = 'Moxy';
+const LOCAL_AUTH_QUERY_PARAM = 'moxy_token';
+const LOCAL_AUTH_HEADER = 'X-Moxy-Local-Token';
+const LOCAL_AUTH_STORAGE_KEY = `${LS_PREFIX}local_auth_token`;
+
+function readLocalAuthToken() {
+    try {
+        const url = new URL(window.location.href);
+        const token = (url.searchParams.get(LOCAL_AUTH_QUERY_PARAM) || '').trim();
+        if (token) {
+            sessionStorage.setItem(LOCAL_AUTH_STORAGE_KEY, token);
+            url.searchParams.delete(LOCAL_AUTH_QUERY_PARAM);
+            const cleanUrl = `${url.pathname}${url.search}${url.hash}`;
+            window.history.replaceState(null, document.title, cleanUrl || '/');
+            return token;
+        }
+        return sessionStorage.getItem(LOCAL_AUTH_STORAGE_KEY) || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+const LOCAL_AUTH_TOKEN = readLocalAuthToken();
+const nativeFetch = window.fetch.bind(window);
+
+function isSameOriginApiRequest(input) {
+    try {
+        const rawUrl = input instanceof Request ? input.url : input;
+        const url = new URL(rawUrl, window.location.origin);
+        return url.origin === window.location.origin && url.pathname.startsWith('/api/');
+    } catch (_) {
+        return false;
+    }
+}
+
+window.fetch = function moxyFetch(input, init = {}) {
+    if (!LOCAL_AUTH_TOKEN || !isSameOriginApiRequest(input)) {
+        return nativeFetch(input, init);
+    }
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    const initHeaders = new Headers(init.headers || undefined);
+    initHeaders.forEach((value, key) => headers.set(key, value));
+    headers.set(LOCAL_AUTH_HEADER, LOCAL_AUTH_TOKEN);
+    return nativeFetch(input, { ...init, headers });
+};
+
+function withLocalAuthParam(rawUrl) {
+    if (!LOCAL_AUTH_TOKEN) return rawUrl;
+    const url = new URL(rawUrl, window.location.href);
+    if (url.host === window.location.host) {
+        url.searchParams.set(LOCAL_AUTH_QUERY_PARAM, LOCAL_AUTH_TOKEN);
+    }
+    return url.toString();
+}
+
+function getLocalAuthWebSocketProtocols() {
+    return LOCAL_AUTH_TOKEN ? ['moxy-auth', LOCAL_AUTH_TOKEN] : undefined;
+}
 
 // One-shot migration of pre-rename localStorage keys. Runs once per browser.
 (function migrateLegacyLocalStorage() {
@@ -123,27 +180,54 @@ function _cleanFinal(s) {
     return s.replace(CHANNEL_TRAILING_THOUGHT_RE, '').replace(CHANNEL_TAG_RE, '').trim();
 }
 
+// Qwen 3 family (including Qwen 3.6 35B-A3B) wraps every response in <think>…</think>.
+// Detect either the closed block or an open <think> still being streamed.
+const QWEN_THINK_CLOSED_RE = /<think>([\s\S]*?)<\/think>/i;
+const QWEN_THINK_OPEN_RE = /<think>([\s\S]*)$/i;
+
 function sanitizeAssistantOutput(content, model = state.loadedModelMeta) {
     const text = String(content || '');
-    if (!text || !isGemma4StyleModel(model)) return text;
-    if (!CHANNEL_ANY_RE.test(text)) return text;
+    if (!text) return text;
 
-    const thoughtMatch = text.match(CHANNEL_THOUGHT_RE);
-    const finalMatch = text.match(CHANNEL_FINAL_RE);
+    // Gemma 4 channel tags
+    if (isGemma4StyleModel(model) && CHANNEL_ANY_RE.test(text)) {
+        const thoughtMatch = text.match(CHANNEL_THOUGHT_RE);
+        const finalMatch = text.match(CHANNEL_FINAL_RE);
 
-    // Whenever Gemma 4 emits thought content, always surface it as a
-    // collapsible dropdown next to whatever final text we have so far
-    // (may be empty while still thinking). renderWithThoughts() turns
-    // the sentinel into a <details> element; state.showThoughts controls
-    // whether it auto-opens.
-    if (thoughtMatch?.[1]?.trim()) {
-        const thought = thoughtMatch[1].trim();
-        const final = finalMatch ? _cleanFinal(finalMatch[1]) : '';
-        return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
+        // Whenever Gemma 4 emits thought content, always surface it as a
+        // collapsible dropdown next to whatever final text we have so far
+        // (may be empty while still thinking). renderWithThoughts() turns
+        // the sentinel into a <details> element; state.showThoughts controls
+        // whether it auto-opens.
+        if (thoughtMatch?.[1]?.trim()) {
+            const thought = thoughtMatch[1].trim();
+            const final = finalMatch ? _cleanFinal(finalMatch[1]) : '';
+            return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
+        }
+        if (finalMatch) return _cleanFinal(finalMatch[1]);
+        return _cleanFinal(text);
     }
 
-    if (finalMatch) return _cleanFinal(finalMatch[1]);
-    return _cleanFinal(text);
+    // Qwen 3 / 3.5 / 3.6 <think>…</think> blocks — same UX as Gemma channels.
+    // Triggered purely by tag presence so it works regardless of model metadata.
+    if (text.includes('<think>')) {
+        const closed = text.match(QWEN_THINK_CLOSED_RE);
+        if (closed) {
+            const thought = closed[1].trim();
+            const final = text.replace(closed[0], '').trim();
+            if (thought) return `\x00THOUGHTS\x00${thought}\x00FINAL\x00${final}`;
+            return final;
+        }
+        const open = text.match(QWEN_THINK_OPEN_RE);
+        if (open) {
+            // Still streaming the thinking section — surface it but leave FINAL empty
+            // so the UI shows "Thinking…" placeholder.
+            const thought = open[1].trim();
+            return `\x00THOUGHTS\x00${thought}\x00FINAL\x00`;
+        }
+    }
+
+    return text;
 }
 
 function finalizeAssistantText(rawText) {
@@ -197,6 +281,11 @@ const WORKFLOW_DEFAULTS = {
     approval_mode: 'manual',
     deep_research: false,
 };
+
+function normalizeApprovalMode(_mode) {
+    // Workspace tools intentionally stage changes for explicit review.
+    return 'manual';
+}
 
 const WORKFLOW_MIN_OUTPUT_TOKENS = {
     chat: 512,
@@ -421,6 +510,7 @@ const dom = {
     btnVoice: $('#btn-voice'),
     btnSpeakToggle: $('#btn-speak-toggle'),
     btnStopSpeaking: $('#btn-stop-speaking'),
+    btnEnhance: $('#btn-enhance'),
     // Context stat
     statContext: $('#stat-context'),
     // Agent steps slider
@@ -475,6 +565,10 @@ function setupVoice() {
     // Stop-speaking button — cancels active audio playback (auto-speak or manual).
     dom.btnStopSpeaking?.addEventListener('click', () => {
         stopSpeaking();
+    });
+
+    dom.btnEnhance?.addEventListener('click', () => {
+        enhancePrompt();
     });
 }
 
@@ -603,16 +697,21 @@ async function speakText(text) {
             voice.currentAudio = null;
             showStopSpeakingButton(false);
         };
-        audio.play();
+        audio.onerror = () => {
+            URL.revokeObjectURL(url);
+            voice.currentAudio = null;
+            showStopSpeakingButton(false);
+        };
+        audio.play().catch(() => {
+            URL.revokeObjectURL(url);
+            voice.currentAudio = null;
+            showStopSpeakingButton(false);
+        });
         return audio;
     } catch (e) {
         showStopSpeakingButton(false);
-        // Fallback: browser SpeechSynthesis
-        if (window.speechSynthesis) {
-            const utter = new SpeechSynthesisUtterance(clean);
-            utter.onend = () => showStopSpeakingButton(false);
-            speechSynthesis.speak(utter);
-            showStopSpeakingButton(true);
+        if (e?.message !== 'loading') {
+            console.error('[TTS speakText]', e?.message || e);
         }
     }
 }
@@ -626,9 +725,6 @@ function stopSpeaking() {
     voice.speechQueue = [];
     voice.queuePlaying = false;
     voice.spokenUpToIdx = 0;
-    if (window.speechSynthesis && speechSynthesis.speaking) {
-        try { speechSynthesis.cancel(); } catch {}
-    }
     document.querySelectorAll('.btn-msg-speak.playing').forEach(b => b.classList.remove('playing'));
     showStopSpeakingButton(false);
 }
@@ -1017,6 +1113,9 @@ async function fetchAppState() {
         state.projects = Array.isArray(data.projects) && data.projects.length
             ? data.projects
             : [{ id: 'default', name: 'Inbox', color: '#818cf8', ...WORKFLOW_DEFAULTS }];
+        state.projects.forEach(project => {
+            project.approval_mode = normalizeApprovalMode(project.approval_mode);
+        });
         state.sessions = Array.isArray(data.sessions) ? data.sessions : [];
         // Normalize: ensure every session has a projectId
         state.sessions.forEach(s => { if (!s.projectId) s.projectId = 'default'; });
@@ -1066,7 +1165,7 @@ async function fetchConnectors() {
 function getProjectWorkflowSettings(project = getActiveProject()) {
     return {
         workflow_mode: project?.workflow_mode || WORKFLOW_DEFAULTS.workflow_mode,
-        approval_mode: project?.approval_mode || WORKFLOW_DEFAULTS.approval_mode,
+        approval_mode: normalizeApprovalMode(project?.approval_mode || WORKFLOW_DEFAULTS.approval_mode),
         deep_research: Boolean(project?.deep_research),
     };
 }
@@ -1228,18 +1327,18 @@ function renderWorkflowRecommendations() {
 function renderWorkflowControls() {
     const settings = getProjectWorkflowSettings();
     const modeLabel = settings.workflow_mode.charAt(0).toUpperCase() + settings.workflow_mode.slice(1);
-    const approvalLabel = settings.approval_mode === 'auto' ? 'Auto in Build' : 'Approve / Deny';
+    const approvalLabel = 'Review Required';
     if (dom.btnQuickSettings) {
         dom.btnQuickSettings.textContent = settings.deep_research
             ? `${modeLabel} · ${approvalLabel} · Research`
             : `${modeLabel} · ${approvalLabel}`;
-        dom.btnQuickSettings.classList.toggle('active', settings.workflow_mode !== 'chat' || settings.approval_mode !== 'manual' || settings.deep_research);
+        dom.btnQuickSettings.classList.toggle('active', settings.workflow_mode !== 'chat' || settings.deep_research);
     }
     if (dom.workflowModeSelect) {
         dom.workflowModeSelect.value = settings.workflow_mode;
     }
     if (dom.approvalModeSelect) {
-        dom.approvalModeSelect.value = settings.approval_mode;
+        dom.approvalModeSelect.value = 'manual';
     }
     if (dom.workflowDeepResearch) {
         dom.workflowDeepResearch.checked = settings.deep_research;
@@ -1256,7 +1355,7 @@ function renderWorkflowControls() {
     }
     if (dom.workflowAgentNote) {
         dom.workflowAgentNote.textContent = isWorkflowAgentForced(settings)
-            ? 'Agent tools are currently forced on by this workflow mode. Model recommendations remain advisory only.'
+            ? 'Agent tools are currently forced on by this workflow mode. Workspace edits still require review before disk writes.'
             : 'Planning, building, and extended research automatically enable agent tools. Model recommendations remain advisory only.';
     }
     renderWorkflowRecommendations();
@@ -1265,7 +1364,11 @@ function renderWorkflowControls() {
 function setActiveProjectWorkflowSettings(patch) {
     const project = getActiveProject();
     if (!project?.id) return;
-    updateProjectState({ ...project, ...patch });
+    const nextPatch = { ...patch };
+    if ('approval_mode' in nextPatch) {
+        nextPatch.approval_mode = normalizeApprovalMode(nextPatch.approval_mode);
+    }
+    updateProjectState({ ...project, ...nextPatch });
     renderProjects();
     renderAgentModeButton();
     requestTokenInspection();
@@ -1309,7 +1412,40 @@ function updateProjectState(nextProject) {
 }
 
 function getPendingWorkspaceBatch() {
-    return getActiveProject()?.workspace_pending_batch || null;
+    const raw = getActiveProject()?.workspace_pending_batch;
+    if (!raw) return null;
+    // Backend stages a flat array [{path, content, op}, ...]. Normalize into
+    // {id, files, summary:{total_operations, counts, preview}} so the modal renderer
+    // and approve handler can read it the way they were originally designed.
+    if (Array.isArray(raw)) {
+        if (raw.length === 0) return null;
+        const counts = { write_file: 0, mkdir: 0, rename: 0, delete: 0 };
+        const preview = raw.map(item => {
+            const op = (item.op || 'write').toLowerCase();
+            const bytes = (item.content || '').length;
+            if (op === 'delete') {
+                counts.delete += 1;
+                return { type: 'delete', path: item.path, bytes };
+            }
+            counts.write_file += 1;
+            return {
+                type: 'write_file',
+                path: item.path,
+                bytes,
+                mode: 'create',  // backend doesn't distinguish overwrite vs create — display as create
+            };
+        });
+        return {
+            id: `staged-${raw.length}-${raw[0]?.path || ''}`,
+            files: raw,
+            summary: {
+                total_operations: raw.length,
+                counts,
+                preview,
+            },
+        };
+    }
+    return raw;
 }
 
 function renderWorkspacePanel() {
@@ -1490,28 +1626,32 @@ function closeWorkspaceApprovalModal() {
 
 async function approveWorkspaceBatch() {
     const batch = getPendingWorkspaceBatch();
-    if (!batch?.id) return;
+    if (!batch) return;
     try {
         const res = await fetch('/api/workspace/apply', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.activeProjectId,
-                pending_id: batch.id,
-                approve: true,
-            }),
+            body: JSON.stringify({ action: 'apply' }),
         });
         const data = await res.json();
         if (!res.ok) {
             throw new Error(data.error || `HTTP ${res.status}`);
         }
-        if (data.project) {
-            updateProjectState(data.project);
-        }
         closeWorkspaceApprovalModal();
+        // Reload app state so the project's now-empty pending batch is reflected.
+        await fetch('/api/app-state').then(r => r.json()).then(s => {
+            if (s.projects) state.projects = s.projects;
+        }).catch(() => {});
         await fetchWorkspaceTree({ silent: true });
         renderWorkspacePanel();
-        showToast('Workspace batch applied', 'success');
+        const applied = (data.applied || []).length;
+        const errors = data.errors || [];
+        if (errors.length) {
+            showToast(`Applied ${applied} files, ${errors.length} errors — see console`, 'error');
+            console.error('[workspace/apply errors]', errors);
+        } else {
+            showToast(`Applied ${applied} file${applied === 1 ? '' : 's'}`, 'success');
+        }
     } catch (e) {
         showToast(`Apply failed: ${e.message}`, 'error');
     }
@@ -1519,7 +1659,7 @@ async function approveWorkspaceBatch() {
 
 async function discardWorkspaceBatch() {
     const batch = getPendingWorkspaceBatch();
-    if (!batch?.id) {
+    if (!batch) {
         closeWorkspaceApprovalModal();
         return;
     }
@@ -1527,24 +1667,20 @@ async function discardWorkspaceBatch() {
         const res = await fetch('/api/workspace/apply', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                project_id: state.activeProjectId,
-                pending_id: batch.id,
-                discard_pending: true,
-            }),
+            body: JSON.stringify({ action: 'discard' }),
         });
         const data = await res.json();
         if (!res.ok) {
             throw new Error(data.error || `HTTP ${res.status}`);
         }
-        if (data.project) {
-            updateProjectState(data.project);
-        }
         closeWorkspaceApprovalModal();
+        await fetch('/api/app-state').then(r => r.json()).then(s => {
+            if (s.projects) state.projects = s.projects;
+        }).catch(() => {});
         renderWorkspacePanel();
-        showToast('Pending workspace batch denied', 'info');
+        showToast(`Discarded ${data.count || 0} pending files`, 'info');
     } catch (e) {
-        showToast(`Deny failed: ${e.message}`, 'error');
+        showToast(`Discard failed: ${e.message}`, 'error');
     }
 }
 
@@ -1596,21 +1732,40 @@ async function fetchModels() {
         dom.modelList.innerHTML = '<div class="model-list-empty">Scanning models…</div>';
         const res = await fetch('/api/models');
         const data = await res.json();
-        state.models = data.models || [];
-        state.loadedModel = data.loaded_model;
-        state.loadedModelPath = data.loaded_model_path;
-        state.loadedModelMeta = getLoadedModelMeta();
-        renderModelList(state.models);
-        updateModelStatus();
-        renderWorkflowControls();
-        updateCapabilityRouting();
-        syncComposerState();
+        applyModelsPayload(data);
     } catch (e) {
         dom.modelList.innerHTML = '<div class="model-list-empty">Failed to load models</div>';
         renderWorkflowControls();
         syncComposerState();
         console.error('Failed to fetch models:', e);
     }
+}
+
+function applyModelsPayload(data) {
+    state.models = data.models || [];
+    state.loadedModel = data.loaded_model;
+    state.loadedModelPath = data.loaded_model_path;
+    state.loadedModelMeta = getLoadedModelMeta();
+    renderModelList(state.models);
+    updateModelStatus();
+    renderWorkflowControls();
+    updateCapabilityRouting();
+    syncComposerState();
+}
+
+async function waitForLoadedModelPath(expectedPath, { attempts = 90, intervalMs = 2000 } = {}) {
+    if (!expectedPath) return false;
+    for (let i = 0; i < attempts; i++) {
+        const payload = await fetch('/api/models').then(r => r.json()).catch(() => ({}));
+        const loadedPath = payload.loaded_model_path || payload.loaded_model?.path;
+        if (payload.loaded_model && !payload.is_loading && loadedPath === expectedPath) {
+            applyModelsPayload({ ...payload, loaded_model_path: loadedPath });
+            await fetchHealth().catch(() => {});
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, intervalMs));
+    }
+    return false;
 }
 
 async function fetchHealth() {
@@ -1723,8 +1878,9 @@ async function unloadModel() {
 function connectWebSocket() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${location.host}/ws/generate`;
+    const wsProtocols = getLocalAuthWebSocketProtocols();
     updateTransportStatus('connecting');
-    state.ws = new WebSocket(wsUrl);
+    state.ws = wsProtocols ? new WebSocket(wsUrl, wsProtocols) : new WebSocket(wsUrl);
 
     state.ws.onopen = () => {
         console.log('WebSocket connected');
@@ -2508,11 +2664,11 @@ function handleSlashCommand(text) {
             }
             break;
         case '/approve':
-            if (['manual', 'auto'].includes(arg.toLowerCase())) {
-                setActiveProjectWorkflowSettings({ approval_mode: arg.toLowerCase() });
-                showToast(arg.toLowerCase() === 'auto' ? 'Auto-approve enabled for build mode' : 'Manual approval restored', 'success');
+            if (!arg || arg.toLowerCase() === 'manual' || arg.toLowerCase() === 'review') {
+                setActiveProjectWorkflowSettings({ approval_mode: 'manual' });
+                showToast('Workspace changes require review before apply', 'success');
             } else {
-                showToast('Usage: /approve [manual|auto]', 'info');
+                showToast('Auto-apply is not available. Workspace changes are staged for review.', 'info');
             }
             break;
         case '/research':
@@ -2540,7 +2696,7 @@ function handleSlashCommand(text) {
             let imgArg = arg, imgSteps = null;
             // Strip optional steps:N / step:N anywhere in the arg
             imgArg = imgArg.replace(/\bsteps?:(\d+)\b/i, (_, n) => {
-                imgSteps = Math.max(1, Math.min(parseInt(n), 4));
+                imgSteps = Math.max(1, Math.min(parseInt(n), 50));
                 return '';
             }).trim();
             // Optional leading WxH size spec: /image 512x768 a sunset
@@ -2559,6 +2715,14 @@ function handleSlashCommand(text) {
 
         case '/images':
             runImageGallery();
+            break;
+
+        case '/enhance':
+            enhancePrompt();
+            break;
+
+        case '/build':
+            startBuildMode(arg);
             break;
 
         case '/refine': {
@@ -2689,6 +2853,79 @@ function handleSlashCommand(text) {
     hideSlashMenu();
 }
 
+async function enhancePrompt() {
+    const raw = (dom.chatInput?.value || '').trim();
+    if (!raw) { showToast('Type a prompt first, then enhance it', 'info'); return; }
+    if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
+    if (!state.loadedModel) { showToast('Load a model first to use enhance', 'error'); return; }
+
+    // Detect mode from prompt prefix.
+    let mode = 'chat';
+    if (raw.startsWith('/image ') || raw.startsWith('/image\n')) mode = 'image';
+
+    const btn = dom.btnEnhance;
+    if (btn) { btn.classList.add('loading'); btn.disabled = true; }
+    showToast(`Enhancing for ${mode}…`, 'info');
+
+    try {
+        const res = await fetch('/api/prompt/enhance', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt: raw, mode }),
+        });
+        const data = await res.json();
+        if (!res.ok) { showToast(data.detail || 'Enhance failed', 'error'); return; }
+
+        // Preserve any leading slash command prefix (/image)
+        const prefix = mode !== 'chat' ? raw.split(/\s+/)[0] + ' ' : '';
+        dom.chatInput.value = prefix + data.enhanced;
+        dom.chatInput.style.height = 'auto';
+        dom.chatInput.style.height = dom.chatInput.scrollHeight + 'px';
+        dom.chatInput.dispatchEvent(new Event('input'));
+        showToast(`Prompt enhanced (${mode})`, 'success');
+    } catch {
+        showToast('Enhance request failed', 'error');
+    } finally {
+        if (btn) { btn.classList.remove('loading'); btn.disabled = false; }
+    }
+}
+
+async function startBuildMode(followupPrompt) {
+    showToast('Switching to build mode — loading Qwen 3.6 35B…', 'info');
+    try {
+        const res = await fetch('/api/build/start', { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            showToast(data.error || `Build mode failed (${res.status})`, 'error');
+            return;
+        }
+        if (data.status === 'loading') {
+            showToast(`Loading ${data.model}… first load takes ~30-60s. Send your prompt once ready.`, 'info');
+        } else {
+            showToast(`Build mode ready · ${data.model}`, 'success');
+        }
+        // Reflect persisted workflow state before optionally dispatching a prompt.
+        await fetchAppState().catch(() => {
+            const project = getActiveProject();
+            if (project?.id) updateProjectState({ ...project, workflow_mode: 'build' });
+            renderWorkflowControls();
+            renderAgentModeButton();
+        });
+
+        const trimmed = (followupPrompt || '').trim();
+        if (trimmed) {
+            const ready = await waitForLoadedModelPath(data.model_path);
+            if (ready) {
+                await sendMessage(trimmed);
+            } else {
+                showToast('Model still loading — send your prompt manually when the model indicator turns green.', 'info');
+            }
+        }
+    } catch (e) {
+        showToast(`Build mode error: ${e.message}`, 'error');
+    }
+}
+
 async function runResearch(query) {
     if (!query.trim()) { showToast('Provide a research query', 'info'); return; }
     if (state.isGenerating) { showToast('Generation in progress', 'info'); return; }
@@ -2808,7 +3045,7 @@ async function runImageGeneration(prompt, { width, height, steps } = {}) {
     startGenerating();
     const msgEl = appendMessage('assistant', '', 0);
     state.currentStreamEl = msgEl.querySelector('.message-body');
-    state.currentStreamEl.innerHTML = '<em style="opacity:.6">Loading FLUX.1-schnell…</em>';
+    state.currentStreamEl.innerHTML = '<em style="opacity:.6">Loading FLUX.1-dev…</em>';
 
     try {
         const body = { prompt };

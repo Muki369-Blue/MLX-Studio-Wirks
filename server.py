@@ -28,6 +28,7 @@ import re
 import threading
 import queue
 import uuid
+import secrets
 from html import unescape
 from html.parser import HTMLParser
 from datetime import datetime, timezone
@@ -38,7 +39,7 @@ from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -77,6 +78,8 @@ HOST = os.environ.get("MLX_MOXY_HOST", "127.0.0.1")
 PORT = 8899
 APP_NAME = "MLX-Moxy-Wirks"
 APP_SLUG = "mlx_moxy_wirks"
+AUTH_TOKEN = os.environ.get("MLX_MOXY_AUTH_TOKEN", "").strip()
+AUTH_HEADER = "x-moxy-local-token"
 APP_STATE_DIR = Path.home() / f".{APP_SLUG}"
 APP_STATE_FILE = APP_STATE_DIR / "app_state.json"
 BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -91,6 +94,7 @@ EXTENSION_ORIGIN_REGEX = (
     r"|safari-web-extension://.+)$"
 )
 EXTENSION_ORIGIN_PATTERN = re.compile(EXTENSION_ORIGIN_REGEX)
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 MAX_PAGE_CLIPS = 20
 MAX_ATTACHMENT_EXCERPT_CHARS = 12000
 MAX_ATTACHMENT_TEXT_BYTES = 1024 * 1024 * 2
@@ -148,6 +152,8 @@ _model_name: Optional[str] = None
 _model_path: Optional[str] = None
 _model_loading = False
 _model_load_start: Optional[float] = None
+_build_model_load_task: Optional[asyncio.Task[Any]] = None
+_build_model_load_task_model_path: Optional[str] = None
 _active_engine: str = "mlx"  # "mlx" or "gguf"
 _generation_stats = {
     "last_tps": 0,
@@ -284,9 +290,36 @@ _flux_loading: bool = False
 _flux_error: Optional[str] = None
 _flux_busy: bool = False
 _flux_lock = threading.Lock()
-FLUX_VARIANT = os.environ.get("MOXY_FLUX_VARIANT", "schnell")  # schnell / dev
+FLUX_VARIANT = os.environ.get("MOXY_FLUX_VARIANT", "dev")  # schnell / dev
 FLUX_QUANTIZE = int(os.environ.get("MOXY_FLUX_QUANTIZE", "4"))  # 4 or 8 bit
 FLUX_IMAGE_DIR = APP_STATE_DIR / "images"
+
+# Build mode — Qwen 3.6 35B-A3B (MoE) for repo scaffolding. Strongest open-weight
+# coder runnable on M4 Max 36 GB at 4-bit. Activates ~3 B params per token (MoE).
+BUILD_PREFERRED_MODEL = os.environ.get(
+    "MOXY_BUILD_MODEL",
+    "/Volumes/Wirks990/ai/models/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit",
+)
+
+BUILD_MODE_GUIDANCE = (
+    "BUILD MODE — you are scaffolding a real repository the user will use in production.\n"
+    "Before any tool call, think (briefly, internally) about the file structure: source layout, tests, "
+    "config, docs, lockfile/pyproject/package.json, CI hint. Then emit ONE workspace_scaffold call "
+    "containing every file at once — not a series of workspace_write calls.\n"
+    "\n"
+    "Quality bar:\n"
+    "- Idiomatic for the requested stack (modern Python = uv/pyproject, modern JS = pnpm/vite, etc.).\n"
+    "- Include a README with setup + usage that actually matches the code.\n"
+    "- Include real tests that import the real modules and assert real behavior — never `assert True`.\n"
+    "- Include a dependency manifest with pinned versions (pyproject.toml, package.json, etc.).\n"
+    "- No TODO comments. No `...` ellipses. No half-implemented stubs. If you scaffold a function, "
+    "it works.\n"
+    "- Error handling at the IO/boundary layer (not wrapped around every line).\n"
+    "- Sensible defaults so `make test` / `pytest` / `pnpm test` passes the moment files land.\n"
+    "\n"
+    "When the request is ambiguous, pick the most common production-grade choice and proceed — do not "
+    "ask the user clarifying questions; you have one shot per turn.\n"
+)
 
 # Workspace file watcher
 _workspace_observer: Optional[Any] = None
@@ -328,13 +361,53 @@ def _is_trusted_browser_origin(origin: Optional[str], request_host: Optional[str
     return False
 
 
+def _request_auth_token(request: Request) -> str:
+    bearer_prefix = "bearer "
+    header_token = request.headers.get(AUTH_HEADER, "").strip()
+    if header_token:
+        return header_token
+
+    auth_header = request.headers.get("authorization", "").strip()
+    if auth_header.lower().startswith(bearer_prefix):
+        return auth_header[len(bearer_prefix):].strip()
+
+    query_token = request.query_params.get("moxy_token")
+    return (query_token or "").strip()
+
+
+def _has_valid_local_auth(request: Request) -> bool:
+    if not AUTH_TOKEN:
+        return True
+    return secrets.compare_digest(_request_auth_token(request), AUTH_TOKEN)
+
+
+def _websocket_auth(websocket: WebSocket) -> tuple[str, Optional[str]]:
+    header_token = websocket.headers.get(AUTH_HEADER, "").strip()
+    if header_token:
+        return header_token, None
+
+    protocols = [
+        item.strip()
+        for item in websocket.headers.get("sec-websocket-protocol", "").split(",")
+        if item.strip()
+    ]
+    for idx, protocol in enumerate(protocols):
+        if protocol == "moxy-auth" and idx + 1 < len(protocols):
+            return protocols[idx + 1], "moxy-auth"
+
+    query_token = websocket.query_params.get("moxy_token", "").strip()
+    return query_token, None
+
+
 @app.middleware("http")
 async def enforce_trusted_browser_origins(request: Request, call_next):
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+    if request.method in MUTATING_METHODS:
         origin = request.headers.get("origin")
         request_host = request.headers.get("host")
         if origin and not _is_trusted_browser_origin(origin, request_host=request_host):
             return JSONResponse({"error": "Untrusted browser origin."}, status_code=403)
+        if request.url.path.startswith("/api/") and not _has_valid_local_auth(request):
+            return JSONResponse({"error": "Local session token is required."}, status_code=401)
     return await call_next(request)
 
 
@@ -445,6 +518,8 @@ def _default_app_state() -> dict:
                 "workspace_label": "",
                 "workspace_pending_batch": [],
                 "workflow_mode": "chat",
+                "approval_mode": "manual",
+                "deep_research": False,
             }
         ],
         "sessions": [],
@@ -509,6 +584,8 @@ def _normalize_app_state(raw: dict | None) -> dict:
         project.setdefault("workspace_label", "")
         project.setdefault("workspace_pending_batch", [])
         project.setdefault("workflow_mode", "chat")
+        project["approval_mode"] = "manual"
+        project["deep_research"] = bool(project.get("deep_research", False))
     return state
 
 
@@ -1953,16 +2030,29 @@ def _generate_text(prompt: str, max_tokens: int, temperature: float, top_p: floa
     )
 
 
-def _render_prompt_from_messages(messages: list[dict], fallback_prompt: str = "") -> str:
+def _render_prompt_from_messages(
+    messages: list[dict],
+    fallback_prompt: str = "",
+    enable_thinking: Optional[bool] = None,
+) -> str:
+    """Render chat messages via the tokenizer's chat template.
+
+    enable_thinking: only honored by templates that explicitly check it (e.g.
+    Qwen 3 family). Pass False to suppress the auto-prepended <think>\n block
+    that Qwen 3.6 emits when add_generation_prompt=True — critical for forcing
+    clean JSON output from the agent tool dispatcher.
+    """
     prompt = fallback_prompt
     if messages:
         if _tokenizer is not None and hasattr(_tokenizer, "apply_chat_template"):
             try:
-                prompt = _tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
+                template_kwargs: dict[str, Any] = {
+                    "tokenize": False,
+                    "add_generation_prompt": True,
+                }
+                if enable_thinking is not None:
+                    template_kwargs["enable_thinking"] = enable_thinking
+                prompt = _tokenizer.apply_chat_template(messages, **template_kwargs)
             except Exception:
                 prompt = fallback_prompt
         if not prompt:
@@ -2005,9 +2095,10 @@ def _extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
-def _agent_tool_prompt() -> str:
+def _agent_tool_prompt(workflow_mode: str = "chat") -> str:
     providers = ", ".join(connector["id"] for connector in _connector_catalog())
-    return (
+    preamble = BUILD_MODE_GUIDANCE + "\n" if workflow_mode == "build" else ""
+    return preamble + (
         "JSON-only tool dispatcher. Output exactly one raw JSON object. No prose, no markdown, no explanation, no <tool_call> tags.\n"
         "Your entire response must be a single JSON object starting with { and ending with }.\n"
         "\n"
@@ -2023,6 +2114,7 @@ def _agent_tool_prompt() -> str:
         '  workspace_read:   {"action":"tool","tool":"workspace_read","args":{"path":"RELATIVE_PATH"}}\n'
         '  workspace_write:  {"action":"tool","tool":"workspace_write","args":{"path":"RELATIVE_PATH","content":"FILE_CONTENT"}}\n'
         '  workspace_scaffold: {"action":"tool","tool":"workspace_scaffold","args":{"files":[{"path":"RELATIVE_PATH","content":"CONTENT"}]}}\n'
+        '  pypi_check:       {"action":"tool","tool":"pypi_check","args":{"package":"PACKAGE_NAME"}}\n'
         '  done:             {"action":"respond"}\n'
         "\n"
         "Rules:\n"
@@ -2031,6 +2123,7 @@ def _agent_tool_prompt() -> str:
         "- For workspace tasks: use workspace_read to inspect a file, workspace_write for single-file edits,\n"
         "  workspace_scaffold to create multiple files. All paths are relative to the workspace root.\n"
         "  workspace_write and workspace_scaffold stage files — they do NOT write until the user approves.\n"
+        "- In build mode, use pypi_check before pinning non-standard Python dependencies.\n"
         "- One action per response. Nothing outside the JSON object."
     )
 
@@ -2068,6 +2161,7 @@ async def _resolve_agent_tools(
     repetition_penalty: float,
     status_callback: Optional[Any] = None,
     max_steps: int = MAX_AGENT_TOOL_STEPS,
+    workflow_mode: str = "chat",
 ) -> tuple[list[dict], list[dict]]:
     if not _gguf_engine_ready() and (_model is None or _tokenizer is None):
         return messages, []
@@ -2076,20 +2170,29 @@ async def _resolve_agent_tools(
     tool_runs: list[dict] = []
     max_steps = max(1, int(max_steps or MAX_AGENT_TOOL_STEPS))
 
+    # workspace_scaffold can carry an entire repo's worth of file content in one JSON
+    # tool call. The 400-token default is fine for search/browser calls but truncates
+    # scaffold output and breaks JSON parsing. Build mode gets a much larger budget.
+    tool_max_tokens = 12288 if workflow_mode == "build" else AGENT_TOOL_MAX_TOKENS
+
     for step in range(max_steps):
-        planner_messages = [{"role": "system", "content": _agent_tool_prompt()}, *working_messages]
+        planner_messages = [{"role": "system", "content": _agent_tool_prompt(workflow_mode)}, *working_messages]
         planner_messages, _ = _compact_messages_for_context(
             planner_messages,
-            AGENT_TOOL_MAX_TOKENS,
+            tool_max_tokens,
             fallback_prompt=prompt,
         )
-        planner_prompt = _render_prompt_from_messages(planner_messages, prompt)
+        # Qwen 3 templates auto-prepend `<think>\n` after the assistant turn marker,
+        # which would corrupt our JSON prefix injection. Force thinking off here so the
+        # rendered prompt ends with `<|im_start|>assistant\n<think>\n\n</think>\n\n` — a
+        # clean point to glue our JSON_PREFIX onto. Other templates ignore this kwarg.
+        planner_prompt = _render_prompt_from_messages(planner_messages, prompt, enable_thinking=False)
         # Inject partial assistant prefix to force first token to be `{`
         # This is the most reliable way to get any LLM to output JSON without prose.
         JSON_PREFIX = '{"action":'
         planner_output_raw = _generate_text(
             prompt=planner_prompt + JSON_PREFIX,
-            max_tokens=AGENT_TOOL_MAX_TOKENS,
+            max_tokens=tool_max_tokens,
             temperature=min(temperature, 0.1),
             top_p=0.9,
             repetition_penalty=repetition_penalty,
@@ -2253,6 +2356,52 @@ async def _resolve_agent_tools(
                     f"Staged {len(files)} file(s) for review: {', '.join(paths)}.\n"
                     "The user must approve these changes via the workspace panel before they are written to disk."
                 )
+            elif tool_name == "pypi_check":
+                pkg = str(args.get("package") or args.get("name") or "").strip()
+                if not pkg:
+                    raise RuntimeError("pypi_check requires a 'package' name")
+                # Lowercase normalize — PyPI is case-insensitive but URLs prefer lowercase.
+                pkg_norm = pkg.lower()
+                try:
+                    async with httpx.AsyncClient(timeout=8.0) as client:
+                        r = await client.get(f"https://pypi.org/pypi/{pkg_norm}/json")
+                except Exception as exc:
+                    tool_feedback = f"pypi_check network error for '{pkg}': {exc}"
+                    tool_runs.append({"tool": tool_name, "package": pkg, "error": str(exc)})
+                else:
+                    if r.status_code == 404:
+                        tool_feedback = (
+                            f"pypi_check: package '{pkg}' NOT FOUND on PyPI. "
+                            "Do not list this name as a dependency."
+                        )
+                        tool_runs.append({"tool": tool_name, "package": pkg, "found": False})
+                    elif r.status_code != 200:
+                        tool_feedback = f"pypi_check: PyPI returned {r.status_code} for '{pkg}'."
+                        tool_runs.append({"tool": tool_name, "package": pkg, "http": r.status_code})
+                    else:
+                        payload = r.json()
+                        info = payload.get("info", {})
+                        latest = info.get("version") or "?"
+                        summary = (info.get("summary") or "").strip()[:140]
+                        requires_py = info.get("requires_python") or "any"
+                        all_releases = sorted(
+                            (v for v in payload.get("releases", {}).keys() if v),
+                            reverse=True,
+                        )[:5]
+                        tool_feedback = (
+                            f"pypi_check: '{pkg}' is REAL on PyPI.\n"
+                            f"  latest version: {latest}\n"
+                            f"  requires_python: {requires_py}\n"
+                            f"  recent releases: {', '.join(all_releases) if all_releases else '(none)'}\n"
+                            f"  summary: {summary}\n"
+                            f"USE THIS EXACT VERSION (or one of the recent releases) when pinning."
+                        )
+                        tool_runs.append({
+                            "tool": tool_name,
+                            "package": pkg,
+                            "found": True,
+                            "latest": latest,
+                        })
             else:
                 raise RuntimeError(f"Unknown tool: {tool_name}")
         except Exception as exc:
@@ -3054,7 +3203,7 @@ def _enrich_system_prompt(user_prompt: str, system_prompt: str = "") -> dict:
 def _build_generation_runtime(
     temperature: float,
     top_p: float,
-    repetition_penalty: float,
+    repetition_penalty: float = 1.0,
 ) -> dict[str, Any]:
     """
     Build generation helpers for the current mlx_lm API.
@@ -3401,7 +3550,14 @@ def _normalize_generation_request(payload: dict) -> dict:
     workflow_mode = str(payload.get("workflow_mode") or "chat").strip().lower()
     if workflow_mode == "build":
         agent_mode = True
-        max_tokens = max(max_tokens, 2048)
+        # Big enough for a multi-file scaffold response.
+        max_tokens = max(max_tokens, 8192)
+        # Force deterministic sampling for code generation. Qwen 3.6's default
+        # temperature=1.0 produces creative variations — fine for chat, but bad
+        # for scaffolds where one wrong identifier breaks the whole repo.
+        temperature = min(temperature, 0.2)
+        top_p = min(top_p, 0.9)
+        repetition_penalty = min(repetition_penalty, 1.05)
     raw_steps = payload.get("agent_steps")
     try:
         agent_steps = max(1, int(raw_steps)) if raw_steps is not None else MAX_AGENT_TOOL_STEPS
@@ -3440,6 +3596,7 @@ async def _prepare_generation_request(payload: dict, status_callback: Optional[A
             "top_p": prepared["top_p"],
             "repetition_penalty": prepared["repetition_penalty"],
             "max_steps": prepared.get("agent_steps", MAX_AGENT_TOOL_STEPS),
+            "workflow_mode": prepared.get("workflow_mode", "chat"),
         }
         if status_callback is not None:
             resolve_kwargs["status_callback"] = status_callback
@@ -4070,6 +4227,132 @@ async def load_model(request: dict):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _load_model_in_background_thread(request: dict) -> Any:
+    """Run the async model loader inside a worker thread.
+
+    load_model is async for FastAPI routing, but the MLX load itself is synchronous
+    and can block the main event loop. Build mode needs a quick "loading" response,
+    so run the existing loader in its own event loop on a background thread.
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(load_model(request))
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _consume_background_load_result(task: asyncio.Task) -> None:
+    global _build_model_load_task, _build_model_load_task_model_path
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        _push_event("model_load_failed", {"error": str(exc)})
+    finally:
+        if task is _build_model_load_task:
+            _build_model_load_task = None
+            _build_model_load_task_model_path = None
+
+
+@app.post("/api/build/start")
+async def build_start():
+    """Enter build mode: load Qwen 3.6 35B-A3B, flip workflow_mode=build + agent_mode=True
+    on the active project. Workspace root must already be set (use /workspace first).
+    """
+    global _build_model_load_task, _build_model_load_task_model_path
+
+    model_path = BUILD_PREFERRED_MODEL
+    if not Path(model_path).expanduser().exists():
+        return JSONResponse(
+            {"error": f"Build model not found at {model_path}. "
+                      f"Set MOXY_BUILD_MODEL env var or download Qwen 3.6 35B-A3B."},
+            status_code=404,
+        )
+
+    state = _load_app_state()
+    project = _get_active_project(state) or {}
+    if not (project.get("workspace_root") or "").strip():
+        return JSONResponse(
+            {"error": "No workspace root set. Run /workspace to pick a directory first."},
+            status_code=400,
+        )
+
+    _update_active_project(state, {"workflow_mode": "build", "agent_mode": True})
+    _save_app_state(state)
+
+    model_name = Path(model_path).name
+    if _model_path == model_path and _model_name:
+        _push_event("build_mode_started", {"model": _model_name, "loading": False})
+        return {
+            "status": "ready",
+            "model": _model_name,
+            "model_path": model_path,
+            "workflow_mode": "build",
+            "agent_mode": True,
+        }
+
+    existing_build_load = (
+        _build_model_load_task
+        if _build_model_load_task_model_path == model_path
+        and _build_model_load_task is not None
+        and not _build_model_load_task.done()
+        else None
+    )
+
+    if _model_loading and existing_build_load is None:
+        _push_event("build_mode_started", {"model": model_name, "loading": True})
+        return {
+            "status": "loading",
+            "model": model_name,
+            "model_path": model_path,
+            "workflow_mode": "build",
+            "agent_mode": True,
+        }
+
+    load_task = existing_build_load
+    if load_task is None:
+        # Fire load asynchronously — load_model is the canonical loader (handles cleanup,
+        # memory headroom check, MLX load). It blocks ~30-60s on cold cache, so bridge
+        # it through a worker thread instead of blocking this request's event loop.
+        load_task = asyncio.create_task(asyncio.to_thread(
+            _load_model_in_background_thread,
+            {"path": model_path, "name": model_name},
+        ))
+        _build_model_load_task = load_task
+        _build_model_load_task_model_path = model_path
+        load_task.add_done_callback(_consume_background_load_result)
+    _push_event("build_mode_started", {"model": model_name, "loading": True})
+
+    try:
+        # Await briefly so the response carries an early error if the load rejects
+        # immediately (e.g. memory headroom). If it's still loading after 1 s, we
+        # return a "loading" response and the model_loaded event fires later via SSE.
+        result = await asyncio.wait_for(asyncio.shield(load_task), timeout=1.0)
+    except asyncio.TimeoutError:
+        return {
+            "status": "loading",
+            "model": model_name,
+            "model_path": model_path,
+            "workflow_mode": "build",
+            "agent_mode": True,
+        }
+
+    if isinstance(result, JSONResponse):
+        return result
+    ready = isinstance(result, dict) and result.get("status") in {"loaded", "already_loaded"}
+    return {
+        "status": "ready" if ready else "loading",
+        "model": (result.get("model") if isinstance(result, dict) else model_name) or model_name,
+        "model_path": model_path,
+        "workflow_mode": "build",
+        "agent_mode": True,
+        "load_result": result if isinstance(result, dict) else None,
+    }
+
+
 @app.post("/api/memory/flush")
 async def memory_flush():
     """Full memory dump, flush, and clean — unload model + purge all caches."""
@@ -4265,6 +4548,58 @@ async def enrich_prompt(request: dict):
     user_prompt = request.get("prompt", "")
     system_prompt = request.get("system_prompt", "")
     return _enrich_system_prompt(user_prompt, system_prompt)
+
+
+_ENHANCE_SYSTEM: dict[str, str] = {
+    "chat": (
+        "You are a prompt engineer. Rewrite the user's prompt to be clearer, more specific, "
+        "and more likely to produce a high-quality response from a language model. "
+        "Preserve the original intent exactly. Output ONLY the improved prompt — no preamble, "
+        "no explanation, no quotes around it."
+    ),
+    "image": (
+        "You are a FLUX image prompt engineer. Rewrite the user's prompt into a rich, "
+        "detailed image generation prompt. Add photographic style, lighting quality, "
+        "composition descriptors, colour palette, mood, and relevant technical details "
+        "(e.g. 'cinematic lighting, shallow depth of field, 8K, hyperrealistic'). "
+        "Keep it one flowing paragraph. Output ONLY the improved prompt — no preamble, "
+        "no explanation, no quotes."
+    ),
+}
+
+
+@app.post("/api/prompt/enhance")
+async def enhance_prompt(request: dict):
+    """Enhance a user prompt tailored to the current generation mode."""
+    raw_prompt = (request.get("prompt") or "").strip()
+    mode = (request.get("mode") or "chat").lower()
+    if mode not in _ENHANCE_SYSTEM:
+        mode = "chat"
+    if not raw_prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+    if _model is None and not _gguf_engine_ready():
+        raise HTTPException(status_code=503, detail="No model loaded")
+
+    system = _ENHANCE_SYSTEM[mode]
+    full_prompt = f"{system}\n\nOriginal prompt:\n{raw_prompt}\n\nEnhanced prompt:"
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _generate_text(
+                prompt=full_prompt,
+                max_tokens=512,
+                temperature=0.4,
+                top_p=0.9,
+                repetition_penalty=1.0,
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    enhanced = result.strip().strip('"').strip("'").strip()
+    if not enhanced:
+        raise HTTPException(status_code=500, detail="Model returned empty enhancement")
+    return {"enhanced": enhanced, "mode": mode}
 
 
 @app.post("/api/tokens/inspect")
@@ -5060,13 +5395,42 @@ async def images_unload():
     return {"loaded": False}
 
 
+def _enrich_flux_prompt(prompt: str) -> str:
+    """Append FLUX-dev-friendly quality directives unless the user already
+    specified them or chose an art style that shouldn't get photographic terms."""
+    p = (prompt or "").strip()
+    if not p:
+        return p
+    lower = p.lower()
+    has_quality = any(k in lower for k in (
+        "highly detailed", "sharp focus", "professional", "8k", "4k",
+        "photorealistic", "hyperrealistic", "cinematic", "masterful",
+    ))
+    if has_quality:
+        return p
+    has_style = any(k in lower for k in (
+        "anime", "cartoon", "illustration", "sketch", "painting",
+        "watercolor", "oil painting", "comic", "manga", "render", "3d",
+    ))
+    if has_style:
+        suffix = ", masterful composition, intricate detail, vivid colors, sharp linework"
+    else:
+        suffix = (
+            ", sharp focus, natural lighting, highly detailed, professional photography, "
+            "masterful composition, hyperrealistic"
+        )
+    return p.rstrip(",. ") + suffix
+
+
 @app.post("/api/images/generate")
 async def images_generate(request: dict):
-    """Body: {prompt, steps?, width?, height?, guidance?, seed?}
+    """Body: {prompt, steps?, width?, height?, guidance?, seed?, enhance?}
     Streams SSE events: loading | generating | done | error."""
-    prompt = (request.get("prompt") or "").strip()
-    if not prompt:
+    raw_prompt = (request.get("prompt") or "").strip()
+    if not raw_prompt:
         return JSONResponse({"error": "prompt required"}, status_code=400)
+    enhance_flag = request.get("enhance")
+    prompt = _enrich_flux_prompt(raw_prompt) if enhance_flag is not False else raw_prompt
 
     # Schnell needs 1-4 steps; dev needs 20-30. Clamp accordingly.
     if FLUX_VARIANT == "schnell":
@@ -5098,7 +5462,7 @@ async def images_generate(request: dict):
             loading = _flux_loading
             err = _flux_error
         if not ready:
-            yield _sse("loading", {"message": "Loading FLUX.1-schnell (~3-4 GB)…"})
+            yield _sse("loading", {"message": f"Loading FLUX.1-{FLUX_VARIANT} (~6 GB)…"})
             if not loading:
                 _flux_start_loading_async()
             # Poll until loaded or error
@@ -5377,7 +5741,13 @@ async def ws_generate(websocket: WebSocket):
     if origin and not _is_trusted_browser_origin(origin, request_host=request_host):
         await websocket.close(code=1008, reason="Untrusted browser origin.")
         return
-    await websocket.accept()
+    auth_subprotocol: Optional[str] = None
+    if AUTH_TOKEN:
+        token, auth_subprotocol = _websocket_auth(websocket)
+        if not secrets.compare_digest(token, AUTH_TOKEN):
+            await websocket.close(code=1008, reason="Local session token is required.")
+            return
+    await websocket.accept(subprotocol=auth_subprotocol)
     try:
         while True:
             data = dict(await websocket.receive_json() or {})
@@ -5602,6 +5972,34 @@ def _strip_reasoning_for_speech(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_text_for_xtts(text: str) -> str:
+    """Aggressive normalization to prevent XTTS language drift.
+
+    XTTS v2 mis-detects language on numbers, code, URLs, and special chars,
+    producing Spanish/Italian-sounding gibberish. Strip everything that
+    isn't speakable English text.
+    """
+    s = _strip_reasoning_for_speech(text)
+    # Drop fenced code blocks entirely (already filtered upstream but be safe).
+    s = re.sub(r"```[\s\S]*?```", " ", s)
+    s = re.sub(r"`[^`]+`", " ", s)
+    # Drop URLs and email addresses.
+    s = re.sub(r"https?://\S+", " ", s)
+    s = re.sub(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b", " ", s)
+    # Markdown links → just the label text.
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    # Bold / italic / headers.
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.MULTILINE)
+    # Strip emoji + most non-ASCII symbols. Keep basic accented Latin (À-ÿ).
+    s = re.sub(r"[^\x20-\x7EÀ-ÿ\n]", " ", s)
+    # Collapse repeated punctuation and whitespace.
+    s = re.sub(r"([.,!?;:])\1+", r"\1", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
 def _get_xtts_latents(model, persona_id: str, voice_ref: Path) -> tuple:
     """Compute and cache speaker latents for a persona. Re-extracting per
     synthesis is slow and produces small variations in voice — caching makes
@@ -5641,7 +6039,7 @@ def _synthesize_xtts(text: str, persona_id: str) -> bytes:
         raise RuntimeError("XTTS model not yet loaded.")
 
     language = persona.get("language", "en")
-    clean = _strip_reasoning_for_speech(text)
+    clean = _normalize_text_for_xtts(text)
     if not clean:
         raise RuntimeError("No speakable text after stripping reasoning markup.")
 
@@ -5657,13 +6055,13 @@ def _synthesize_xtts(text: str, persona_id: str) -> bytes:
                 language=language,
                 gpt_cond_latent=gpt_cond_latent,
                 speaker_embedding=speaker_embedding,
-                temperature=0.70,
+                temperature=0.55,
                 length_penalty=1.0,
                 repetition_penalty=5.0,
                 top_k=50,
                 top_p=0.85,
-                speed=1.18,
-                enable_text_splitting=len(clean) > 200,
+                speed=1.10,
+                enable_text_splitting=False,
             )
             wav = out.get("wav") if isinstance(out, dict) else out
             wav_np = np.asarray(wav, dtype=np.float32)
@@ -5864,7 +6262,9 @@ def main() -> None:
     print(f"   🧪 Prompt enrichment: /api/prompts/enrich")
     print(f"   📦 Model pull: POST /api/models/pull")
     print(f"   🦙 GGUF engine: llama-server → port {LLAMA_SERVER_PORT}\n")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
+    if AUTH_TOKEN:
+        print("   🔐 Local session token guard: enabled")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info", access_log=not bool(AUTH_TOKEN))
 
 
 if __name__ == "__main__":

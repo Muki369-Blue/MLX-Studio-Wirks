@@ -10,7 +10,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="/static/style.css?v=4">
+    <link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
     <!-- Ambient background -->
@@ -479,6 +479,9 @@
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 000-6l-1.5-.4a6.97 6.97 0 00-1-1.7l.8-1.4a1.65 1.65 0 00-2.3-2.3l-1.4.8a6.97 6.97 0 00-1.7-1L12 1.6a1.65 1.65 0 00-6 0l-.4 1.5a6.97 6.97 0 00-1.7 1l-1.4-.8a1.65 1.65 0 00-2.3 2.3l.8 1.4a6.97 6.97 0 00-1 1.7L1.6 9a1.65 1.65 0 000 6l1.5.4a6.97 6.97 0 001 1.7l-.8 1.4a1.65 1.65 0 002.3 2.3l1.4-.8a6.97 6.97 0 001.7 1L9 22.4a1.65 1.65 0 006 0l.4-1.5a6.97 6.97 0 001.7-1l1.4.8a1.65 1.65 0 002.3-2.3l-.8-1.4a6.97 6.97 0 001-1.7z"/></svg>
                         </button>
                         <textarea class="chat-input" id="chat-input" rows="1" placeholder="Send a message… (/ for commands)"></textarea>
+                        <button class="btn-icon btn-enhance" id="btn-enhance" title="Enhance prompt for chat or image mode (✨)">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/></svg>
+                        </button>
                         <button class="btn-icon btn-voice" id="btn-voice" title="Talk to Moxy (click to speak)">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
                         </button>
@@ -506,10 +509,12 @@
                         <div class="slash-item" data-cmd="/github"><span class="slash-cmd">/github</span><span class="slash-desc">Search GitHub and add source context</span></div>
                         <div class="slash-item" data-cmd="/agent"><span class="slash-cmd">/agent</span><span class="slash-desc">Toggle agent tools for web and browser access</span></div>
                         <div class="slash-item" data-cmd="/mode"><span class="slash-cmd">/mode</span><span class="slash-desc">Set workflow mode: chat, plan, or build</span></div>
-                        <div class="slash-item" data-cmd="/approve"><span class="slash-cmd">/approve</span><span class="slash-desc">Set change policy: manual or auto</span></div>
+                        <div class="slash-item" data-cmd="/build "><span class="slash-cmd">/build</span><span class="slash-desc">Switch to Qwen 3.6 35B + build mode + agent tools (scaffold repos from prompts)</span></div>
+                        <div class="slash-item" data-cmd="/approve"><span class="slash-cmd">/approve</span><span class="slash-desc">Confirm workspace changes stay review-gated</span></div>
                         <div class="slash-item" data-cmd="/image "><span class="slash-cmd">/image</span><span class="slash-desc">Generate an image — /image [WxH] [steps:N] &lt;prompt&gt;</span></div>
                         <div class="slash-item" data-cmd="/images"><span class="slash-cmd">/images</span><span class="slash-desc">Browse generated image gallery</span></div>
                         <div class="slash-item" data-cmd="/research "><span class="slash-cmd">/research</span><span class="slash-desc">Deep multi-source web research on a query</span></div>
+                        <div class="slash-item" data-cmd="/enhance"><span class="slash-cmd">/enhance</span><span class="slash-desc">Enhance current prompt for chat or image</span></div>
                         <div class="slash-item" data-cmd="/refine"><span class="slash-cmd">/refine</span><span class="slash-desc">Ask Moxy to revise the last response</span></div>
                         <div class="slash-item" data-cmd="/explain"><span class="slash-cmd">/explain</span><span class="slash-desc">Explain the last response in simpler terms</span></div>
                         <div class="slash-item" data-cmd="/debug"><span class="slash-cmd">/debug</span><span class="slash-desc">Review last response for errors</span></div>
@@ -528,7 +533,7 @@
                     <span class="input-hint">Enter to send · Shift+Enter for new line · / for commands · ⌘K command palette</span>
                     <div class="input-action-row">
                         <div class="quick-settings">
-                            <button class="btn-ghost btn-sm" id="btn-quick-settings">Chat · Approve / Deny</button>
+                            <button class="btn-ghost btn-sm" id="btn-quick-settings">Chat · Review Required</button>
                             <div class="quick-settings-menu" id="quick-settings-menu">
                                 <div class="quick-settings-section">
                                     <label class="quick-settings-label" for="workflow-mode-select">Mode</label>
@@ -541,8 +546,7 @@
                                 <div class="quick-settings-section">
                                     <label class="quick-settings-label" for="approval-mode-select">Changes</label>
                                     <select class="quick-settings-select" id="approval-mode-select">
-                                        <option value="manual">Approve / Deny</option>
-                                        <option value="auto">Auto-approve in Build</option>
+                                        <option value="manual">Review required</option>
                                     </select>
                                 </div>
                                 <label class="quick-settings-check" for="workflow-deep-research">
@@ -628,6 +632,6 @@
         </div>
     </div>
 
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=13"></script>
 </body>
 </html>
